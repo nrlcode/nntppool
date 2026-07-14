@@ -1,9 +1,13 @@
 package nntppool
 
 import (
+	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -102,6 +106,67 @@ func waitForProviderCapacity(t *testing.T, client *Client, providerID string) {
 		runtime.Gosched()
 	}
 }
+
+func requireBreakerTransportKind(t *testing.T, err error, want OutcomeKind) *TransportError {
+	t.Helper()
+	var transportErr *TransportError
+	if !errors.As(err, &transportErr) {
+		t.Errorf("error = %v, want TransportError", err)
+		return nil
+	}
+	if transportErr.Kind != want {
+		t.Errorf("transport kind = %s, want %s", transportErr.Kind, want)
+	}
+	if errors.Is(err, ErrCircuitBreakerOpen) {
+		t.Errorf("error = %v, bootstrap classification was hidden by breaker-open", err)
+	}
+	return transportErr
+}
+
+func targetedBreakerErrors(client *Client, providerID string, count int) []error {
+	start := make(chan struct{})
+	results := make(chan error, count)
+	for range count {
+		go func() {
+			<-start
+			results <- targetedBreakerStat(client, providerID)
+		}()
+	}
+	close(start)
+	errs := make([]error, 0, count)
+	for range count {
+		errs = append(errs, <-results)
+	}
+	return errs
+}
+
+func authRejectingBreakerFactory(context.Context) (net.Conn, error) {
+	client, server := net.Pipe()
+	go func() {
+		defer func() { _ = server.Close() }()
+		if _, err := io.WriteString(server, "200 regression server ready\r\n"); err != nil {
+			return
+		}
+		reader := bufio.NewReader(server)
+		if _, err := reader.ReadString('\n'); err != nil {
+			return
+		}
+		if _, err := io.WriteString(server, "381 password required\r\n"); err != nil {
+			return
+		}
+		if _, err := reader.ReadString('\n'); err != nil {
+			return
+		}
+		_, _ = io.WriteString(server, "481 authentication rejected\r\n")
+	}()
+	return client, nil
+}
+
+type breakerDialTimeoutError struct{}
+
+func (breakerDialTimeoutError) Error() string   { return "deterministic provider dial timeout" }
+func (breakerDialTimeoutError) Timeout() bool   { return true }
+func (breakerDialTimeoutError) Temporary() bool { return true }
 
 func TestPR2CircuitBreakerIsOptInAndUsesOneEligibilityPath(t *testing.T) {
 	var disabledCommands atomic.Int32
@@ -563,6 +628,352 @@ func TestPR2SuccessfulRequestResetsClosedBreakerWindow(t *testing.T) {
 	if stats.State != CircuitBreakerClosed || stats.QualifyingFailures != 0 {
 		t.Fatalf("successful request did not reset breaker window: %+v", stats)
 	}
+}
+
+func TestPR2BootstrapAuthenticationAndConfigurationDoNotTripBreaker(t *testing.T) {
+	t.Run("authentication rejection", func(t *testing.T) {
+		provider := Provider{
+			ID:          "auth-rejected",
+			Host:        "auth-rejected.invalid:119",
+			Factory:     authRejectingBreakerFactory,
+			Auth:        Auth{Username: "fixture-user", Password: "fixture-password"},
+			Connections: 3,
+			Inflight:    1,
+			SkipPing:    true,
+		}
+		client := newBreakerClient(t, newBreakerFakeClock(), provider)
+		for request, err := range targetedBreakerErrors(client, provider.ID, 3) {
+			requireBreakerTransportKind(t, err, OutcomeProviderUnavailable)
+			if !errors.Is(err, ErrAuthRejected) {
+				t.Errorf("request %d error = %v, want ErrAuthRejected", request+1, err)
+			}
+		}
+		if stats := providerBreakerStats(t, client, provider.ID); stats.State != CircuitBreakerClosed || stats.QualifyingFailures != 0 {
+			t.Fatalf("authentication failures changed breaker state: %+v", stats)
+		}
+	})
+
+	t.Run("missing password configuration", func(t *testing.T) {
+		greetingFactory := func(context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				defer func() { _ = server.Close() }()
+				_, _ = io.WriteString(server, "200 regression server ready\r\n")
+			}()
+			return client, nil
+		}
+		provider := Provider{
+			ID:          "missing-password",
+			Host:        "missing-password.invalid:119",
+			Factory:     greetingFactory,
+			Auth:        Auth{Username: "fixture-user"},
+			Connections: 3,
+			Inflight:    1,
+			SkipPing:    true,
+		}
+		client := newBreakerClient(t, newBreakerFakeClock(), provider)
+		for _, err := range targetedBreakerErrors(client, provider.ID, 3) {
+			requireBreakerTransportKind(t, err, OutcomeProviderUnavailable)
+		}
+		if stats := providerBreakerStats(t, client, provider.ID); stats.State != CircuitBreakerClosed || stats.QualifyingFailures != 0 {
+			t.Fatalf("missing-password configuration changed breaker state: %+v", stats)
+		}
+	})
+
+	t.Run("malformed address configuration", func(t *testing.T) {
+		provider := Provider{
+			ID:          "malformed-address",
+			Host:        "missing-port",
+			Connections: 3,
+			Inflight:    1,
+			SkipPing:    true,
+		}
+		client := newBreakerClient(t, newBreakerFakeClock(), provider)
+		for _, err := range targetedBreakerErrors(client, provider.ID, 3) {
+			requireBreakerTransportKind(t, err, OutcomeProviderUnavailable)
+		}
+		if stats := providerBreakerStats(t, client, provider.ID); stats.State != CircuitBreakerClosed || stats.QualifyingFailures != 0 {
+			t.Fatalf("malformed-address configuration changed breaker state: %+v", stats)
+		}
+	})
+
+	t.Run("invalid TLS policy configuration", func(t *testing.T) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("Listen() error = %v", err)
+		}
+		stop := make(chan struct{})
+		t.Cleanup(func() {
+			close(stop)
+			_ = listener.Close()
+		})
+		go func() {
+			for {
+				conn, acceptErr := listener.Accept()
+				if acceptErr != nil {
+					return
+				}
+				go func() {
+					<-stop
+					_ = conn.Close()
+				}()
+			}
+		}()
+		provider := Provider{
+			ID:   "invalid-tls-policy",
+			Host: listener.Addr().String(),
+			TLSConfig: &tls.Config{
+				ServerName: "fixture.invalid",
+				MinVersion: tls.VersionTLS13,
+				MaxVersion: tls.VersionTLS12,
+			},
+			Connections: 3,
+			Inflight:    1,
+			SkipPing:    true,
+		}
+		client := newBreakerClient(t, newBreakerFakeClock(), provider)
+		for _, requestErr := range targetedBreakerErrors(client, provider.ID, 3) {
+			requireBreakerTransportKind(t, requestErr, OutcomeProviderUnavailable)
+		}
+		if stats := providerBreakerStats(t, client, provider.ID); stats.State != CircuitBreakerClosed || stats.QualifyingFailures != 0 {
+			t.Fatalf("invalid TLS policy changed breaker state: %+v", stats)
+		}
+	})
+}
+
+func TestPR2RealTransportLifecycleFeedsBreakerAccounting(t *testing.T) {
+	t.Run("provider response timeout counts", func(t *testing.T) {
+		hungFactory := func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				defer func() { _ = server.Close() }()
+				if _, err := io.WriteString(server, "200 regression server ready\r\n"); err != nil {
+					return
+				}
+				reader := bufio.NewReader(server)
+				if _, err := reader.ReadString('\n'); err != nil {
+					return
+				}
+				<-ctx.Done()
+			}()
+			return client, nil
+		}
+		provider := Provider{
+			ID:             "response-timeout",
+			Host:           "response-timeout.invalid:119",
+			Factory:        hungFactory,
+			Connections:    1,
+			Inflight:       1,
+			SkipPing:       true,
+			AttemptTimeout: 20 * time.Millisecond,
+		}
+		client := newBreakerClient(t, newBreakerFakeClock(), provider)
+		for request := 1; request <= 3; request++ {
+			transportErr := requireBreakerTransportKind(t, targetedBreakerStat(client, provider.ID), OutcomeTransportFailure)
+			if transportErr == nil || len(transportErr.Attempts) == 0 || !transportErr.Attempts[len(transportErr.Attempts)-1].ProviderResponseTimeout {
+				t.Errorf("request %d error = %v, want real provider response-timeout evidence", request, transportErr)
+			}
+		}
+		if stats := providerBreakerStats(t, client, provider.ID); stats.State != CircuitBreakerOpen || stats.Cooldown != 10*time.Second {
+			t.Fatalf("provider response timeouts did not open breaker: %+v", stats)
+		}
+	})
+
+	t.Run("genuine dial timeout counts", func(t *testing.T) {
+		provider := Provider{
+			ID:   "dial-timeout",
+			Host: "dial-timeout.invalid:119",
+			Factory: func(context.Context) (net.Conn, error) {
+				return nil, breakerDialTimeoutError{}
+			},
+			Connections: 3,
+			Inflight:    1,
+			SkipPing:    true,
+		}
+		client := newBreakerClient(t, newBreakerFakeClock(), provider)
+		for request, err := range targetedBreakerErrors(client, provider.ID, 3) {
+			transportErr := requireBreakerTransportKind(t, err, OutcomeTransportFailure)
+			if transportErr == nil || len(transportErr.Attempts) == 0 || transportErr.Attempts[len(transportErr.Attempts)-1].ProviderResponseTimeout {
+				t.Errorf("request %d error = %v, want non-response provider dial timeout", request+1, transportErr)
+			}
+		}
+		if stats := providerBreakerStats(t, client, provider.ID); stats.State != CircuitBreakerOpen || stats.Cooldown != 10*time.Second {
+			t.Fatalf("genuine provider dial failures did not open breaker: %+v", stats)
+		}
+	})
+
+	t.Run("local pipeline wait cancellation does not count", func(t *testing.T) {
+		firstCommand := make(chan struct{})
+		release := make(chan struct{})
+		var firstOnce, releaseOnce sync.Once
+		releaseServer := func() { releaseOnce.Do(func() { close(release) }) }
+		t.Cleanup(releaseServer)
+		factory := func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				defer func() { _ = server.Close() }()
+				if _, err := io.WriteString(server, "200 regression server ready\r\n"); err != nil {
+					return
+				}
+				reader := bufio.NewReader(server)
+				if _, err := reader.ReadString('\n'); err != nil {
+					return
+				}
+				firstOnce.Do(func() { close(firstCommand) })
+				select {
+				case <-release:
+				case <-ctx.Done():
+				}
+			}()
+			return client, nil
+		}
+		provider := Provider{
+			ID:             "local-cancellation",
+			Host:           "local-cancellation.invalid:119",
+			Factory:        factory,
+			Connections:    1,
+			Inflight:       1,
+			StatInflight:   1,
+			SkipPing:       true,
+			AttemptTimeout: time.Second,
+		}
+		client := newBreakerClient(t, newBreakerFakeClock(), provider)
+		firstCtx, cancelFirst := context.WithCancel(context.Background())
+		firstResp := client.Send(firstCtx, []byte("STAT <first@example.invalid>\r\n"), nil)
+		select {
+		case <-firstCommand:
+		case <-time.After(2 * time.Second):
+			t.Fatal("first STAT did not occupy the provider pipeline")
+		}
+
+		queuedCtx, cancelQueued := context.WithTimeout(context.Background(), 25*time.Millisecond)
+		_, queuedErr := client.Stat(queuedCtx, "queued@example.invalid")
+		cancelQueued()
+		if !errors.Is(queuedErr, context.DeadlineExceeded) {
+			t.Errorf("queued request error = %v, want context deadline", queuedErr)
+		}
+		cancelFirst()
+		first := <-firstResp
+		if !errors.Is(first.Err, context.Canceled) {
+			t.Errorf("first request error = %v, want caller cancellation", first.Err)
+		}
+		releaseServer()
+		if stats := providerBreakerStats(t, client, provider.ID); stats.State != CircuitBreakerClosed || stats.QualifyingFailures != 0 {
+			t.Fatalf("local cancellations changed breaker state: %+v", stats)
+		}
+	})
+
+	t.Run("collateral pipeline loss does not count", func(t *testing.T) {
+		var connections atomic.Int32
+		firstCommand := make(chan string, 1)
+		bothWritten := make(chan struct{})
+		releaseMalformed := make(chan struct{})
+		var releaseOnce sync.Once
+		releaseFirstResponse := func() { releaseOnce.Do(func() { close(releaseMalformed) }) }
+		t.Cleanup(releaseFirstResponse)
+		factory := func(ctx context.Context) (net.Conn, error) {
+			connection := connections.Add(1)
+			client, server := net.Pipe()
+			go func() {
+				defer func() { _ = server.Close() }()
+				if _, err := io.WriteString(server, "200 regression server ready\r\n"); err != nil {
+					return
+				}
+				reader := bufio.NewReader(server)
+				if connection == 1 {
+					command, err := reader.ReadString('\n')
+					if err != nil {
+						return
+					}
+					firstCommand <- command
+					if _, err := reader.ReadString('\n'); err != nil {
+						return
+					}
+					close(bothWritten)
+					select {
+					case <-releaseMalformed:
+					case <-ctx.Done():
+						return
+					}
+					_, _ = io.WriteString(server, "222 0 <fixture@example.invalid> body follows\r\nmalformed body\r\n.\r\n")
+					return
+				}
+				for {
+					if _, err := reader.ReadString('\n'); err != nil {
+						return
+					}
+					if _, err := io.WriteString(server, "430 no such article\r\n"); err != nil {
+						return
+					}
+				}
+			}()
+			return client, nil
+		}
+		provider := Provider{
+			ID:           "collateral-pipeline",
+			Host:         "collateral-pipeline.invalid:119",
+			Factory:      factory,
+			Connections:  1,
+			Inflight:     2,
+			StatInflight: 2,
+			SkipPing:     true,
+		}
+		client := newBreakerClient(t, newBreakerFakeClock(), provider)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		type bodyResult struct {
+			body *ArticleBody
+			err  error
+		}
+		bodyDone := make(chan bodyResult, 1)
+		go func() {
+			body, err := client.Body(ctx, "pipeline-body@example.invalid")
+			bodyDone <- bodyResult{body: body, err: err}
+		}()
+		select {
+		case command := <-firstCommand:
+			if operationFromPayload([]byte(command)) != OperationBody {
+				t.Fatalf("first pipelined command = %q, want BODY", command)
+			}
+		case <-ctx.Done():
+			t.Fatal("first transport did not receive BODY")
+		}
+		statResponse := client.Send(ctx, []byte("STAT <pipeline-stat@example.invalid>\r\n"), nil)
+		select {
+		case <-bothWritten:
+		case <-ctx.Done():
+			t.Fatal("STAT was not written behind BODY")
+		}
+		for client.Stats().Providers[0].PipelineInUse < 2 {
+			select {
+			case <-ctx.Done():
+				t.Fatal("both commands did not become pending before transport loss")
+			default:
+				runtime.Gosched()
+			}
+		}
+		releaseFirstResponse()
+
+		bodyOutcome := <-bodyDone
+		var bodyErr *TransportError
+		if bodyOutcome.body != nil || !errors.As(bodyOutcome.err, &bodyErr) || bodyErr.Kind != OutcomeCorruptBody {
+			t.Fatalf("BODY result = body %v error %v, want isolated corruption", bodyOutcome.body, bodyOutcome.err)
+		}
+		response := <-statResponse
+		if response.Err != nil || (response.StatusCode != 423 && response.StatusCode != 430) {
+			t.Fatalf("retried collateral response = %+v, want hard absence", response)
+		}
+		if len(response.Attempts) < 2 || response.Attempts[0].Outcome != OutcomeTransportFailure || response.Attempts[len(response.Attempts)-1].Outcome != OutcomeHardArticleAbsence {
+			t.Fatalf("collateral attempts = %+v, want transport loss then hard absence", response.Attempts)
+		}
+		initial := response.Attempts[0]
+		if initial.PipelineHeadWaitDuration <= 0 || initial.ResponseServiceDuration != 0 {
+			t.Fatalf("collateral evidence = %+v, want written request that never reached response head", initial)
+		}
+		if stats := providerBreakerStats(t, client, provider.ID); stats.State != CircuitBreakerClosed || stats.QualifyingFailures != 0 {
+			t.Fatalf("retried/collateral pipeline loss changed breaker state: %+v", stats)
+		}
+	})
 }
 
 func ExampleWithProviderCircuitBreaker() {
