@@ -123,6 +123,7 @@ type ProviderStats struct {
 	BackgroundStatInUse int
 	BackgroundStatLimit int
 	PriorityHeadroom    int
+	CircuitBreaker      CircuitBreakerStats
 	Ping                PingResult
 
 	// Quota fields. QuotaBytes is 0 when no quota is configured.

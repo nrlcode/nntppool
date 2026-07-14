@@ -503,6 +503,41 @@ func TestPR2OnlyOpenProviderReturnsStructuredTemporaryOutcome(t *testing.T) {
 	}
 }
 
+func TestPR2CallerCancellationPrecedesOpenProviderEligibility(t *testing.T) {
+	clock := newBreakerFakeClock()
+	server, provider := breakerProvider(
+		"cancelled",
+		"breaker-cancelled.invalid:119",
+		func(int, string) []byte { return []byte("451 temporary failure\r\n") },
+	)
+	client := newBreakerClient(t, clock, provider)
+	for range 3 {
+		_ = targetedBreakerStat(client, "cancelled")
+	}
+	before := server.commandCount("STAT")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := client.Stat(ctx, "fixture@example.invalid")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled request error = %v, want context.Canceled", err)
+	}
+	if errors.Is(err, ErrCircuitBreakerOpen) {
+		t.Fatalf("canceled request error = %v, breaker eligibility hid caller cancellation", err)
+	}
+	var transportErr *TransportError
+	if !errors.As(err, &transportErr) || transportErr.Kind != OutcomeCancellation {
+		t.Fatalf("canceled request error = %v, want cancellation TransportError", err)
+	}
+	if got := server.commandCount("STAT") - before; got != 0 {
+		t.Fatalf("canceled request sent %d provider commands", got)
+	}
+	stats := providerBreakerStats(t, client, "cancelled")
+	if stats.State != CircuitBreakerOpen || stats.Cooldown != 10*time.Second {
+		t.Fatalf("caller cancellation changed breaker state: %+v", stats)
+	}
+}
+
 func TestPR2SuccessfulRequestResetsClosedBreakerWindow(t *testing.T) {
 	clock := newBreakerFakeClock()
 	var healthy atomic.Bool

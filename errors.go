@@ -120,6 +120,8 @@ func classifyOutcome(code int, err error) OutcomeKind {
 		return OutcomeCancellation
 	case errors.Is(err, ErrBodyCorrupt), errors.Is(err, ErrCRCMismatch):
 		return OutcomeCorruptBody
+	case errors.Is(err, ErrCircuitBreakerOpen):
+		return OutcomeTemporaryFailure
 	case errors.Is(err, ErrServiceUnavailable), errors.Is(err, ErrAuthRequired),
 		errors.Is(err, ErrAuthRejected), errors.Is(err, ErrQuotaExceeded),
 		errors.Is(err, ErrMaxConnections), code == 502:

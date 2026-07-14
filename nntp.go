@@ -1640,9 +1640,11 @@ const (
 type ClientOption func(*clientConfig)
 
 type clientConfig struct {
-	dispatch      DispatchStrategy
-	statProbeOff  bool
-	speedAwareOff bool
+	dispatch              DispatchStrategy
+	statProbeOff          bool
+	speedAwareOff         bool
+	circuitBreakerEnabled bool
+	circuitBreakerClock   circuitBreakerClock
 }
 
 // WithDispatchStrategy sets the request distribution strategy for main providers.
@@ -1668,6 +1670,21 @@ func WithStatProbe(enabled bool) ClientOption {
 // governs the base weight. Has no effect under DispatchFIFO.
 func WithSpeedAwareDispatch(enabled bool) ClientOption {
 	return func(cfg *clientConfig) { cfg.speedAwareOff = !enabled }
+}
+
+// WithProviderCircuitBreaker enables or disables the bounded in-memory
+// provider circuit breaker. It is disabled by default for v4 behavioral
+// compatibility. When enabled, three qualifying failures in 30 seconds open a
+// provider and use exclusive half-open probes after 10, 20, 40, 80, and then
+// 120 second cooldowns.
+func WithProviderCircuitBreaker(enabled bool) ClientOption {
+	return func(cfg *clientConfig) { cfg.circuitBreakerEnabled = enabled }
+}
+
+// withCircuitBreakerClock is an internal deterministic test seam. Production
+// clients use the wall clock.
+func withCircuitBreakerClock(clock circuitBreakerClock) ClientOption {
+	return func(cfg *clientConfig) { cfg.circuitBreakerClock = clock }
 }
 
 // Provider describes a single NNTP server with its own credentials and connection count.
@@ -1758,6 +1775,7 @@ type providerGroup struct {
 	hotReqCh  chan *Request // unbuffered; hot (connected) connections read this
 	hotPrioCh chan *Request // unbuffered; hot priority connections read this
 	gate      *connGate
+	breaker   *providerCircuitBreaker
 	stats     providerStats
 	cancel    context.CancelFunc // cancels this group's slot goroutines
 	p         Provider           // original config; used for auto-reconnect
@@ -1825,9 +1843,11 @@ type Client struct {
 	backupGroups atomic.Pointer[[]*providerGroup]
 	nextIdx      atomic.Uint64 // round-robin counter for mainGroups
 
-	dispatch   DispatchStrategy // set once by NewClient, read-only after
-	statProbe  bool             // set once by NewClient; enables parallel STAT probing on 430
-	speedAware bool             // set once by NewClient; weights round-robin dispatch by throughput
+	dispatch     DispatchStrategy // set once by NewClient, read-only after
+	statProbe    bool             // set once by NewClient; enables parallel STAT probing on 430
+	speedAware   bool             // set once by NewClient; weights round-robin dispatch by throughput
+	breakerOn    bool
+	breakerClock circuitBreakerClock
 
 	providerIdx atomic.Int64 // monotonic counter for unnamed providers
 	// decodeFn is copied to each request when non-nil. It remains unexported so
@@ -1989,6 +2009,7 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 		hotReqCh:    make(chan *Request),
 		hotPrioCh:   make(chan *Request),
 		gate:        gate,
+		breaker:     newProviderCircuitBreaker(c.breakerOn, c.breakerClock),
 		cancel:      gcancel,
 		p:           p,
 		quotaPeriod: p.QuotaPeriod,
@@ -2113,12 +2134,14 @@ func NewClient(ctx context.Context, providers []Provider, opts ...ClientOption) 
 	}
 
 	c := &Client{
-		ctx:        ctx,
-		cancel:     cancel,
-		dispatch:   cfg.dispatch,
-		statProbe:  !cfg.statProbeOff,
-		speedAware: !cfg.speedAwareOff,
-		startTime:  time.Now(),
+		ctx:          ctx,
+		cancel:       cancel,
+		dispatch:     cfg.dispatch,
+		statProbe:    !cfg.statProbeOff,
+		speedAware:   !cfg.speedAwareOff,
+		breakerOn:    cfg.circuitBreakerEnabled,
+		breakerClock: cfg.circuitBreakerClock,
+		startTime:    time.Now(),
 	}
 	// Initialize empty slices.
 	c.mainGroups.Store(&[]*providerGroup{})
@@ -2640,6 +2663,39 @@ func (c *Client) tryGroupResilient(
 	validateBody bool,
 	freshTransport bool,
 ) (resp Response, ok bool, cancelled bool) {
+	lease, breakerErr := g.breaker.acquire(g.id)
+	if breakerErr != nil {
+		// Preserve PR1 cancellation precedence when cancellation races with
+		// breaker eligibility. An open provider must not hide caller shutdown.
+		cancellationResp := func(err error) Response {
+			return Response{
+				Err:        err,
+				ProviderID: g.id,
+				Attempts:   []AttemptEvidence{buildEligibilityEvidence(payload, g.id, err, validateBody)},
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return cancellationResp(err), false, true
+		}
+		if err := c.ctx.Err(); err != nil {
+			return cancellationResp(err), false, true
+		}
+		resp = Response{
+			Err:        breakerErr,
+			ProviderID: g.id,
+			Attempts:   []AttemptEvidence{buildEligibilityEvidence(payload, g.id, breakerErr, validateBody)},
+		}
+		return resp, true, false
+	}
+	if lease.probe {
+		// Half-open is a transport recovery probe, not merely another request
+		// on a socket that predates the breaker cooldown.
+		freshTransport = true
+	}
+	defer func() {
+		g.breaker.complete(lease, classifyCircuitBreakerCompletion(resp, ok, cancelled))
+	}()
+
 	var attempts []AttemptEvidence
 	connRetries := 0
 	temporaryRetried := false
@@ -2950,6 +3006,7 @@ func (c *Client) Stats() ClientStats {
 				BackgroundStatInUse: int(g.stats.BackgroundStatInUse.Load()),
 				BackgroundStatLimit: g.stats.backgroundStatLimit,
 				PriorityHeadroom:    g.stats.priorityHeadroom,
+				CircuitBreaker:      g.breaker.snapshot(),
 				Ping:                g.stats.Ping,
 				QuotaBytes:          g.stats.quotaBytes,
 				QuotaUsed:           quotaUsed,
