@@ -151,4 +151,17 @@ func TestGreetingError_Is(t *testing.T) {
 	if errors.Is(e, ErrArticleNotFound) {
 		t.Error("greetingError should not match ErrArticleNotFound")
 	}
+
+	for _, tt := range []struct {
+		code int
+		want error
+	}{
+		{480, ErrAuthRequired},
+		{481, ErrAuthRejected},
+	} {
+		e := &greetingError{StatusCode: tt.code, Message: "test"}
+		if !errors.Is(e, tt.want) {
+			t.Errorf("greetingError{%d} should match %v", tt.code, tt.want)
+		}
+	}
 }

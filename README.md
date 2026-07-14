@@ -26,6 +26,7 @@ A high-performance NNTP connection pool library for Go. It manages multiple NNTP
   - [Connection lifecycle](#connection-lifecycle)
   - [Request dispatch strategies](#request-dispatch-strategies)
   - [Failover and retry logic](#failover-and-retry-logic)
+  - [Provider circuit breaker](#provider-circuit-breaker)
   - [Read buffer internals](#read-buffer-internals)
   - [yEnc decoding pipeline](#yenc-decoding-pipeline)
   - [Hot vs cold connections](#hot-vs-cold-connections)
@@ -59,6 +60,7 @@ A high-performance NNTP connection pool library for Go. It manages multiple NNTP
 - **Command pipelining**: configurable inflight requests per connection (default: 1)
 - **Weighted round-robin dispatch**: distributes load by available inflight capacity; FIFO mode also available
 - **Automatic failover**: ordered fallback for hard absence (423/430), temporary failure, corruption, unavailability, and transport failure, followed by failure-only backups
+- **Bounded provider circuit breaker**: optional short-lived suppression after repeated provider-level temporary failures, with exclusive half-open recovery probes
 - **Independent provider evidence**: every configured account remains eligible after hard absence, even when multiple accounts share one endpoint
 - **Provider removal on 502**: permanently unavailable providers are atomically removed from the pool
 - **Auto-reconnect after 502**: optionally re-add a provider after a configurable delay (`ReconnectDelay`)
@@ -544,12 +546,13 @@ fmt.Printf("Total: %.2f MB/s, %d MB consumed, elapsed: %s\n",
 )
 
 for _, p := range stats.Providers {
-    fmt.Printf("  [%s] active=%d/%d avg=%.2f MB/s missing=%d errors=%d ping=%s\n",
+    fmt.Printf("  [%s] active=%d/%d avg=%.2f MB/s missing=%d errors=%d breaker=%s ping=%s\n",
         p.Name,
         p.ActiveConnections, p.MaxConnections,
         p.AvgSpeed/(1<<20),
         p.Missing,
         p.Errors,
+        p.CircuitBreaker.State,
         p.Ping.RTT.Round(time.Millisecond),
     )
 }
@@ -608,6 +611,7 @@ When a request arrives at `Send()`:
 client.Send()
   → doSendWithRetry() (goroutine)
     → round-robin / FIFO: pick provider group
+    → check shared provider eligibility (quota and optional circuit breaker)
     → try hotReqCh (non-blocking) — succeeds only if a connection is already idle with inflight capacity
     → fall back to reqCh (wakes a cold slot or queues behind in-flight requests)
     → receive response from innerCh
@@ -624,7 +628,7 @@ client.Send()
 
 **FIFO**: Scans providers in declaration order and sends to the first provider with available capacity and within quota. Under light load this concentrates traffic on the primary provider, keeping it "warm" while other providers stay disconnected.
 
-Both strategies skip quota-exceeded providers during normal dispatch. If all providers are quota-exceeded, the pool falls back to round-robin and lets each provider return `ErrQuotaExceeded`.
+Both strategies use the same provider eligibility boundary. They skip quota-exceeded providers and, when the opt-in circuit breaker is enabled, advance past open providers without sending a command. If all providers are quota-exceeded, the pool falls back to round-robin and lets each provider return `ErrQuotaExceeded`. An open provider instead contributes structured breaker attempt evidence; it is returned as a temporary error when no alternative succeeds.
 
 ### Failover and retry logic
 
@@ -643,6 +647,8 @@ Both strategies skip quota-exceeded providers during normal dispatch. If all pro
    - buffered BODY framing/decode/size/CRC failure → retire the socket, try next provider
    - connection error → try next provider
    - quota exceeded → skip, try next provider
+   - breaker open → record temporary eligibility evidence without contacting the provider,
+     then try next provider
 
 2. If all mains failed: attempt failure-only backup providers in order
    - backup 423/430 → continue through remaining backups
@@ -652,6 +658,22 @@ Both strategies skip quota-exceeded providers during normal dispatch. If all pro
    - return hard absence only when every eligible provider conclusively reported 423/430
    - mixed outcome classes return a structured inconclusive error with per-attempt evidence
 ```
+
+### Provider circuit breaker
+
+The provider circuit breaker is disabled by default, preserving existing v4 routing behavior. Enable it for a client with:
+
+```go
+client, err := nntppool.NewClient(ctx, providers,
+    nntppool.WithProviderCircuitBreaker(true),
+)
+```
+
+When enabled, each provider opens after three qualifying failures from distinct public requests within a rolling 30-second window. Accounting happens once after all internal retries for that provider: a final `451`, provider connection/bootstrap failure, direct provider transport failure, or genuine provider response/progress timeout counts. Local queue/admission expiry, collateral pipeline cancellation, hard article absence, caller cancellation, health preemption, isolated article corruption, authentication, quota, configuration, and explicit service-unavailable states do not count. Bootstrap preserves `ErrAuthRequired`/`ErrAuthRejected` and marks recognized local address or TLS policy failures with `ErrInvalidProviderConfiguration`, so those actionable causes cannot be hidden by breaker cooldown.
+
+An open provider is skipped while alternatives are tried. After cooldown, exactly one request receives an exclusive half-open probe on a fresh transport; concurrent requests receive `ErrCircuitBreakerOpen` with a `*CircuitBreakerError`. Failed probes advance cooldowns through 10, 20, 40, 80, and 120 seconds, capped at 120 seconds. Any successful provider request closes the breaker and resets its failure window and cooldown immediately.
+
+nntppool does not wait for a cooldown or run caller retry/backoff policy. `ProviderStats.CircuitBreaker` exposes the current in-memory state, failure count, cooldown deadline, and probe occupancy. This transient state is transport telemetry, not durable article-availability evidence.
 
 ### Read buffer internals
 
@@ -769,7 +791,7 @@ Both return immediately with a buffered channel (capacity 1). The caller receive
 
 ### v4 source compatibility
 
-Existing v4 methods and their signatures remain available. Zero values and external keyed composite literals remain source-compatible as additive provider identity, result evidence, validation, and telemetry fields are introduced. External unkeyed literals of exported structs are not part of this compatibility guarantee: Go requires their field count and order to remain frozen, which is incompatible with the plan's explicitly additive v4 fields. The test suite includes an external-package compile fixture for the supported keyed and method-call surface.
+Existing v4 methods and their signatures remain available. Zero values and external keyed composite literals remain source-compatible as additive provider identity, result evidence, validation, and telemetry fields are introduced. The provider circuit breaker is opt-in and disabled by default, so existing clients retain their routing behavior. External unkeyed literals of exported structs are not part of this compatibility guarantee: Go requires their field count and order to remain frozen, which is incompatible with the plan's explicitly additive v4 fields. The test suite includes an external-package compile fixture for the supported keyed and method-call surface.
 
 ### Provider management
 
@@ -789,7 +811,7 @@ func (c *Client) NumProviders() int
 func (c *Client) Stats() ClientStats
 ```
 
-Returns a lock-free snapshot using atomic reads. `ClientStats` aggregates across all providers; `ProviderStats` contains per-provider counters including quota state.
+Returns a concurrency-safe snapshot. `ClientStats` aggregates across all providers; `ProviderStats` contains per-provider counters, quota state, and the transient circuit-breaker snapshot.
 
 ### Provider testing
 
@@ -843,6 +865,22 @@ type TransportError struct {
     ResponseCode int
     Attempts     []AttemptEvidence
     Cause        error
+}
+
+// CircuitBreakerError is returned when provider eligibility is suppressed.
+// It unwraps to ErrCircuitBreakerOpen.
+type CircuitBreakerError struct {
+    ProviderID string
+    State      CircuitBreakerState
+    RetryAt    time.Time
+}
+
+type CircuitBreakerStats struct {
+    State              CircuitBreakerState // disabled | closed | open | half_open
+    QualifyingFailures int
+    OpenUntil          time.Time
+    Cooldown           time.Duration
+    ProbeInFlight      bool
 }
 
 type TargetedBodyOptions struct {
@@ -899,6 +937,7 @@ type ProviderStats struct {
     BackgroundStatInUse  int
     BackgroundStatLimit  int
     PriorityHeadroom     int
+    CircuitBreaker       CircuitBreakerStats
     Ping              PingResult    // result of startup DATE ping
     QuotaBytes        int64         // 0 = unlimited
     QuotaUsed         int64         // bytes consumed in current period
@@ -924,7 +963,7 @@ type ProviderStats struct {
 | `StatInflight` | `int` | 0 (= `Inflight`) | Pipeline depth for bodyless STAT commands; set higher than `Inflight` (e.g. 50–100) to amortise round-trips on existence sweeps without inflating BODY memory |
 | `BackgroundStatInflight` | `int` | 0 (= `StatInflight`) | Maximum unanswered ordinary, non-priority STAT commands per connection |
 | `PriorityHeadroom` | `int` | 0 | Pipeline slots per connection that ordinary STAT cannot consume |
-| `Factory` | `ConnFactory` | nil | Custom dialer `func(ctx) (net.Conn, error)`; overrides `Host`/`TLSConfig` |
+| `Factory` | `ConnFactory` | nil | Custom dialer `func(ctx) (net.Conn, error)`; overrides `Host`/`TLSConfig`; wrap local setup errors with `ErrInvalidProviderConfiguration` so breaker accounting keeps them separate from provider transport failures |
 | `Backup` | `bool` | false | If true, used only after all eligible main providers fail the request |
 | `SkipPing` | `bool` | false | Skip the startup DATE ping (for servers that don't support DATE) |
 | `IdleTimeout` | `time.Duration` | 0 (disabled) | Disconnect idle connections after this duration; 0 = never |
@@ -949,6 +988,9 @@ type ProviderStats struct {
 // Set the request dispatch strategy (default: DispatchRoundRobin)
 nntppool.WithDispatchStrategy(nntppool.DispatchRoundRobin)
 nntppool.WithDispatchStrategy(nntppool.DispatchFIFO)
+
+// Enable the bounded provider circuit breaker (default: false)
+nntppool.WithProviderCircuitBreaker(true)
 ```
 
 ### Dispatch strategies
@@ -974,8 +1016,14 @@ nntppool.WithDispatchStrategy(nntppool.DispatchFIFO)
 | `ErrConnectionDied` | — | TCP connection closed unexpectedly |
 | `ErrProtocolDesync` | — | Binary data received where a status line was expected |
 | `ErrQuotaExceeded` | — | Provider's download quota for the current period is exhausted |
+| `ErrInvalidProviderConfiguration` | — | Local address, authentication setup, TLS policy, or explicitly classified custom-factory configuration is invalid; never trips the temporary provider breaker |
+| `ErrCircuitBreakerOpen` | — | The provider is temporarily suppressed; use `errors.As` for `*CircuitBreakerError` state and retry time |
 
 `ErrArticleNotFound` uses category matching: `errors.Is(err, ErrArticleNotFound)` returns true for both 430 and 423 responses.
+
+`ErrCircuitBreakerOpen` is a temporary eligibility outcome. nntppool does not wait until `CircuitBreakerError.RetryAt`; callers that need deadline-aware retry orchestration own that policy.
+
+Recognized built-in address/TLS setup failures and missing authentication configuration preserve `ErrInvalidProviderConfiguration`. A custom `ConnFactory` should wrap that sentinel only for local configuration failures; ordinary provider dial, timeout, reset, greeting I/O, and response failures remain breaker-eligible transport outcomes.
 
 High-level buffered BODY APIs never return corrupt payload as a successful body.
 They preserve `errors.Is` checks through `TransportError` and expose every
