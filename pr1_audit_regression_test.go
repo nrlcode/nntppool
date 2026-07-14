@@ -476,6 +476,65 @@ func TestPR1RawDecoderErrorsRetainV4Semantics(t *testing.T) {
 	}
 }
 
+func TestPR1NativeDecoderErrorFallsBackBeforeBufferedAcceptance(t *testing.T) {
+	nativeErr := errors.New("native provider decoder regression")
+	first := &regressionProvider{
+		host: "native-error.invalid:119",
+		respond: func(int, string) []byte {
+			return yencSinglePart([]byte("must be discarded"), "invalid.bin")
+		},
+	}
+	second := &regressionProvider{
+		host: "native-fallback.invalid:119",
+		respond: func(int, string) []byte {
+			return yencSinglePart([]byte("native fallback"), "valid.bin")
+		},
+	}
+	client := newRegressionClient(t, first.provider(false), second.provider(false))
+	var decodeCalls atomic.Int32
+	client.decodeFn = func(dst, src []byte, state *rapidyenc.State) (int, int, rapidyenc.End, error) {
+		if decodeCalls.Add(1) == 1 {
+			return 0, 0, rapidyenc.EndNone, nativeErr
+		}
+		return rapidyenc.DecodeIncremental(dst, src, state)
+	}
+
+	body, err := client.Body(context.Background(), "fixture@example.invalid")
+	if err != nil {
+		t.Fatalf("Body() error = %v", err)
+	}
+	if !bytes.Equal(body.Bytes, []byte("native fallback")) {
+		t.Fatalf("Body() bytes = %q, want fallback provider bytes", body.Bytes)
+	}
+	if len(body.Attempts) != 2 || body.Attempts[0].Outcome != OutcomeCorruptBody || body.Attempts[1].Outcome != OutcomeSuccess {
+		t.Fatalf("attempts = %+v, want native corruption then fallback success", body.Attempts)
+	}
+}
+
+func TestPR1ControlledFeedEnforcesExactBufferedByteCap(t *testing.T) {
+	const byteCap = 64
+	buffered := bytes.Repeat([]byte("x"), 4*byteCap)
+	rb := readBuffer{buf: bytes.Clone(buffered), end: len(buffered)}
+	consumedByFeeder := 0
+	feeder := &mockFeeder{feedFunc: func(in []byte, _ io.Writer) (int, bool, error) {
+		consumedByFeeder += len(in)
+		return len(in), false, nil
+	}}
+	err := rb.feedUntilDoneControlled(nil, feeder, io.Discard, func(_ int, consumed int) (time.Time, bool, int, error) {
+		remaining := byteCap - consumed
+		if remaining <= 0 {
+			return time.Time{}, false, 0, errAbandonedBodyDrainLimit
+		}
+		return time.Time{}, false, remaining, nil
+	})
+	if !errors.Is(err, errAbandonedBodyDrainLimit) {
+		t.Fatalf("buffered feed error = %v, want byte limit", err)
+	}
+	if consumedByFeeder != byteCap {
+		t.Fatalf("buffered bytes consumed = %d, want exact cap %d", consumedByFeeder, byteCap)
+	}
+}
+
 func TestPR1TransportErrorSummaryCannotMixAttempts(t *testing.T) {
 	temporary := &Error{Code: 451, Message: "temporary"}
 	absenceA := &Error{Code: 430, Message: "missing a"}

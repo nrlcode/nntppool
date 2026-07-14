@@ -65,7 +65,11 @@ type AttemptEvidence struct {
 }
 
 // TransportError is the structured final error returned after cancellation or
-// provider exhaustion. Cause remains wrapped for errors.Is/errors.As callers.
+// provider exhaustion. Kind classifies the complete pool result. ProviderID,
+// ResponseCode, and Cause describe one coherent representative attempt when
+// all attempts agree; mixed outcomes intentionally leave provider/code empty
+// and retain complete attribution in Attempts. Cause remains wrapped for
+// errors.Is/errors.As callers.
 type TransportError struct {
 	Kind         OutcomeKind
 	ProviderID   string
@@ -146,17 +150,15 @@ func cloneAttempts(attempts []AttemptEvidence) []AttemptEvidence {
 func newTransportError(attempts []AttemptEvidence, cause error) *TransportError {
 	kind := OutcomeInconclusive
 	haveKind := false
-	var providerID string
-	responseCode := 0
+	mixed := false
 	for _, attempt := range attempts {
 		if attempt.Outcome == OutcomeSuccess {
 			continue
 		}
-		providerID = attempt.ProviderID
-		responseCode = attempt.ResponseCode
 		if attempt.Outcome == OutcomeCancellation {
 			kind = OutcomeCancellation
 			haveKind = true
+			mixed = false
 			continue
 		}
 		if kind == OutcomeCancellation {
@@ -169,6 +171,38 @@ func newTransportError(attempts []AttemptEvidence, cause error) *TransportError 
 			// A final result is conclusive only when every provider attempt
 			// agrees on its outcome class. Per-provider detail remains in Attempts.
 			kind = OutcomeInconclusive
+			mixed = true
+		}
+	}
+
+	var providerID string
+	responseCode := 0
+	if mixed {
+		// Never let a hard-absence cause make errors.Is report global absence
+		// for a mixed result. Choose the last non-absence cause, while leaving
+		// provider/code unattributed because Kind describes the aggregate.
+		for i := len(attempts) - 1; i >= 0; i-- {
+			attempt := attempts[i]
+			if attempt.Outcome != OutcomeSuccess && attempt.Outcome != OutcomeHardArticleAbsence && attempt.Cause != nil {
+				cause = attempt.Cause
+				break
+			}
+		}
+	} else {
+		// Uniform (or single) outcomes select all summary fields from the same
+		// attempt so ProviderID/ResponseCode can never wrap another provider's
+		// cause.
+		for i := len(attempts) - 1; i >= 0; i-- {
+			attempt := attempts[i]
+			if attempt.Outcome != kind {
+				continue
+			}
+			providerID = attempt.ProviderID
+			responseCode = attempt.ResponseCode
+			if attempt.Cause != nil {
+				cause = attempt.Cause
+			}
+			break
 		}
 	}
 	return &TransportError{

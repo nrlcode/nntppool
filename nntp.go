@@ -14,6 +14,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/mnightingale/rapidyenc"
 )
 
 var ErrMaxConnections = errors.New("nntp: server max connections reached")
@@ -148,6 +150,9 @@ type Request struct {
 
 	// Optional: called with yEnc metadata once =ybegin/=ypart headers are parsed, before body decoding.
 	OnMeta func(YEncMeta)
+	// decodeFn is an internal deterministic test seam for native decoder
+	// failures. Production requests leave it nil and use rapidyenc directly.
+	decodeFn func(dst, src []byte, state *rapidyenc.State) (nDst, nSrc int, end rapidyenc.End, err error)
 
 	// PayloadBody is an optional reader streamed to the connection after Payload.
 	// Used by POST to stream article content without buffering in memory.
@@ -1366,7 +1371,9 @@ func (c *NNTPConnection) readerLoop() {
 			Request: req,
 		}
 		decoder := NNTPResponse{
-			onMeta: req.OnMeta,
+			onMeta:             req.OnMeta,
+			strictDecodeErrors: req.ValidateBody,
+			decodeFn:           req.decodeFn,
 		}
 
 		// If the request is cancelled after send, drain only a bounded prefix of
@@ -1399,6 +1406,7 @@ func (c *NNTPConnection) readerLoop() {
 		// always still applies as an upper bound.
 		stall := c.stallTimeout
 		lastBytes := 0
+		lastConsumed := 0
 		var stallDeadline time.Time
 		var firstByteAt time.Time
 		var drainStarted time.Time
@@ -1424,6 +1432,9 @@ func (c *NNTPConnection) readerLoop() {
 					drainStarted = time.Now()
 					drainStartConsumed = consumedBytes
 				}
+				if c.abandonedDrainTimeout > 0 && !time.Now().Before(drainStarted.Add(c.abandonedDrainTimeout)) {
+					return time.Time{}, false, 0, errAbandonedBodyDrainLimit
+				}
 				remaining := c.abandonedDrainBytes - (consumedBytes - drainStartConsumed)
 				if c.abandonedDrainBytes > 0 && remaining <= 0 {
 					return time.Time{}, false, 0, errAbandonedBodyDrainLimit
@@ -1433,13 +1444,16 @@ func (c *NNTPConnection) readerLoop() {
 				}
 				return time.Time{}, false, max(remaining, 0), nil
 			}
-			if wireBytes > lastBytes {
-				lastBytes = wireBytes
+			if wireBytes > lastBytes || consumedBytes > lastConsumed {
+				now := time.Now()
 				if firstByteAt.IsZero() {
-					firstByteAt = time.Now()
+					firstByteAt = now
 				}
+				lastBytes = wireBytes
+				lastConsumed = consumedBytes
 				if stall > 0 {
-					if dl := time.Now().Add(stall); dl.Sub(stallDeadline) >= stallDeadlineQuantum {
+					dl := now.Add(stall)
+					if stallDeadline.IsZero() || !stallDeadline.After(now) || dl.Sub(stallDeadline) >= stallDeadlineQuantum {
 						stallDeadline = dl
 					}
 				}
@@ -1816,6 +1830,9 @@ type Client struct {
 	speedAware bool             // set once by NewClient; weights round-robin dispatch by throughput
 
 	providerIdx atomic.Int64 // monotonic counter for unnamed providers
+	// decodeFn is copied to each request when non-nil. It remains unexported so
+	// production callers cannot replace the transport decoder.
+	decodeFn func(dst, src []byte, state *rapidyenc.State) (nDst, nSrc int, end rapidyenc.End, err error)
 
 	startTime time.Time
 	wg        sync.WaitGroup
@@ -2229,27 +2246,17 @@ func (c *Client) raceCandidates(
 	onMeta func(YEncMeta),
 	validateBody bool,
 	attempts *[]AttemptEvidence,
-	skipHosts *[4]string,
-	skipCount *int,
 	respCh chan<- Response,
 ) (delivered, cancelled bool, lastErr error) {
-	// Filter to live candidates (skip same hosts and quota-exceeded).
+	// Filter to live candidates. Every configured provider remains independently
+	// eligible even when multiple accounts share one endpoint: co-location is
+	// not evidence that retention, authorization, or article availability agree.
 	live := make([]*providerGroup, 0, len(candidates))
-	seen := make(map[string]bool)
 	for _, g := range candidates {
-		if hostSkipped(g.host, skipHosts, *skipCount) {
-			continue
-		}
 		if g.isQuotaExceeded() {
 			lastErr = fmt.Errorf("%s: %w", g.name, ErrQuotaExceeded)
 			*attempts = append(*attempts, buildEligibilityEvidence(payload, g.id, lastErr, validateBody))
 			continue
-		}
-		if g.host != "" && seen[g.host] {
-			continue
-		}
-		if g.host != "" {
-			seen[g.host] = true
 		}
 		live = append(live, g)
 	}
@@ -2270,6 +2277,11 @@ func (c *Client) raceCandidates(
 			return false, false, lastErr
 		}
 		if resp.Err != nil {
+			if bodyWriter != nil && attemptCommittedResp(resp) {
+				resp.Attempts = cloneAttempts(*attempts)
+				respCh <- resp
+				return true, false, nil
+			}
 			return false, false, resp.Err
 		}
 		if resp.StatusCode == 502 {
@@ -2280,10 +2292,6 @@ func (c *Client) raceCandidates(
 			return false, false, fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
 		}
 		if resp.StatusCode == 430 || resp.StatusCode == 423 {
-			if g.host != "" && *skipCount < len(skipHosts) {
-				skipHosts[*skipCount] = g.host
-				*skipCount++
-			}
 			c.nextIdx.Add(1)
 			return false, false, lastErr
 		}
@@ -2331,10 +2339,6 @@ func (c *Client) raceCandidates(
 			}
 			lastErr = fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
 		case 430, 423:
-			if g.host != "" && *skipCount < len(skipHosts) {
-				skipHosts[*skipCount] = g.host
-				*skipCount++
-			}
 			c.nextIdx.Add(1)
 		case 223:
 			winners = append(winners, g)
@@ -2372,10 +2376,6 @@ func (c *Client) raceCandidates(
 			continue
 		}
 		if resp.StatusCode == 430 || resp.StatusCode == 423 {
-			if winner.host != "" && *skipCount < len(skipHosts) {
-				skipHosts[*skipCount] = winner.host
-				*skipCount++
-			}
 			c.nextIdx.Add(1)
 			continue
 		}
@@ -2442,6 +2442,7 @@ func (c *Client) tryGroup(
 		FreshTransport:  freshTransport,
 		Priority:        priority,
 		OnMeta:          onMeta,
+		decodeFn:        c.decodeFn,
 		submittedAt:     time.Now(),
 		responseTimeout: g.attemptTimeout(),
 	}
@@ -2492,20 +2493,6 @@ func (c *Client) tryGroup(
 			return failAttempt(reqCtx.Err()), false, ctx.Err() != nil
 		}
 	}
-}
-
-// hostSkipped reports whether host is already in the skip list.
-// Empty hosts (Factory-based providers) are never skipped.
-func hostSkipped(host string, skipHosts *[4]string, count int) bool {
-	if host == "" || count == 0 {
-		return false
-	}
-	for i := range count {
-		if skipHosts[i] == host {
-			return true
-		}
-	}
-	return false
 }
 
 // attemptCommittedResp reports whether the response came from an attempt that
@@ -2679,6 +2666,11 @@ func (c *Client) tryGroupResilient(
 			delay := temporaryRetryMinDelay + time.Duration(rand.Int64N(int64(temporaryRetryJitter)+1))
 			select {
 			case <-time.After(delay):
+				// The response connection was retired by readerLoop. Reject every
+				// other transport that predates this retry as well, so a multi-
+				// connection provider cannot satisfy the retry from another hot
+				// socket.
+				freshTransport = true
 				continue
 			case <-ctx.Done():
 				resp.Attempts = cloneAttempts(attempts)
@@ -2710,11 +2702,6 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 	var lastErr error
 	var attempts []AttemptEvidence
 	post430 := false
-
-	// Track hosts that returned 430 so we can skip other providers on
-	// the same server (different credentials won't help).
-	var skipHosts [4]string
-	skipCount := 0
 
 	// 1. Try all main providers.
 	mains := *c.mainGroups.Load()
@@ -2753,9 +2740,6 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 	for attempt := range n {
 		idx := (start + attempt) % n
 		g := mains[idx]
-		if hostSkipped(g.host, &skipHosts, skipCount) {
-			continue
-		}
 		if g.isQuotaExceeded() {
 			lastErr = fmt.Errorf("%s: %w", g.name, ErrQuotaExceeded)
 			attempts = append(attempts, buildEligibilityEvidence(payload, g.id, lastErr, validateBody))
@@ -2799,10 +2783,6 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 		}
 		if resp.StatusCode == 430 || resp.StatusCode == 423 {
 			c.nextIdx.Add(1) // bias next request away from this provider
-			if g.host != "" && skipCount < len(skipHosts) {
-				skipHosts[skipCount] = g.host
-				skipCount++
-			}
 			lastResp = resp
 			hasResp = true
 			post430 = true
@@ -2815,7 +2795,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 				}
 				delivered, cancelled, raceErr := c.raceCandidates(
 					ctx, rest, statPayload, payload, bodyWriter, onMeta,
-					validateBody, &attempts, &skipHosts, &skipCount, respCh,
+					validateBody, &attempts, respCh,
 				)
 				if cancelled {
 					err := ctx.Err()
@@ -2850,7 +2830,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 	if raceable && post430 {
 		delivered, cancelled, raceErr := c.raceCandidates(
 			ctx, backups, statPayload, payload, bodyWriter, onMeta,
-			validateBody, &attempts, &skipHosts, &skipCount, respCh,
+			validateBody, &attempts, respCh,
 		)
 		if cancelled {
 			err := ctx.Err()
@@ -2869,9 +2849,6 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 	} else {
 		for i := range backups {
 			g := backups[i]
-			if hostSkipped(g.host, &skipHosts, skipCount) {
-				continue
-			}
 			if g.isQuotaExceeded() {
 				lastErr = fmt.Errorf("%s: %w", g.name, ErrQuotaExceeded)
 				attempts = append(attempts, buildEligibilityEvidence(payload, g.id, lastErr, validateBody))

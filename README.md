@@ -35,6 +35,7 @@ A high-performance NNTP connection pool library for Go. It manages multiple NNTP
   - [Reading articles](#reading-articles)
   - [Posting articles](#posting-articles)
   - [Low-level send](#low-level-send)
+  - [v4 source compatibility](#v4-source-compatibility)
   - [Provider management](#provider-management)
   - [Statistics](#statistics)
   - [Provider testing](#provider-testing)
@@ -58,7 +59,7 @@ A high-performance NNTP connection pool library for Go. It manages multiple NNTP
 - **Command pipelining**: configurable inflight requests per connection (default: 1)
 - **Weighted round-robin dispatch**: distributes load by available inflight capacity; FIFO mode also available
 - **Automatic failover**: ordered fallback for hard absence (423/430), temporary failure, corruption, unavailability, and transport failure, followed by failure-only backups
-- **Same-host deduplication**: a hard-absence response from one account on a host skips all other accounts on the same host
+- **Independent provider evidence**: every configured account remains eligible after hard absence, even when multiple accounts share one endpoint
 - **Provider removal on 502**: permanently unavailable providers are atomically removed from the pool
 - **Auto-reconnect after 502**: optionally re-add a provider after a configurable delay (`ReconnectDelay`)
 - **Validated yEnc decoding**: SIMD-accelerated via `rapidyenc`, with complete framing, size, part, decoder, and supplied-CRC validation
@@ -610,8 +611,8 @@ client.Send()
     → try hotReqCh (non-blocking) — succeeds only if a connection is already idle with inflight capacity
     → fall back to reqCh (wakes a cold slot or queues behind in-flight requests)
     → receive response from innerCh
-    → on 423/430: retry next provider, track host to skip duplicates
-    → on 451: retry once on a fresh connection, then advance
+    → on 423/430: retry every remaining configured provider
+    → on 451: reject all preexisting transports, retry once on a newly created connection, then advance
     → on buffered BODY corruption: retire the socket and advance
     → on 502: remove provider, retry
     → on all exhausted: deliver last response or error
@@ -631,14 +632,14 @@ Both strategies skip quota-exceeded providers during normal dispatch. If all pro
 1. Attempt all main providers (round-robin start, then configured order):
    - 2xx → success, return response immediately
    - 430/423 → article not found on this provider:
-       • record host in skipHosts (up to 4)
-       • skip other providers on the same host (different credentials won't help)
-       • try next provider
+       • retain provider-specific evidence
+       • try every remaining configured provider, including accounts sharing the endpoint
    - 502 → permanent unavailability:
        • atomically remove provider from pool
        • if ReconnectDelay > 0: schedule re-add after delay
        • try next provider
-   - 451 → retry once on a fresh connection after short jitter, then try next provider
+   - 451 → retire its socket, reject every other preexisting socket for that provider,
+     retry once on a newly created connection after short jitter, then try next provider
    - buffered BODY framing/decode/size/CRC failure → retire the socket, try next provider
    - connection error → try next provider
    - quota exceeded → skip, try next provider
@@ -674,8 +675,9 @@ The `NNTPResponse` type in `reader.go` implements `streamFeeder` and processes r
    - Parses `=ypart` for byte range (begin/end), fires `onMeta` callback
    - Delegates to `rapidyenc.DecodeIncremental()` for SIMD-accelerated in-place decoding
    - Accumulates CRC32 using `crc32.Update()` on each decoded chunk
-   - Parses `=yend` for `pcrc32=` or `crc32=` field
-   - Before buffered acceptance, requires coherent `=ybegin`/`=ypart`/`=yend`, decoded sizes, native decoder success, and every supplied CRC (including `00000000`)
+   - Parses `pcrc32=` and `crc32=` independently and requires every supplied value to contain exactly eight hexadecimal digits
+   - Validates `pcrc32` against the decoded part. A whole-file `crc32` is also compared when the BODY covers the complete file; on a partial multipart BODY it is syntax-checked but cannot be proven from that part alone
+   - Before buffered acceptance, requires coherent `=ybegin`/`=ypart`/`=yend`, decoded sizes, native decoder success, and every applicable supplied CRC (including `00000000`)
    - A failed buffered attempt is discarded and may fall back; a caller-owned writer is never restarted after receiving decoded bytes
 4. **UU path**: detected but not decoded further (format is noted in `ArticleBody.Encoding`)
 5. **NNTP terminator**: `.\r\n` detected by `rapidyenc.DecodeIncremental` returning `EndArticle`; backs up 3 bytes to include the terminator in subsequent header parsing
@@ -763,7 +765,11 @@ func (c *Client) Send(ctx context.Context, payload []byte, bodyWriter io.Writer,
 func (c *Client) SendPriority(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta ...func(YEncMeta)) <-chan Response
 ```
 
-Both return immediately with a buffered channel (capacity 1). The caller receives exactly one `Response`. Use `bodyWriter = nil` to buffer decoded bytes in `Response.Body`; use `io.Discard` to throw them away; use any `io.Writer` to stream them. Raw `Send` retains v4 behavior and does not enable the high-level BODY integrity contract; its BODY evidence reports `not_requested`.
+Both return immediately with a buffered channel (capacity 1). The caller receives exactly one `Response`. Use `bodyWriter = nil` to buffer decoded bytes in `Response.Body`; use `io.Discard` to throw them away; use any `io.Writer` to stream them. Raw `Send` retains v4 behavior, including its historical native-decoder-error handling, and does not enable the high-level BODY integrity contract; its BODY evidence reports `not_requested`.
+
+### v4 source compatibility
+
+Existing v4 methods and their signatures remain available. Zero values and external keyed composite literals remain source-compatible as additive provider identity, result evidence, validation, and telemetry fields are introduced. External unkeyed literals of exported structs are not part of this compatibility guarantee: Go requires their field count and order to remain frozen, which is incompatible with the plan's explicitly additive v4 fields. The test suite includes an external-package compile fixture for the supported keyed and method-call surface.
 
 ### Provider management
 
@@ -807,9 +813,9 @@ type ArticleBody struct {
     Encoding      ArticleEncoding // EncodingYEnc | EncodingUU | EncodingUnknown
     YEnc          YEncMeta        // yEnc metadata (zero value for non-yEnc)
     CRC           uint32          // actual CRC of decoded bytes
-    ExpectedCRC   uint32          // CRC from =yend (0 when absent)
-    CRCProvided   bool
-    CRCValid      bool            // true when a supplied CRC, including zero, matched
+    ExpectedCRC   uint32          // applicable checksum for these decoded bytes
+    CRCProvided   bool            // an applicable part/full-file checksum was supplied
+    CRCValid      bool            // true when that checksum, including zero, matched
 }
 
 // AttemptEvidence contains bounded transport facts for one provider attempt.
@@ -828,6 +834,9 @@ type AttemptEvidence struct {
 
 // TransportError wraps the existing sentinel/protocol cause so errors.Is and
 // errors.As checks remain valid after provider exhaustion or cancellation.
+// Kind describes the aggregate pool outcome. Uniform results attribute the
+// provider/code/cause to one coherent attempt; mixed outcomes intentionally
+// leave ProviderID and ResponseCode empty and retain detail in Attempts.
 type TransportError struct {
     Kind         OutcomeKind
     ProviderID   string

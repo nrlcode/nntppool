@@ -172,11 +172,14 @@ func (rb *readBuffer) feedUntilDoneControlled(
 		if err != nil {
 			return err
 		}
-		if done {
-			return nil
-		}
+		// Re-check control even when this buffered feed completed the response.
+		// Time and byte bounds are lifecycle limits, not merely socket-read
+		// deadlines, so locally buffered completion cannot bypass them.
 		if _, _, _, controlErr = control(wireBytes, consumedBytes); controlErr != nil {
 			return controlErr
+		}
+		if done {
+			return nil
 		}
 
 		// Need more data.

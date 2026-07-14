@@ -2,8 +2,6 @@ package nntppool
 
 import (
 	"bytes"
-	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -43,10 +41,17 @@ type NNTPResponse struct {
 	hasBegin     bool
 	hasEnd       bool
 	hasCrc       bool
+	hasPartCRC   bool
+	hasFileCRC   bool
 	hasEmptyline bool // for article requests has the empty line separating headers and body been seen
+	partCRC      uint32
+	fileCRC      uint32
 	onMeta       func(YEncMeta)
 	headerErr    error
-	decodeFn     func(dst, src []byte, state *rapidyenc.State) (nDst, nSrc int, end rapidyenc.End, err error)
+	// Raw Send retains v4's decoder-error behavior. Strict high-level BODY
+	// requests set this flag and propagate native decoder failures as corruption.
+	strictDecodeErrors bool
+	decodeFn           func(dst, src []byte, state *rapidyenc.State) (nDst, nSrc int, end rapidyenc.End, err error)
 }
 
 const nntpBody = 222
@@ -276,7 +281,7 @@ func (r *NNTPResponse) decodeYenc(buf []byte, out io.Writer) (n int64, err error
 		decodeFn = rapidyenc.DecodeIncremental
 	}
 	produced, consumed, end, err = decodeFn(buf, buf, &r.State)
-	if err != nil {
+	if err != nil && r.strictDecodeErrors {
 		return 0, fmt.Errorf("%w: yEnc decode: %w", ErrBodyCorrupt, err)
 	}
 
@@ -359,15 +364,33 @@ func (r *NNTPResponse) processYencHeader(line []byte) {
 	} else if bytes.HasPrefix(line, []byte("=yend ")) {
 		r.hasEnd = true
 		line = line[len("=yend"):]
-		if crc, err := extractCRC(line, []byte(" pcrc32=")); err == nil {
-			r.ExpectedCRC = crc
-			r.hasCrc = true
-		} else if crc, err := extractCRC(line, []byte(" crc32=")); err == nil {
-			r.ExpectedCRC = crc
-			r.hasCrc = true
+		if bytes.Contains(line, []byte(" pcrc32=")) {
+			crc, crcErr := extractCRC(line, []byte(" pcrc32="))
+			if crcErr != nil {
+				r.headerErr = fmt.Errorf("invalid =yend pcrc32: %w", crcErr)
+			} else {
+				r.partCRC = crc
+				r.hasPartCRC = true
+			}
 		}
-		if (bytes.Contains(line, []byte(" pcrc32=")) || bytes.Contains(line, []byte(" crc32="))) && !r.hasCrc {
-			r.headerErr = fmt.Errorf("invalid =yend CRC")
+		if bytes.Contains(line, []byte(" crc32=")) {
+			crc, crcErr := extractCRC(line, []byte(" crc32="))
+			if crcErr != nil {
+				r.headerErr = fmt.Errorf("invalid =yend crc32: %w", crcErr)
+			} else {
+				r.fileCRC = crc
+				r.hasFileCRC = true
+			}
+		}
+		// Preserve the existing single expected-CRC view for callers. Final
+		// applicability is resolved by validateBody once part coverage is known.
+		switch {
+		case r.hasPartCRC:
+			r.ExpectedCRC = r.partCRC
+			r.hasCrc = true
+		case r.hasFileCRC:
+			r.ExpectedCRC = r.fileCRC
+			r.hasCrc = true
 		}
 		if r.EndSize, err = extractInt(line, []byte(" size=")); err != nil {
 			r.headerErr = fmt.Errorf("invalid =yend size: %w", err)
@@ -419,8 +442,28 @@ func (r *NNTPResponse) validateBody() error {
 	if r.EndSize != int64(r.BytesDecoded) {
 		return fmt.Errorf("%w: trailer size %d does not match decoded size %d", ErrBodyCorrupt, r.EndSize, r.BytesDecoded)
 	}
-	if r.hasCrc && r.CRC != r.ExpectedCRC {
+	completeFile := !r.hasPart || (r.YEnc.PartBegin == 0 && r.YEnc.PartSize == r.YEnc.FileSize)
+	if r.hasPartCRC && r.CRC != r.partCRC {
 		return fmt.Errorf("%w: %w", ErrBodyCorrupt, ErrCRCMismatch)
+	}
+	// crc32 covers the complete file. It is verifiable for a single-part/full-
+	// coverage BODY, but only syntax-checkable for one partial multipart BODY.
+	// pcrc32 remains the integrity checksum for that partial part.
+	if r.hasFileCRC && completeFile && r.CRC != r.fileCRC {
+		return fmt.Errorf("%w: %w", ErrBodyCorrupt, ErrCRCMismatch)
+	}
+	// ExpectedCRC/hasCrc describe the checksum that was actually applicable to
+	// these decoded bytes, avoiding a false mismatch for an unverifiable whole-
+	// file CRC on a partial multipart response.
+	r.hasCrc = false
+	r.ExpectedCRC = 0
+	switch {
+	case r.hasPartCRC:
+		r.hasCrc = true
+		r.ExpectedCRC = r.partCRC
+	case r.hasFileCRC && completeFile:
+		r.hasCrc = true
+		r.ExpectedCRC = r.fileCRC
 	}
 	return nil
 }
@@ -470,16 +513,9 @@ func extractCRC(data, substr []byte) (uint32, error) {
 		data = data[:end]
 	}
 
-	// Take up to the last 8 characters
-	parsed := data[len(data)-min(8, len(data)):]
-
-	// Left pad unexpected length with 0
-	if len(parsed) != 8 {
-		padded := []byte("00000000")
-		copy(padded[8-len(parsed):], parsed)
-		parsed = padded
+	if len(data) != 8 {
+		return 0, fmt.Errorf("CRC must contain exactly 8 hexadecimal digits")
 	}
-
-	_, err := hex.Decode(parsed, parsed)
-	return binary.BigEndian.Uint32(parsed), err
+	parsed, err := strconv.ParseUint(string(data), 16, 32)
+	return uint32(parsed), err
 }

@@ -983,8 +983,9 @@ func TestPR1ZeroCRCIsValidated(t *testing.T) {
 func TestPR1NativeDecodeErrorPropagates(t *testing.T) {
 	nativeErr := errors.New("native decoder regression")
 	response := NNTPResponse{
-		body:   true,
-		Format: 1,
+		body:               true,
+		Format:             1,
+		strictDecodeErrors: true,
 		decodeFn: func([]byte, []byte, *rapidyenc.State) (int, int, rapidyenc.End, error) {
 			return 0, 0, rapidyenc.EndNone, nativeErr
 		},
