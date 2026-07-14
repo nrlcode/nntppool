@@ -996,6 +996,9 @@ func TestPR1NativeDecodeErrorPropagates(t *testing.T) {
 }
 
 func TestPR1ParallelProbePreservesConfiguredOrderAndEvidence(t *testing.T) {
+	preferredProbeStarted := make(chan struct{})
+	laterProbeFinished := make(chan struct{})
+	var preferredOnce, laterOnce sync.Once
 	missing := &regressionProvider{
 		host:    "probe-missing.invalid:119",
 		respond: func(_ int, _ string) []byte { return []byte("430 no such article\r\n") },
@@ -1004,7 +1007,8 @@ func TestPR1ParallelProbePreservesConfiguredOrderAndEvidence(t *testing.T) {
 		host: "probe-preferred.invalid:119",
 		respond: func(_ int, command string) []byte {
 			if strings.HasPrefix(command, "STAT") {
-				time.Sleep(80 * time.Millisecond)
+				preferredOnce.Do(func() { close(preferredProbeStarted) })
+				<-laterProbeFinished
 				return []byte("223 1 <fixture@example.invalid> exists\r\n")
 			}
 			return yencSinglePart([]byte("preferred"), "preferred.bin")
@@ -1014,6 +1018,8 @@ func TestPR1ParallelProbePreservesConfiguredOrderAndEvidence(t *testing.T) {
 		host: "probe-faster.invalid:119",
 		respond: func(_ int, command string) []byte {
 			if strings.HasPrefix(command, "STAT") {
+				<-preferredProbeStarted
+				laterOnce.Do(func() { close(laterProbeFinished) })
 				return []byte("223 1 <fixture@example.invalid> exists\r\n")
 			}
 			return yencSinglePart([]byte("later"), "later.bin")
@@ -1215,6 +1221,10 @@ func TestPR1UnsentPriorityPrecedesQueuedNormalWork(t *testing.T) {
 	for (len(group.reqCh) == 0 || len(group.prioCh) == 0) && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
+	if len(group.reqCh) == 0 || len(group.prioCh) == 0 {
+		close(releaseFirst)
+		t.Fatalf("normal/priority queues did not both populate: normal=%d priority=%d", len(group.reqCh), len(group.prioCh))
+	}
 	close(releaseFirst)
 	if second := <-commands; !strings.HasPrefix(second, "BODY") {
 		t.Errorf("second command = %q, want priority BODY before queued normal STAT", second)
@@ -1280,10 +1290,20 @@ func TestPR1BackgroundStatWindowPreservesPriorityHeadroom(t *testing.T) {
 			t.Fatal("background STAT window did not fill")
 		}
 	}
+	group := (*client.mainGroups.Load())[0]
+	deadline := time.Now().Add(time.Second)
+	for (client.Stats().Providers[0].BackgroundStatInUse != 2 || len(group.reqCh) == 0) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if stats := client.Stats().Providers[0]; stats.BackgroundStatInUse != 2 || len(group.reqCh) == 0 {
+		close(release)
+		t.Fatalf("background window/queue did not reach deterministic blocked state: stats=%+v queued=%d", stats, len(group.reqCh))
+	}
 	select {
 	case command := <-commands:
+		close(release)
 		t.Fatalf("ordinary background exceeded configured window before priority: %q", command)
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
 	go func() {
 		_, err := client.StatPriority(context.Background(), "priority@example.invalid")

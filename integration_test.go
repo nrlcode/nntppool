@@ -603,9 +603,10 @@ func TestClient_SendRetryAll430(t *testing.T) {
 	}
 }
 
-func TestClient_Skip430SameHost(t *testing.T) {
+func TestClient_Tries430SameHostAccounts(t *testing.T) {
 	// Two main providers + one backup, all same host but different auth.
-	// First returns 430 → others should be skipped.
+	// Every configured account remains independently eligible for hard-absence
+	// evidence even when the endpoint is shared.
 	var counts [3]atomic.Int64
 	make430Factory := func(idx int) ConnFactory {
 		return func(ctx context.Context) (net.Conn, error) {
@@ -651,8 +652,8 @@ func TestClient_Skip430SameHost(t *testing.T) {
 	}
 
 	total := counts[0].Load() + counts[1].Load() + counts[2].Load()
-	if total != 1 {
-		t.Errorf("total requests = %d, want 1 (same-host providers should be skipped)", total)
+	if total != 3 {
+		t.Errorf("total requests = %d, want 3 (every same-host account must be tried)", total)
 	}
 }
 

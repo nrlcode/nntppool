@@ -15,11 +15,11 @@ import (
 
 func TestFeed_SingleLineResponse(t *testing.T) {
 	tests := []struct {
-		name       string
-		input      string
-		wantCode   int
-		wantDone   bool
-		wantMsg    string
+		name     string
+		input    string
+		wantCode int
+		wantDone bool
+		wantMsg  string
 	}{
 		{"200 ok", "200 server ready\r\n", 200, true, "200 server ready"},
 		{"430 not found", "430 no such article\r\n", 430, true, "430 no such article"},
@@ -550,10 +550,12 @@ func TestExtractCRC(t *testing.T) {
 		wantErr bool
 	}{
 		{"full 8-char", " pcrc32=AABBCCDD", " pcrc32=", 0xAABBCCDD, false},
-		{"short left-padded", " pcrc32=AABB", " pcrc32=", 0x0000AABB, false},
+		{"empty", " pcrc32=", " pcrc32=", 0, true},
+		{"short", " pcrc32=AABB", " pcrc32=", 0, true},
 		{"not found", " crc32=AABB", " pcrc32=", 0, true},
 		{"lowercase", " pcrc32=aabbccdd", " pcrc32=", 0xAABBCCDD, false},
-		{">8 chars takes last 8", " pcrc32=00AABBCCDD", " pcrc32=", 0xAABBCCDD, false},
+		{"overlong", " pcrc32=00AABBCCDD", " pcrc32=", 0, true},
+		{"non-hex", " pcrc32=not-hex!", " pcrc32=", 0, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -619,10 +621,10 @@ func TestDecodeUUChar(t *testing.T) {
 		c    byte
 		want int
 	}{
-		{'`', 0},   // backtick → 0
-		{' ', 0},   // space → 0
-		{'!', 1},   // ! → 1
-		{'M', 45},  // M → 45
+		{'`', 0},  // backtick → 0
+		{' ', 0},  // space → 0
+		{'!', 1},  // ! → 1
+		{'M', 45}, // M → 45
 	}
 	for _, tt := range tests {
 		if got := decodeUUChar(tt.c); got != tt.want {
@@ -635,7 +637,7 @@ func TestDecodeUUCharWorkaround(t *testing.T) {
 	// Verify formula: ((int(c)-32)&63)*4+5)/3
 	// For 'M' (77): ((77-32)&63)*4+5)/3 = (45*4+5)/3 = 185/3 = 61
 	got := decodeUUCharWorkaround('M')
-	want := int(((int('M') - 32) & 63 * 4) + 5) / 3
+	want := int(((int('M')-32)&63*4)+5) / 3
 	if got != want {
 		t.Errorf("decodeUUCharWorkaround('M') = %d, want %d", got, want)
 	}
@@ -646,10 +648,10 @@ func TestIsMultiline(t *testing.T) {
 		code int
 		want bool
 	}{
-		{222, true},  // BODY
-		{220, true},  // ARTICLE
-		{221, true},  // HEAD
-		{101, true},  // CAPABILITIES
+		{222, true}, // BODY
+		{220, true}, // ARTICLE
+		{221, true}, // HEAD
+		{101, true}, // CAPABILITIES
 		{200, false},
 		{430, false},
 		{480, false},
