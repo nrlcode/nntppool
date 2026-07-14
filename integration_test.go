@@ -481,7 +481,7 @@ func TestClient_SendRetryFallbackBackup(t *testing.T) {
 	}
 
 	c, err := NewClient(context.Background(), []Provider{
-		{Factory: makeFactory(430), Connections: 1},        // main: always 430
+		{Factory: makeFactory(430), Connections: 1},               // main: always 430
 		{Factory: makeFactory(223), Connections: 1, Backup: true}, // backup: 223
 	})
 	if err != nil {
@@ -554,6 +554,15 @@ func TestClient_SendRetryConnectionDiedSameProvider(t *testing.T) {
 	if got := connNum.Load(); got < 2 {
 		t.Errorf("expected at least 2 connections (stale + fresh), got %d", got)
 	}
+	if len(resp.Attempts) < 2 || resp.Attempts[len(resp.Attempts)-1].Outcome != OutcomeSuccess {
+		t.Errorf("attempts = %+v, want connection death followed by same-provider success", resp.Attempts)
+	} else {
+		for _, attempt := range resp.Attempts[:len(resp.Attempts)-1] {
+			if attempt.Outcome != OutcomeTransportFailure {
+				t.Errorf("pre-success attempt = %+v, want transport failure", attempt)
+			}
+		}
+	}
 }
 
 func TestClient_SendRetryAll430(t *testing.T) {
@@ -594,9 +603,10 @@ func TestClient_SendRetryAll430(t *testing.T) {
 	}
 }
 
-func TestClient_Skip430SameHost(t *testing.T) {
+func TestClient_Tries430SameHostAccounts(t *testing.T) {
 	// Two main providers + one backup, all same host but different auth.
-	// First returns 430 → others should be skipped.
+	// Every configured account remains independently eligible for hard-absence
+	// evidence even when the endpoint is shared.
 	var counts [3]atomic.Int64
 	make430Factory := func(idx int) ConnFactory {
 		return func(ctx context.Context) (net.Conn, error) {
@@ -642,8 +652,8 @@ func TestClient_Skip430SameHost(t *testing.T) {
 	}
 
 	total := counts[0].Load() + counts[1].Load() + counts[2].Load()
-	if total != 1 {
-		t.Errorf("total requests = %d, want 1 (same-host providers should be skipped)", total)
+	if total != 3 {
+		t.Errorf("total requests = %d, want 3 (every same-host account must be tried)", total)
 	}
 }
 
@@ -804,7 +814,6 @@ func TestClient_FIFODispatch(t *testing.T) {
 		t.Errorf("FIFO: p1=%d p2=%d, want p1=%d p2=0", hits["p1"], hits["p2"], N)
 	}
 }
-
 
 func TestClient_FIFO430Fallthrough(t *testing.T) {
 	// Provider #1 returns 430, provider #2 returns 223.
@@ -1314,8 +1323,8 @@ func TestClient_502CommandFallsBackToBackup(t *testing.T) {
 	}
 
 	c, err := NewClient(context.Background(), []Provider{
-		{Factory: makeFactory(502), Connections: 1},                // main: always 502
-		{Factory: makeFactory(223), Connections: 1, Backup: true},  // backup: success
+		{Factory: makeFactory(502), Connections: 1},               // main: always 502
+		{Factory: makeFactory(223), Connections: 1, Backup: true}, // backup: success
 	})
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)
@@ -1446,4 +1455,3 @@ func TestKeepalive_DeadConnection(t *testing.T) {
 		t.Fatal("timeout: Run() should have returned after keepalive detected dead connection")
 	}
 }
-
