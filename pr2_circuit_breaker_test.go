@@ -123,6 +123,14 @@ func requireBreakerTransportKind(t *testing.T, err error, want OutcomeKind) *Tra
 	return transportErr
 }
 
+func requireBreakerConfigurationError(t *testing.T, err error) {
+	t.Helper()
+	_ = requireBreakerTransportKind(t, err, OutcomeProviderUnavailable)
+	if !errors.Is(err, ErrInvalidProviderConfiguration) {
+		t.Errorf("error = %v, want ErrInvalidProviderConfiguration", err)
+	}
+}
+
 func targetedBreakerErrors(client *Client, providerID string, count int) []error {
 	start := make(chan struct{})
 	results := make(chan error, count)
@@ -643,7 +651,7 @@ func TestPR2BootstrapAuthenticationAndConfigurationDoNotTripBreaker(t *testing.T
 		}
 		client := newBreakerClient(t, newBreakerFakeClock(), provider)
 		for request, err := range targetedBreakerErrors(client, provider.ID, 3) {
-			requireBreakerTransportKind(t, err, OutcomeProviderUnavailable)
+			_ = requireBreakerTransportKind(t, err, OutcomeProviderUnavailable)
 			if !errors.Is(err, ErrAuthRejected) {
 				t.Errorf("request %d error = %v, want ErrAuthRejected", request+1, err)
 			}
@@ -673,7 +681,7 @@ func TestPR2BootstrapAuthenticationAndConfigurationDoNotTripBreaker(t *testing.T
 		}
 		client := newBreakerClient(t, newBreakerFakeClock(), provider)
 		for _, err := range targetedBreakerErrors(client, provider.ID, 3) {
-			requireBreakerTransportKind(t, err, OutcomeProviderUnavailable)
+			requireBreakerConfigurationError(t, err)
 		}
 		if stats := providerBreakerStats(t, client, provider.ID); stats.State != CircuitBreakerClosed || stats.QualifyingFailures != 0 {
 			t.Fatalf("missing-password configuration changed breaker state: %+v", stats)
@@ -690,7 +698,7 @@ func TestPR2BootstrapAuthenticationAndConfigurationDoNotTripBreaker(t *testing.T
 		}
 		client := newBreakerClient(t, newBreakerFakeClock(), provider)
 		for _, err := range targetedBreakerErrors(client, provider.ID, 3) {
-			requireBreakerTransportKind(t, err, OutcomeProviderUnavailable)
+			requireBreakerConfigurationError(t, err)
 		}
 		if stats := providerBreakerStats(t, client, provider.ID); stats.State != CircuitBreakerClosed || stats.QualifyingFailures != 0 {
 			t.Fatalf("malformed-address configuration changed breaker state: %+v", stats)
@@ -733,7 +741,7 @@ func TestPR2BootstrapAuthenticationAndConfigurationDoNotTripBreaker(t *testing.T
 		}
 		client := newBreakerClient(t, newBreakerFakeClock(), provider)
 		for _, requestErr := range targetedBreakerErrors(client, provider.ID, 3) {
-			requireBreakerTransportKind(t, requestErr, OutcomeProviderUnavailable)
+			requireBreakerConfigurationError(t, requestErr)
 		}
 		if stats := providerBreakerStats(t, client, provider.ID); stats.State != CircuitBreakerClosed || stats.QualifyingFailures != 0 {
 			t.Fatalf("invalid TLS policy changed breaker state: %+v", stats)

@@ -78,6 +78,36 @@ type TransportError struct {
 	Cause        error
 }
 
+// classifiedError preserves an existing error string and underlying cause
+// while attaching a stable semantic category for errors.Is/errors.As callers.
+// It is used when connection bootstrap discovers authentication or local
+// provider configuration errors before an NNTP command can be issued.
+type classifiedError struct {
+	cause    error
+	category error
+}
+
+func (e *classifiedError) Error() string {
+	if e == nil || e.cause == nil {
+		return "<nil>"
+	}
+	return e.cause.Error()
+}
+
+func (e *classifiedError) Unwrap() []error {
+	if e == nil {
+		return nil
+	}
+	return []error{e.cause, e.category}
+}
+
+func withErrorClassification(cause, category error) error {
+	if cause == nil || category == nil || errors.Is(cause, category) {
+		return cause
+	}
+	return &classifiedError{cause: cause, category: category}
+}
+
 func (e *TransportError) Error() string {
 	if e == nil {
 		return "<nil>"
@@ -124,7 +154,7 @@ func classifyOutcome(code int, err error) OutcomeKind {
 		return OutcomeTemporaryFailure
 	case errors.Is(err, ErrServiceUnavailable), errors.Is(err, ErrAuthRequired),
 		errors.Is(err, ErrAuthRejected), errors.Is(err, ErrQuotaExceeded),
-		errors.Is(err, ErrMaxConnections), code == 502:
+		errors.Is(err, ErrInvalidProviderConfiguration), errors.Is(err, ErrMaxConnections), code == 502:
 		return OutcomeProviderUnavailable
 	case code == 423 || code == 430 || errors.Is(err, ErrArticleNotFound):
 		return OutcomeHardArticleAbsence
@@ -287,6 +317,11 @@ var (
 	ErrBodyCorrupt         = errors.New("nntp: corrupt article body")
 	ErrProtocolDesync      = errors.New("nntp: protocol desync: expected status line, got binary data")
 	ErrQuotaExceeded       = errors.New("nntp: download quota exceeded")
+	// ErrInvalidProviderConfiguration identifies a local provider address,
+	// authentication setup, TLS policy, or caller-supplied factory error that
+	// must remain distinct from temporary provider transport health. Custom
+	// ConnFactory implementations may wrap this sentinel when appropriate.
+	ErrInvalidProviderConfiguration = errors.New("nntp: invalid provider configuration")
 )
 
 // toError maps an NNTP status code to a sentinel error, or returns nil for success codes.

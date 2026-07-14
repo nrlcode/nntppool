@@ -669,7 +669,7 @@ client, err := nntppool.NewClient(ctx, providers,
 )
 ```
 
-When enabled, each provider opens after three qualifying failures from distinct public requests within a rolling 30-second window. Accounting happens once after all internal retries for that provider: a final `451`, provider connection/bootstrap failure, direct provider transport failure, or genuine provider response/progress timeout counts. Local queue/admission expiry, collateral pipeline cancellation, hard article absence, caller cancellation, health preemption, isolated article corruption, authentication, quota, configuration, and explicit service-unavailable states do not count.
+When enabled, each provider opens after three qualifying failures from distinct public requests within a rolling 30-second window. Accounting happens once after all internal retries for that provider: a final `451`, provider connection/bootstrap failure, direct provider transport failure, or genuine provider response/progress timeout counts. Local queue/admission expiry, collateral pipeline cancellation, hard article absence, caller cancellation, health preemption, isolated article corruption, authentication, quota, configuration, and explicit service-unavailable states do not count. Bootstrap preserves `ErrAuthRequired`/`ErrAuthRejected` and marks recognized local address or TLS policy failures with `ErrInvalidProviderConfiguration`, so those actionable causes cannot be hidden by breaker cooldown.
 
 An open provider is skipped while alternatives are tried. After cooldown, exactly one request receives an exclusive half-open probe on a fresh transport; concurrent requests receive `ErrCircuitBreakerOpen` with a `*CircuitBreakerError`. Failed probes advance cooldowns through 10, 20, 40, 80, and 120 seconds, capped at 120 seconds. Any successful provider request closes the breaker and resets its failure window and cooldown immediately.
 
@@ -963,7 +963,7 @@ type ProviderStats struct {
 | `StatInflight` | `int` | 0 (= `Inflight`) | Pipeline depth for bodyless STAT commands; set higher than `Inflight` (e.g. 50–100) to amortise round-trips on existence sweeps without inflating BODY memory |
 | `BackgroundStatInflight` | `int` | 0 (= `StatInflight`) | Maximum unanswered ordinary, non-priority STAT commands per connection |
 | `PriorityHeadroom` | `int` | 0 | Pipeline slots per connection that ordinary STAT cannot consume |
-| `Factory` | `ConnFactory` | nil | Custom dialer `func(ctx) (net.Conn, error)`; overrides `Host`/`TLSConfig` |
+| `Factory` | `ConnFactory` | nil | Custom dialer `func(ctx) (net.Conn, error)`; overrides `Host`/`TLSConfig`; wrap local setup errors with `ErrInvalidProviderConfiguration` so breaker accounting keeps them separate from provider transport failures |
 | `Backup` | `bool` | false | If true, used only after all eligible main providers fail the request |
 | `SkipPing` | `bool` | false | Skip the startup DATE ping (for servers that don't support DATE) |
 | `IdleTimeout` | `time.Duration` | 0 (disabled) | Disconnect idle connections after this duration; 0 = never |
@@ -1016,11 +1016,14 @@ nntppool.WithProviderCircuitBreaker(true)
 | `ErrConnectionDied` | — | TCP connection closed unexpectedly |
 | `ErrProtocolDesync` | — | Binary data received where a status line was expected |
 | `ErrQuotaExceeded` | — | Provider's download quota for the current period is exhausted |
+| `ErrInvalidProviderConfiguration` | — | Local address, authentication setup, TLS policy, or explicitly classified custom-factory configuration is invalid; never trips the temporary provider breaker |
 | `ErrCircuitBreakerOpen` | — | The provider is temporarily suppressed; use `errors.As` for `*CircuitBreakerError` state and retry time |
 
 `ErrArticleNotFound` uses category matching: `errors.Is(err, ErrArticleNotFound)` returns true for both 430 and 423 responses.
 
 `ErrCircuitBreakerOpen` is a temporary eligibility outcome. nntppool does not wait until `CircuitBreakerError.RetryAt`; callers that need deadline-aware retry orchestration own that policy.
+
+Recognized built-in address/TLS setup failures and missing authentication configuration preserve `ErrInvalidProviderConfiguration`. A custom `ConnFactory` should wrap that sentinel only for local configuration failures; ordinary provider dial, timeout, reset, greeting I/O, and response failures remain breaker-eligible transport outcomes.
 
 High-level buffered BODY APIs never return corrupt payload as a successful body.
 They preserve `errors.Is` checks through `TransportError` and expose every

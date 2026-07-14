@@ -104,6 +104,9 @@ func TestNNTPConnection_AuthReject(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected auth rejection error")
 	}
+	if !errors.Is(err, ErrAuthRejected) {
+		t.Fatalf("auth rejection error = %v, want ErrAuthRejected", err)
+	}
 }
 
 func TestNNTPConnection_RunSingleRequest(t *testing.T) {

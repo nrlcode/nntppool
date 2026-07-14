@@ -32,6 +32,10 @@ func isConnectionDeathError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, ErrAuthRequired) || errors.Is(err, ErrAuthRejected) ||
+		errors.Is(err, ErrInvalidProviderConfiguration) {
+		return false
+	}
 	if errors.Is(err, ErrConnectionDied) ||
 		errors.Is(err, io.EOF) ||
 		errors.Is(err, io.ErrUnexpectedEOF) ||
@@ -131,7 +135,16 @@ func (e *greetingError) Error() string {
 }
 
 func (e *greetingError) Is(target error) bool {
-	return target == ErrMaxConnections && (e.StatusCode == 502 || e.StatusCode == 400)
+	switch e.StatusCode {
+	case 400, 502:
+		return target == ErrMaxConnections
+	case 480:
+		return errors.Is(ErrAuthRequired, target)
+	case 481:
+		return errors.Is(ErrAuthRejected, target)
+	default:
+		return false
+	}
 }
 
 type Request struct {
@@ -269,6 +282,34 @@ type NNTPConnection struct {
 	failMu sync.Mutex
 }
 
+func classifyDialConfigurationError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var addressError *net.AddrError
+	if errors.As(err, &addressError) {
+		return withErrorClassification(err, ErrInvalidProviderConfiguration)
+	}
+	return err
+}
+
+func isBootstrapTransportError(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError)
+}
+
+func classifyTLSConfigurationError(err error) error {
+	if err == nil || isBootstrapTransportError(err) {
+		return err
+	}
+	return withErrorClassification(err, ErrInvalidProviderConfiguration)
+}
+
 func newNetConn(ctx context.Context, addr string, tlsConfig *tls.Config, keepAlive time.Duration) (net.Conn, error) {
 	if keepAlive == 0 {
 		keepAlive = defaultKeepAlive
@@ -279,18 +320,18 @@ func newNetConn(ctx context.Context, addr string, tlsConfig *tls.Config, keepAli
 	if tlsConfig != nil {
 		conn, err := dialer.DialContext(ctx, "tcp", addr)
 		if err != nil {
-			return nil, err
+			return nil, classifyDialConfigurationError(err)
 		}
 		tlsConn := tls.Client(conn, tlsConfig)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			_ = conn.Close()
-			return nil, err
+			return nil, classifyTLSConfigurationError(err)
 		}
 		return tlsConn, nil
 	}
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return nil, err
+		return nil, classifyDialConfigurationError(err)
 	}
 	return conn, nil
 }
@@ -345,7 +386,8 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 	// Optional AUTHINFO handshake.
 	if auth.Username != "" {
 		if auth.Password == "" {
-			return nil, fmt.Errorf("nntp auth: password required when username is set")
+			cause := errors.New("nntp auth: password required when username is set")
+			return nil, withErrorClassification(cause, ErrInvalidProviderConfiguration)
 		}
 
 		if err := c.auth(auth); err != nil {
@@ -354,6 +396,15 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 	}
 
 	return c, nil
+}
+
+func authResponseError(stage string, resp NNTPResponse) error {
+	cause := fmt.Errorf("nntp auth: unexpected response to %s: %s", stage, resp.Message)
+	category := toError(resp.StatusCode, resp.Message)
+	if category == nil {
+		category = &Error{Code: resp.StatusCode, Message: resp.Message}
+	}
+	return withErrorClassification(cause, category)
 }
 
 func NewNNTPConnection(ctx context.Context, addr string, tlsConfig *tls.Config, inflightLimit int, reqCh <-chan *Request, auth Auth, userAgent string) (*NNTPConnection, error) {
@@ -386,7 +437,7 @@ func (c *NNTPConnection) auth(auth Auth) error {
 	case 381:
 		// need pass
 	default:
-		return fmt.Errorf("nntp auth: unexpected response to AUTHINFO USER: %s", resp.Message)
+		return authResponseError("AUTHINFO USER", resp)
 	}
 
 	// AUTHINFO PASS
@@ -398,7 +449,7 @@ func (c *NNTPConnection) auth(auth Auth) error {
 		return fmt.Errorf("nntp auth: AUTHINFO PASS: %w", err)
 	}
 	if resp.StatusCode != 281 {
-		return fmt.Errorf("nntp auth: unexpected response to AUTHINFO PASS: %s", resp.Message)
+		return authResponseError("AUTHINFO PASS", resp)
 	}
 	return nil
 }
