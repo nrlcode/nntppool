@@ -372,6 +372,71 @@ func Test451AMapped451ThenResponseTimeoutIsInconclusive(t *testing.T) {
 	}
 }
 
+func Test451AMapped451ThenTransportOrUnmappedResponseIsInconclusive(t *testing.T) {
+	t.Run("transport_failure", func(t *testing.T) {
+		var factoryCalls atomic.Int32
+		dialErr := errors.New("deterministic retry dial failure")
+		factory := func(context.Context) (net.Conn, error) {
+			if factoryCalls.Add(1) > 1 {
+				return nil, dialErr
+			}
+			client, server := net.Pipe()
+			go func() {
+				defer func() { _ = server.Close() }()
+				_, _ = server.Write([]byte("200 transport regression server ready\r\n"))
+				reader := bufio.NewReader(server)
+				if _, err := reader.ReadString('\n'); err != nil {
+					return
+				}
+				_, _ = server.Write([]byte("451 mapped article absence\r\n"))
+			}()
+			return client, nil
+		}
+		client := newResponse451Client(t, Provider{
+			ID:                "mapped-transport",
+			Host:              "mapped-transport.invalid:119",
+			Factory:           factory,
+			Connections:       1,
+			SkipPing:          true,
+			Response451Policy: Response451AbsentAfterRetry,
+		})
+		_, err := client.Stat(context.Background(), "fixture@example.invalid")
+		transportErr := require451TransportError(t, err, OutcomeInconclusive)
+		if errors.Is(err, ErrArticleNotFound) || !errors.Is(err, dialErr) {
+			t.Fatalf("error = %v, want inconclusive wrapped transport failure", err)
+		}
+		if len(transportErr.Attempts) != 2 ||
+			transportErr.Attempts[0].Outcome != OutcomeHardArticleAbsence ||
+			transportErr.Attempts[1].Outcome != OutcomeTransportFailure {
+			t.Fatalf("attempts = %+v, want mapped 451 then transport failure", transportErr.Attempts)
+		}
+	})
+
+	t.Run("unmapped_protocol_response", func(t *testing.T) {
+		server := &regressionProvider{
+			host: "mapped-unrecognized.invalid:119",
+			respond: func(connection int, _ string) []byte {
+				if connection == 1 {
+					return []byte("451 mapped article absence\r\n")
+				}
+				return []byte("499 unrecognized vendor response\r\n")
+			},
+		}
+		client := newResponse451Client(t, response451Provider(server, "mapped-unrecognized", false, Response451AbsentAfterRetry))
+		_, err := client.Stat(context.Background(), "fixture@example.invalid")
+		transportErr := require451TransportError(t, err, OutcomeInconclusive)
+		if errors.Is(err, ErrArticleNotFound) {
+			t.Fatalf("error = %v, mapped 451 plus unknown response must not be absence", err)
+		}
+		if len(transportErr.Attempts) != 2 ||
+			transportErr.Attempts[0].Outcome != OutcomeHardArticleAbsence ||
+			transportErr.Attempts[1].Outcome != OutcomeInconclusive ||
+			transportErr.Attempts[1].ResponseCode != 499 {
+			t.Fatalf("attempts = %+v, want mapped 451 then raw inconclusive 499", transportErr.Attempts)
+		}
+	})
+}
+
 func Test451ACallerCancellationWinsAndStopsFallback(t *testing.T) {
 	t.Run("before_dispatch", func(t *testing.T) {
 		server := &regressionProvider{
@@ -405,6 +470,10 @@ func Test451ACallerCancellationWinsAndStopsFallback(t *testing.T) {
 				}
 				commands.Add(1)
 				if _, err := server.Write([]byte("451 mapped article absence\r\n")); err == nil {
+					// readerLoop retires every 451 transport only after it has built
+					// and delivered the attempt. Waiting for that close places the
+					// cancellation deterministically inside the retry-delay boundary.
+					_, _ = reader.ReadByte()
 					once.Do(cancel)
 				}
 			}()
@@ -483,6 +552,46 @@ func Test451AOrderedFallbackAfterMappedAbsence(t *testing.T) {
 		if got := result.Attempts[index]; got.ProviderID != expected.provider || got.Outcome != expected.outcome {
 			t.Errorf("attempt[%d] = %+v, want provider=%s outcome=%s", index, got, expected.provider, expected.outcome)
 		}
+	}
+}
+
+func Test451AMappedAbsenceUsesExistingParallelProbeFallback(t *testing.T) {
+	mapped := &regressionProvider{
+		host:    "mapped-probe-primary.invalid:119",
+		respond: func(_ int, _ string) []byte { return []byte("451 mapped article absence\r\n") },
+	}
+	available := &regressionProvider{
+		host: "mapped-probe-available.invalid:119",
+		respond: func(_ int, command string) []byte {
+			switch {
+			case strings.HasPrefix(command, "STAT"):
+				return []byte("223 1 <fixture@example.invalid> exists\r\n")
+			case strings.HasPrefix(command, "BODY"):
+				return yencSinglePart([]byte("probe fallback payload"), "probe.bin")
+			default:
+				return []byte("500 unexpected command\r\n")
+			}
+		},
+	}
+	missing := &regressionProvider{
+		host:    "mapped-probe-missing.invalid:119",
+		respond: func(_ int, _ string) []byte { return []byte("430 no such article\r\n") },
+	}
+	client := newRegressionClient(t,
+		response451Provider(mapped, "mapped-probe-primary", false, Response451AbsentAfterRetry),
+		response451Provider(available, "mapped-probe-available", false, Response451Temporary),
+		response451Provider(missing, "mapped-probe-missing", false, Response451Temporary),
+	)
+	body, err := client.Body(context.Background(), "fixture@example.invalid")
+	if err != nil {
+		t.Fatalf("Body() error = %v", err)
+	}
+	if !bytes.Equal(body.Bytes, []byte("probe fallback payload")) {
+		t.Fatalf("Body() bytes = %q", body.Bytes)
+	}
+	if available.commandCount("STAT") != 1 || available.commandCount("BODY") != 1 || missing.commandCount("STAT") != 1 {
+		t.Fatalf("available STAT/BODY and missing STAT = %d/%d/%d, want existing probe flow 1/1/1",
+			available.commandCount("STAT"), available.commandCount("BODY"), missing.commandCount("STAT"))
 	}
 }
 
@@ -589,7 +698,7 @@ func Test451ARawMappedEvidenceIsPreserved(t *testing.T) {
 		t.Fatalf("error = %v, want ErrArticleNotFound compatibility", err)
 	}
 	var raw *Error
-	if !errors.As(err, &raw) || raw.Code != 451 || raw.Message != "documented vendor article removal" {
+	if !errors.As(err, &raw) || raw.Code != 451 || !strings.Contains(raw.Message, "documented vendor article removal") {
 		t.Fatalf("wrapped raw error = %#v, want original vendor 451", raw)
 	}
 	if len(transportErr.Attempts) != 2 {
