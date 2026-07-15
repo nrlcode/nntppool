@@ -1,0 +1,739 @@
+package nntppool
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func response451Provider(server *regressionProvider, id string, backup bool, policy Response451Policy) Provider {
+	provider := server.provider(backup)
+	provider.ID = id
+	provider.Response451Policy = policy
+	return provider
+}
+
+func newResponse451Client(t *testing.T, providers ...Provider) *Client {
+	t.Helper()
+	client, err := NewClient(
+		context.Background(),
+		providers,
+		WithDispatchStrategy(DispatchFIFO),
+		WithStatProbe(false),
+		WithSpeedAwareDispatch(false),
+	)
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	return client
+}
+
+func require451TransportError(t *testing.T, err error, want OutcomeKind) *TransportError {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("error = nil, want %s TransportError", want)
+	}
+	var transportErr *TransportError
+	if !errors.As(err, &transportErr) {
+		t.Fatalf("error = %v, want TransportError", err)
+	}
+	if transportErr.Kind != want {
+		t.Fatalf("transport kind = %s, want %s; attempts = %+v", transportErr.Kind, want, transportErr.Attempts)
+	}
+	return transportErr
+}
+
+func Test451AZeroAndExplicitTemporaryPolicyPreserveV4Behavior(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		policy Response451Policy
+	}{
+		{name: "omitted_zero_value"},
+		{name: "explicit_temporary", policy: Response451Temporary},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := &regressionProvider{
+				host: "temporary-" + test.name + ".invalid:119",
+				respond: func(_ int, _ string) []byte {
+					return []byte("451 temporary article response\r\n")
+				},
+			}
+			client := newResponse451Client(t, response451Provider(server, "temporary", false, test.policy))
+
+			_, err := client.Stat(context.Background(), "fixture@example.invalid")
+			transportErr := require451TransportError(t, err, OutcomeTemporaryFailure)
+			if errors.Is(err, ErrArticleNotFound) {
+				t.Fatalf("error = %v, default 451 policy must remain temporary", err)
+			}
+			if server.connections.Load() != 2 || server.commandCount("STAT") != 2 {
+				t.Fatalf("connections/STAT attempts = %d/%d, want one existing fresh retry (2/2)", server.connections.Load(), server.commandCount("STAT"))
+			}
+			if len(transportErr.Attempts) != 2 {
+				t.Fatalf("attempts = %+v, want two", transportErr.Attempts)
+			}
+			for _, attempt := range transportErr.Attempts {
+				if attempt.Outcome != OutcomeTemporaryFailure || attempt.ResponseCode != 451 || attempt.Operation != OperationStat {
+					t.Errorf("attempt = %+v, want temporary raw STAT 451", attempt)
+				}
+			}
+		})
+	}
+}
+
+func Test451AInvalidPolicyIsConfigurationError(t *testing.T) {
+	var factoryCalls atomic.Int32
+	factory := func(context.Context) (net.Conn, error) {
+		factoryCalls.Add(1)
+		return nil, errors.New("factory must not run")
+	}
+	invalid := Provider{
+		ID:                "invalid-policy",
+		Factory:           factory,
+		Connections:       1,
+		SkipPing:          true,
+		Response451Policy: Response451Policy(255),
+	}
+
+	client, err := NewClient(context.Background(), []Provider{invalid})
+	if client != nil {
+		_ = client.Close()
+		t.Fatal("NewClient() returned a client for an invalid 451 policy")
+	}
+	if !errors.Is(err, ErrInvalidProviderConfiguration) {
+		t.Fatalf("NewClient() error = %v, want ErrInvalidProviderConfiguration", err)
+	}
+	if factoryCalls.Load() != 0 {
+		t.Fatalf("invalid NewClient policy invoked factory %d times", factoryCalls.Load())
+	}
+
+	validServer := &regressionProvider{
+		host: "valid-policy.invalid:119",
+		respond: func(_ int, _ string) []byte {
+			return []byte("223 1 <fixture@example.invalid> exists\r\n")
+		},
+	}
+	validClient := newResponse451Client(t, validServer.provider(false))
+	if err := validClient.AddProvider(invalid); !errors.Is(err, ErrInvalidProviderConfiguration) {
+		t.Fatalf("AddProvider() error = %v, want ErrInvalidProviderConfiguration", err)
+	}
+	if factoryCalls.Load() != 0 {
+		t.Fatalf("invalid AddProvider policy invoked factory %d times", factoryCalls.Load())
+	}
+}
+
+func Test451APolicyIsArticleOperationScoped(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		payload   string
+		operation Operation
+		mapped    bool
+	}{
+		{name: "stat", payload: "STAT <fixture@example.invalid>\r\n", operation: OperationStat, mapped: true},
+		{name: "body", payload: "BODY <fixture@example.invalid>\r\n", operation: OperationBody, mapped: true},
+		{name: "head", payload: "HEAD <fixture@example.invalid>\r\n", operation: OperationHead, mapped: true},
+		{name: "article", payload: "ARTICLE <fixture@example.invalid>\r\n", operation: OperationArticle, mapped: true},
+		{name: "post", payload: "POST\r\n", operation: OperationPost},
+		{name: "capabilities", payload: "CAPABILITIES\r\n", operation: OperationUnknown},
+		{name: "date", payload: "DATE\r\n", operation: OperationUnknown},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := &regressionProvider{
+				host: "scope-" + test.name + ".invalid:119",
+				respond: func(_ int, _ string) []byte {
+					return []byte("451 vendor-specific response\r\n")
+				},
+			}
+			client := newResponse451Client(t, response451Provider(server, "scope-"+test.name, false, Response451AbsentAfterRetry))
+			response := <-client.Send(context.Background(), []byte(test.payload), nil)
+			err := responseError(response)
+
+			wantKind := OutcomeTemporaryFailure
+			if test.mapped {
+				wantKind = OutcomeHardArticleAbsence
+			}
+			transportErr := require451TransportError(t, err, wantKind)
+			if got := errors.Is(err, ErrArticleNotFound); got != test.mapped {
+				t.Fatalf("errors.Is(ErrArticleNotFound) = %v, want %v; error = %v", got, test.mapped, err)
+			}
+			if len(transportErr.Attempts) != 2 {
+				t.Fatalf("attempts = %+v, want two", transportErr.Attempts)
+			}
+			for _, attempt := range transportErr.Attempts {
+				if attempt.Operation != test.operation || attempt.Outcome != wantKind || attempt.ResponseCode != 451 {
+					t.Errorf("attempt = %+v, want operation=%s outcome=%s raw 451", attempt, test.operation, wantKind)
+				}
+			}
+		})
+	}
+}
+
+func Test451AMappedRetryRejectsEveryPreexistingHotTransport(t *testing.T) {
+	var connections atomic.Int32
+	var bodyAttempts atomic.Int32
+	warmSeen := make(chan int, 3)
+	warmRelease := make(chan struct{})
+	bodyConnections := make(chan int, 2)
+	valid := yencSinglePart([]byte("fresh mapped retry"), "fresh.bin")
+
+	factory := func(context.Context) (net.Conn, error) {
+		connection := int(connections.Add(1))
+		client, server := net.Pipe()
+		go func() {
+			defer func() { _ = server.Close() }()
+			_, _ = server.Write([]byte("200 mapped retry server ready\r\n"))
+			reader := bufio.NewReader(server)
+			for {
+				command, err := reader.ReadString('\n')
+				if err != nil {
+					return
+				}
+				switch {
+				case strings.HasPrefix(command, "STAT"):
+					warmSeen <- connection
+					<-warmRelease
+					_, _ = server.Write([]byte("223 1 <warm@example.invalid> exists\r\n"))
+				case strings.HasPrefix(command, "BODY"):
+					bodyConnections <- connection
+					if bodyAttempts.Add(1) == 1 {
+						_, _ = server.Write([]byte("451 mapped article absence\r\n"))
+					} else {
+						_, _ = server.Write(valid)
+					}
+				}
+			}
+		}()
+		return client, nil
+	}
+	client := newResponse451Client(t, Provider{
+		ID:                "multi-hot-mapped",
+		Host:              "multi-hot-mapped.invalid:119",
+		Factory:           factory,
+		Connections:       2,
+		Inflight:          1,
+		StatInflight:      1,
+		SkipPing:          true,
+		Response451Policy: Response451AbsentAfterRetry,
+	})
+
+	warmResults := make(chan error, 3)
+	for index := range 3 {
+		go func(index int) {
+			_, err := client.Stat(context.Background(), fmt.Sprintf("warm-%d@example.invalid", index))
+			warmResults <- err
+		}(index)
+	}
+	warmConnections := make(map[int]struct{}, 2)
+	for len(warmConnections) < 2 {
+		select {
+		case connection := <-warmSeen:
+			warmConnections[connection] = struct{}{}
+		case <-time.After(2 * time.Second):
+			t.Fatal("did not establish two preexisting hot transports")
+		}
+	}
+	close(warmRelease)
+	for range 3 {
+		if err := <-warmResults; err != nil {
+			t.Fatalf("warming STAT error = %v", err)
+		}
+	}
+
+	body, err := client.Body(context.Background(), "fixture@example.invalid")
+	if err != nil {
+		t.Fatalf("Body() error = %v", err)
+	}
+	if !bytes.Equal(body.Bytes, []byte("fresh mapped retry")) {
+		t.Fatalf("Body() bytes = %q", body.Bytes)
+	}
+	firstConnection := <-bodyConnections
+	secondConnection := <-bodyConnections
+	if _, existed := warmConnections[firstConnection]; !existed {
+		t.Fatalf("first 451 connection = %d, want a preexisting hot transport from %v", firstConnection, warmConnections)
+	}
+	if _, existed := warmConnections[secondConnection]; existed {
+		t.Fatalf("451 retry connection = %d, want newer than all preexisting transports %v", secondConnection, warmConnections)
+	}
+	if connections.Load() < 3 {
+		t.Fatalf("created transports = %d, want at least one new transport after 451", connections.Load())
+	}
+	if len(body.Attempts) != 2 || body.Attempts[0].Outcome != OutcomeHardArticleAbsence || body.Attempts[1].Outcome != OutcomeSuccess {
+		t.Fatalf("attempts = %+v, want mapped hard absence then success", body.Attempts)
+	}
+}
+
+func Test451AMappedRetryConclusions(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		server := &regressionProvider{
+			host: "mapped-success.invalid:119",
+			respond: func(connection int, _ string) []byte {
+				if connection == 1 {
+					return []byte("451 mapped article absence\r\n")
+				}
+				return []byte("223 1 <fixture@example.invalid> exists\r\n")
+			},
+		}
+		client := newResponse451Client(t, response451Provider(server, "mapped-success", false, Response451AbsentAfterRetry))
+		result, err := client.Stat(context.Background(), "fixture@example.invalid")
+		if err != nil {
+			t.Fatalf("Stat() error = %v", err)
+		}
+		if len(result.Attempts) != 2 || result.Attempts[0].Outcome != OutcomeHardArticleAbsence || result.Attempts[1].Outcome != OutcomeSuccess {
+			t.Fatalf("attempts = %+v, want hard absence then success", result.Attempts)
+		}
+	})
+
+	for _, test := range []struct {
+		name        string
+		retryStatus string
+	}{
+		{name: "second_451", retryStatus: "451 mapped article absence\r\n"},
+		{name: "retry_423", retryStatus: "423 no article with that number\r\n"},
+		{name: "retry_430", retryStatus: "430 no such article\r\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := &regressionProvider{
+				host: "mapped-" + test.name + ".invalid:119",
+				respond: func(connection int, _ string) []byte {
+					if connection == 1 {
+						return []byte("451 mapped article absence\r\n")
+					}
+					return []byte(test.retryStatus)
+				},
+			}
+			client := newResponse451Client(t, response451Provider(server, "mapped-"+test.name, false, Response451AbsentAfterRetry))
+			_, err := client.Stat(context.Background(), "fixture@example.invalid")
+			transportErr := require451TransportError(t, err, OutcomeHardArticleAbsence)
+			if !errors.Is(err, ErrArticleNotFound) {
+				t.Fatalf("error = %v, want ErrArticleNotFound compatibility", err)
+			}
+			if len(transportErr.Attempts) != 2 || transportErr.Attempts[0].ResponseCode != 451 {
+				t.Fatalf("attempts = %+v, want raw mapped 451 then conclusive retry", transportErr.Attempts)
+			}
+			for _, attempt := range transportErr.Attempts {
+				if attempt.Outcome != OutcomeHardArticleAbsence {
+					t.Fatalf("attempt = %+v, want hard article absence", attempt)
+				}
+			}
+		})
+	}
+}
+
+func Test451AMapped451ThenResponseTimeoutIsInconclusive(t *testing.T) {
+	var connections atomic.Int32
+	factory := func(ctx context.Context) (net.Conn, error) {
+		connection := connections.Add(1)
+		client, server := net.Pipe()
+		go func() {
+			defer func() { _ = server.Close() }()
+			_, _ = server.Write([]byte("200 timeout regression server ready\r\n"))
+			reader := bufio.NewReader(server)
+			if _, err := reader.ReadString('\n'); err != nil {
+				return
+			}
+			if connection == 1 {
+				_, _ = server.Write([]byte("451 mapped article absence\r\n"))
+				return
+			}
+			<-ctx.Done()
+		}()
+		return client, nil
+	}
+	client := newResponse451Client(t, Provider{
+		ID:                "mapped-timeout",
+		Host:              "mapped-timeout.invalid:119",
+		Factory:           factory,
+		Connections:       1,
+		SkipPing:          true,
+		AttemptTimeout:    30 * time.Millisecond,
+		Response451Policy: Response451AbsentAfterRetry,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := client.Stat(ctx, "fixture@example.invalid")
+	transportErr := require451TransportError(t, err, OutcomeInconclusive)
+	if errors.Is(err, ErrArticleNotFound) {
+		t.Fatalf("error = %v, mapped 451 plus timeout must not be absence", err)
+	}
+	if len(transportErr.Attempts) != 2 {
+		t.Fatalf("attempts = %+v, want mapped 451 then timeout", transportErr.Attempts)
+	}
+	if first, second := transportErr.Attempts[0], transportErr.Attempts[1]; first.Outcome != OutcomeHardArticleAbsence || first.ResponseCode != 451 ||
+		second.Outcome != OutcomeTransportFailure || !second.ProviderResponseTimeout {
+		t.Fatalf("attempts = %+v, want hard raw 451 then provider response timeout", transportErr.Attempts)
+	}
+}
+
+func Test451ACallerCancellationWinsAndStopsFallback(t *testing.T) {
+	t.Run("before_dispatch", func(t *testing.T) {
+		server := &regressionProvider{
+			host:    "cancel-before.invalid:119",
+			respond: func(_ int, _ string) []byte { return []byte("451 mapped article absence\r\n") },
+		}
+		client := newResponse451Client(t, response451Provider(server, "cancel-before", false, Response451AbsentAfterRetry))
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := client.Stat(ctx, "fixture@example.invalid")
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Stat() error = %v, want context.Canceled", err)
+		}
+		if server.commandCount("STAT") != 0 {
+			t.Fatalf("pre-cancel dispatched %d STAT commands", server.commandCount("STAT"))
+		}
+	})
+
+	t.Run("during_fresh_retry", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		var once sync.Once
+		var commands atomic.Int32
+		factory := func(context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				defer func() { _ = server.Close() }()
+				_, _ = server.Write([]byte("200 cancellation regression server ready\r\n"))
+				reader := bufio.NewReader(server)
+				if _, err := reader.ReadString('\n'); err != nil {
+					return
+				}
+				commands.Add(1)
+				if _, err := server.Write([]byte("451 mapped article absence\r\n")); err == nil {
+					once.Do(cancel)
+				}
+			}()
+			return client, nil
+		}
+		backup := &regressionProvider{
+			host:    "cancel-backup.invalid:119",
+			respond: func(_ int, _ string) []byte { return []byte("223 1 <fixture@example.invalid> exists\r\n") },
+		}
+		client := newResponse451Client(t,
+			Provider{
+				ID:                "cancel-mapped",
+				Host:              "cancel-mapped.invalid:119",
+				Factory:           factory,
+				Connections:       1,
+				SkipPing:          true,
+				Response451Policy: Response451AbsentAfterRetry,
+			},
+			response451Provider(backup, "cancel-backup", true, Response451Temporary),
+		)
+		_, err := client.Stat(ctx, "fixture@example.invalid")
+		transportErr := require451TransportError(t, err, OutcomeCancellation)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Stat() error = %v, want caller cancellation", err)
+		}
+		if commands.Load() != 1 || backup.commandCount("STAT") != 0 {
+			t.Fatalf("primary/backup commands = %d/%d, cancellation must stop retry and fallback", commands.Load(), backup.commandCount("STAT"))
+		}
+		if len(transportErr.Attempts) == 0 || transportErr.Attempts[0].ResponseCode != 451 {
+			t.Fatalf("attempts = %+v, want the completed raw 451 before cancellation", transportErr.Attempts)
+		}
+	})
+}
+
+func Test451AOrderedFallbackAfterMappedAbsence(t *testing.T) {
+	mapped := &regressionProvider{
+		host:    "mapped-primary.invalid:119",
+		respond: func(_ int, _ string) []byte { return []byte("451 mapped article absence\r\n") },
+	}
+	missing := &regressionProvider{
+		host:    "missing-secondary.invalid:119",
+		respond: func(_ int, _ string) []byte { return []byte("430 no such article\r\n") },
+	}
+	backup := &regressionProvider{
+		host:    "available-backup.invalid:119",
+		respond: func(_ int, _ string) []byte { return []byte("223 1 <fixture@example.invalid> exists\r\n") },
+	}
+	client := newResponse451Client(t,
+		response451Provider(mapped, "mapped-primary", false, Response451AbsentAfterRetry),
+		response451Provider(missing, "missing-secondary", false, Response451Temporary),
+		response451Provider(backup, "available-backup", true, Response451Temporary),
+	)
+	result, err := client.Stat(context.Background(), "fixture@example.invalid")
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if result.ProviderID != "available-backup" {
+		t.Fatalf("serving provider = %q, want available-backup", result.ProviderID)
+	}
+	if mapped.commandCount("STAT") != 2 || missing.commandCount("STAT") != 1 || backup.commandCount("STAT") != 1 {
+		t.Fatalf("mapped/missing/backup STATs = %d/%d/%d, want 2/1/1", mapped.commandCount("STAT"), missing.commandCount("STAT"), backup.commandCount("STAT"))
+	}
+	want := []struct {
+		provider string
+		outcome  OutcomeKind
+	}{
+		{provider: "mapped-primary", outcome: OutcomeHardArticleAbsence},
+		{provider: "mapped-primary", outcome: OutcomeHardArticleAbsence},
+		{provider: "missing-secondary", outcome: OutcomeHardArticleAbsence},
+		{provider: "available-backup", outcome: OutcomeSuccess},
+	}
+	if len(result.Attempts) != len(want) {
+		t.Fatalf("attempts = %+v, want %d", result.Attempts, len(want))
+	}
+	for index, expected := range want {
+		if got := result.Attempts[index]; got.ProviderID != expected.provider || got.Outcome != expected.outcome {
+			t.Errorf("attempt[%d] = %+v, want provider=%s outcome=%s", index, got, expected.provider, expected.outcome)
+		}
+	}
+}
+
+func Test451AAllProviderHardAbsenceIsSentinelCompatible(t *testing.T) {
+	mapped := &regressionProvider{
+		host:    "all-hard-mapped.invalid:119",
+		respond: func(_ int, _ string) []byte { return []byte("451 vendor article removal\r\n") },
+	}
+	missing430 := &regressionProvider{
+		host:    "all-hard-430.invalid:119",
+		respond: func(_ int, _ string) []byte { return []byte("430 no such article\r\n") },
+	}
+	missing423 := &regressionProvider{
+		host:    "all-hard-423.invalid:119",
+		respond: func(_ int, _ string) []byte { return []byte("423 no article with that number\r\n") },
+	}
+	client := newResponse451Client(t,
+		response451Provider(mapped, "mapped", false, Response451AbsentAfterRetry),
+		response451Provider(missing430, "missing-430", false, Response451Temporary),
+		response451Provider(missing423, "missing-423", true, Response451Temporary),
+	)
+	_, err := client.Stat(context.Background(), "fixture@example.invalid")
+	transportErr := require451TransportError(t, err, OutcomeHardArticleAbsence)
+	if !errors.Is(err, ErrArticleNotFound) {
+		t.Fatalf("error = %v, want ErrArticleNotFound compatibility", err)
+	}
+	if len(transportErr.Attempts) != 4 {
+		t.Fatalf("attempts = %+v, want two mapped plus 430 and 423", transportErr.Attempts)
+	}
+	if transportErr.Attempts[0].ResponseCode != 451 || transportErr.Attempts[1].ResponseCode != 451 {
+		t.Fatalf("mapped attempts = %+v, raw 451 must not be fabricated as 430", transportErr.Attempts[:2])
+	}
+}
+
+func Test451AMixedEvidenceNeverBecomesGlobalAbsence(t *testing.T) {
+	t.Run("unmapped_temporary", func(t *testing.T) {
+		mapped := &regressionProvider{
+			host:    "mixed-mapped.invalid:119",
+			respond: func(_ int, _ string) []byte { return []byte("451 mapped article absence\r\n") },
+		}
+		temporary := &regressionProvider{
+			host:    "mixed-temporary.invalid:119",
+			respond: func(_ int, _ string) []byte { return []byte("451 temporary article response\r\n") },
+		}
+		client := newResponse451Client(t,
+			response451Provider(mapped, "mapped", false, Response451AbsentAfterRetry),
+			response451Provider(temporary, "temporary", false, Response451Temporary),
+		)
+		_, err := client.Stat(context.Background(), "fixture@example.invalid")
+		_ = require451TransportError(t, err, OutcomeInconclusive)
+		if errors.Is(err, ErrArticleNotFound) {
+			t.Fatalf("error = %v, hard plus temporary must remain inconclusive", err)
+		}
+	})
+
+	t.Run("unavailable", func(t *testing.T) {
+		mapped := &regressionProvider{
+			host:    "mixed-unavailable-mapped.invalid:119",
+			respond: func(_ int, _ string) []byte { return []byte("451 mapped article absence\r\n") },
+		}
+		unavailable := &regressionProvider{
+			host:    "mixed-unavailable.invalid:119",
+			respond: func(_ int, _ string) []byte { return []byte("223 1 <fixture@example.invalid> exists\r\n") },
+		}
+		unavailableConfig := response451Provider(unavailable, "unavailable", false, Response451Temporary)
+		unavailableConfig.QuotaBytes = 1
+		unavailableConfig.QuotaUsed = 1
+		client := newResponse451Client(t,
+			response451Provider(mapped, "mapped", false, Response451AbsentAfterRetry),
+			unavailableConfig,
+		)
+		_, err := client.Stat(context.Background(), "fixture@example.invalid")
+		_ = require451TransportError(t, err, OutcomeInconclusive)
+		if errors.Is(err, ErrArticleNotFound) {
+			t.Fatalf("error = %v, unavailable provider must prevent global absence", err)
+		}
+	})
+
+	t.Run("omitted_or_incomplete_evidence", func(t *testing.T) {
+		raw451 := &Error{Code: 451, Message: "mapped article absence"}
+		err := newTransportError([]AttemptEvidence{
+			{ProviderID: "mapped", Operation: OperationStat, Outcome: OutcomeHardArticleAbsence, ResponseCode: 451, Cause: raw451},
+			{ProviderID: "undispatched", Operation: OperationStat, Outcome: OutcomeInconclusive, Cause: errors.New("provider result omitted")},
+		}, raw451)
+		if err.Kind != OutcomeInconclusive || errors.Is(err, ErrArticleNotFound) {
+			t.Fatalf("aggregate = %+v, omitted/incomplete provider must prevent global absence", err)
+		}
+	})
+}
+
+func Test451ARawMappedEvidenceIsPreserved(t *testing.T) {
+	server := &regressionProvider{
+		host:    "raw-evidence.invalid:119",
+		respond: func(_ int, _ string) []byte { return []byte("451 documented vendor article removal\r\n") },
+	}
+	client := newResponse451Client(t, response451Provider(server, "stable-provider-id", false, Response451AbsentAfterRetry))
+	response := <-client.Send(context.Background(), []byte("ARTICLE <fixture@example.invalid>\r\n"), nil)
+	err := responseError(response)
+	transportErr := require451TransportError(t, err, OutcomeHardArticleAbsence)
+	if transportErr.ProviderID != "stable-provider-id" || transportErr.ResponseCode != 451 {
+		t.Fatalf("transport attribution = provider %q code %d, want stable-provider-id/raw 451", transportErr.ProviderID, transportErr.ResponseCode)
+	}
+	if !errors.Is(err, ErrArticleNotFound) {
+		t.Fatalf("error = %v, want ErrArticleNotFound compatibility", err)
+	}
+	var raw *Error
+	if !errors.As(err, &raw) || raw.Code != 451 || raw.Message != "documented vendor article removal" {
+		t.Fatalf("wrapped raw error = %#v, want original vendor 451", raw)
+	}
+	if len(transportErr.Attempts) != 2 {
+		t.Fatalf("attempts = %+v, want two", transportErr.Attempts)
+	}
+	for index, attempt := range transportErr.Attempts {
+		if attempt.ProviderID != "stable-provider-id" || attempt.Operation != OperationArticle ||
+			attempt.Outcome != OutcomeHardArticleAbsence || attempt.ResponseCode != 451 {
+			t.Errorf("attempt[%d] = %+v, want stable raw ARTICLE hard absence", index, attempt)
+		}
+		if attempt.PoolQueueDuration < 0 || attempt.PipelineHeadWaitDuration < 0 || attempt.ResponseServiceDuration < 0 {
+			t.Errorf("attempt[%d] has negative timing: %+v", index, attempt)
+		}
+		var attemptRaw *Error
+		if !errors.As(attempt.Cause, &attemptRaw) || attemptRaw.Code != 451 {
+			t.Errorf("attempt[%d] cause = %v, want raw 451", index, attempt.Cause)
+		}
+	}
+}
+
+func Test451AOrdinaryInitial423430DoNotGainRetry(t *testing.T) {
+	for _, code := range []int{423, 430} {
+		t.Run(fmt.Sprintf("status_%d", code), func(t *testing.T) {
+			missing := &regressionProvider{
+				host: "deferred-missing.invalid:119",
+				respond: func(_ int, _ string) []byte {
+					return []byte(fmt.Sprintf("%d ordinary article absence\r\n", code))
+				},
+			}
+			available := &regressionProvider{
+				host:    "deferred-available.invalid:119",
+				respond: func(_ int, _ string) []byte { return []byte("223 1 <fixture@example.invalid> exists\r\n") },
+			}
+			client := newResponse451Client(t,
+				response451Provider(missing, "missing", false, Response451AbsentAfterRetry),
+				response451Provider(available, "available", false, Response451Temporary),
+			)
+			if _, err := client.Stat(context.Background(), "fixture@example.invalid"); err != nil {
+				t.Fatalf("Stat() error = %v", err)
+			}
+			if missing.commandCount("STAT") != 1 || missing.connections.Load() != 1 {
+				t.Fatalf("ordinary %d attempts/connections = %d/%d, same-provider retry is deferred", code, missing.commandCount("STAT"), missing.connections.Load())
+			}
+			if available.commandCount("STAT") != 1 {
+				t.Fatalf("fallback STAT attempts = %d, want 1", available.commandCount("STAT"))
+			}
+		})
+	}
+}
+
+func seedBreakerFailures(t *testing.T, client *Client, providerID string, count int) *providerGroup {
+	t.Helper()
+	group := client.findGroup(providerID)
+	if group == nil {
+		t.Fatalf("provider %q not found", providerID)
+	}
+	for range count {
+		lease, err := group.breaker.acquire(providerID)
+		if err != nil {
+			t.Fatalf("breaker acquire before seed failure: %v", err)
+		}
+		group.breaker.complete(lease, circuitBreakerFailure)
+	}
+	return group
+}
+
+func Test451AMappedResultsAreCircuitBreakerNeutral(t *testing.T) {
+	t.Run("absence_does_not_increment_or_open", func(t *testing.T) {
+		clock := newBreakerFakeClock()
+		server, provider := breakerProvider(
+			"mapped-neutral",
+			"mapped-neutral.invalid:119",
+			func(_ int, _ string) []byte { return []byte("451 mapped article absence\r\n") },
+		)
+		provider.Response451Policy = Response451AbsentAfterRetry
+		client := newBreakerClient(t, clock, provider)
+		for request := range 3 {
+			err := targetedBreakerStat(client, "mapped-neutral")
+			if !errors.Is(err, ErrArticleNotFound) {
+				t.Fatalf("request %d error = %v, want mapped hard absence", request, err)
+			}
+			stats := providerBreakerStats(t, client, "mapped-neutral")
+			if stats.State != CircuitBreakerClosed || stats.QualifyingFailures != 0 || stats.Cooldown != 0 {
+				t.Fatalf("request %d breaker stats = %+v, mapped absence must be neutral", request, stats)
+			}
+		}
+		if server.commandCount("STAT") != 6 {
+			t.Fatalf("mapped STAT commands = %d, want 6", server.commandCount("STAT"))
+		}
+	})
+
+	t.Run("retry_success_does_not_reset_failure_window", func(t *testing.T) {
+		clock := newBreakerFakeClock()
+		var commands atomic.Int32
+		_, provider := breakerProvider(
+			"mapped-success-neutral",
+			"mapped-success-neutral.invalid:119",
+			func(_ int, _ string) []byte {
+				if commands.Add(1)%2 == 1 {
+					return []byte("451 mapped article absence\r\n")
+				}
+				return []byte("223 1 <fixture@example.invalid> exists\r\n")
+			},
+		)
+		provider.Response451Policy = Response451AbsentAfterRetry
+		client := newBreakerClient(t, clock, provider)
+		seedBreakerFailures(t, client, "mapped-success-neutral", 2)
+		if err := targetedBreakerStat(client, "mapped-success-neutral"); err != nil {
+			t.Fatalf("mapped retry success error = %v", err)
+		}
+		stats := providerBreakerStats(t, client, "mapped-success-neutral")
+		if stats.State != CircuitBreakerClosed || stats.QualifyingFailures != 2 {
+			t.Fatalf("breaker stats after mapped retry success = %+v, want closed with prior two failures retained", stats)
+		}
+	})
+
+	t.Run("half_open_probe_is_released_without_close_or_extension", func(t *testing.T) {
+		clock := newBreakerFakeClock()
+		server, provider := breakerProvider(
+			"mapped-half-open",
+			"mapped-half-open.invalid:119",
+			func(_ int, _ string) []byte { return []byte("451 mapped article absence\r\n") },
+		)
+		provider.Response451Policy = Response451AbsentAfterRetry
+		client := newBreakerClient(t, clock, provider)
+		seedBreakerFailures(t, client, "mapped-half-open", providerBreakerFailureThreshold)
+		opened := providerBreakerStats(t, client, "mapped-half-open")
+		if opened.State != CircuitBreakerOpen {
+			t.Fatalf("seeded breaker stats = %+v, want open", opened)
+		}
+		clock.Advance(providerBreakerCooldowns[0])
+
+		for probe := range 2 {
+			err := targetedBreakerStat(client, "mapped-half-open")
+			if !errors.Is(err, ErrArticleNotFound) {
+				t.Fatalf("neutral probe %d error = %v, want mapped absence", probe, err)
+			}
+			stats := providerBreakerStats(t, client, "mapped-half-open")
+			if stats.State != CircuitBreakerHalfOpen || stats.ProbeInFlight || stats.Cooldown != opened.Cooldown || !stats.OpenUntil.Equal(opened.OpenUntil) {
+				t.Fatalf("neutral probe %d stats = %+v, want unchanged eligible half-open state from %+v", probe, stats, opened)
+			}
+		}
+		if server.commandCount("STAT") != 4 {
+			t.Fatalf("half-open mapped STAT commands = %d, want two fresh retry pairs", server.commandCount("STAT"))
+		}
+	})
+}
