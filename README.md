@@ -59,7 +59,7 @@ A high-performance NNTP connection pool library for Go. It manages multiple NNTP
 - **Multi-provider pooling**: configure N connection slots per provider; supports both main and backup tiers
 - **Command pipelining**: configurable inflight requests per connection (default: 1)
 - **Weighted round-robin dispatch**: distributes load by available inflight capacity; FIFO mode also available
-- **Automatic failover**: ordered fallback for hard absence (423/430), temporary failure, corruption, unavailability, and transport failure, followed by failure-only backups
+- **Automatic failover**: ordered fallback for hard absence (423/430 or explicitly mapped provider-local 451), temporary failure, corruption, unavailability, and transport failure, followed by failure-only backups
 - **Bounded provider circuit breaker**: optional short-lived suppression after repeated provider-level temporary failures, with exclusive half-open recovery probes
 - **Independent provider evidence**: every configured account remains eligible after hard absence, even when multiple accounts share one endpoint
 - **Provider removal on 502**: permanently unavailable providers are atomically removed from the pool
@@ -617,6 +617,7 @@ client.Send()
     → receive response from innerCh
     → on 423/430: retry every remaining configured provider
     → on 451: reject all preexisting transports, retry once on a newly created connection, then advance
+      (an explicit provider policy may classify a conclusive article-operation retry as hard absence)
     → on buffered BODY corruption: retire the socket and advance
     → on 502: remove provider, retry
     → on all exhausted: deliver last response or error
@@ -643,7 +644,12 @@ Both strategies use the same provider eligibility boundary. They skip quota-exce
        • if ReconnectDelay > 0: schedule re-add after delay
        • try next provider
    - 451 → retire its socket, reject every other preexisting socket for that provider,
-     retry once on a newly created connection after short jitter, then try next provider
+     retry once on a newly created connection after short jitter, then try next provider:
+       • default/zero policy: repeated 451 remains temporary
+       • `Response451AbsentAfterRetry`: for STAT, BODY, HEAD, and ARTICLE only,
+         retry 451/423/430 completes provider-local hard absence
+       • success wins; timeout, transport failure, cancellation, or any other
+         response after the mapped 451 remains inconclusive rather than absent
    - buffered BODY framing/decode/size/CRC failure → retire the socket, try next provider
    - connection error → try next provider
    - quota exceeded → skip, try next provider
@@ -655,7 +661,10 @@ Both strategies use the same provider eligibility boundary. They skip quota-exce
    - backup 502 → remove, try next backup
 
 3. If all providers exhausted:
-   - return hard absence only when every eligible provider conclusively reported 423/430
+   - return hard absence only when every eligible provider conclusively reported
+     423/430 or completed the explicitly mapped 451 fresh-retry boundary
+   - uniform mapped-451 absence still satisfies `errors.Is(ErrArticleNotFound)`
+     while retaining the raw 451 response, provider, operation, and cause
    - mixed outcome classes return a structured inconclusive error with per-attempt evidence
 ```
 
@@ -669,9 +678,9 @@ client, err := nntppool.NewClient(ctx, providers,
 )
 ```
 
-When enabled, each provider opens after three qualifying failures from distinct public requests within a rolling 30-second window. Accounting happens once after all internal retries for that provider: a final `451`, provider connection/bootstrap failure, direct provider transport failure, or genuine provider response/progress timeout counts. Local queue/admission expiry, collateral pipeline cancellation, hard article absence, caller cancellation, health preemption, isolated article corruption, authentication, quota, configuration, and explicit service-unavailable states do not count. Bootstrap preserves `ErrAuthRequired`/`ErrAuthRejected` and marks recognized local address or TLS policy failures with `ErrInvalidProviderConfiguration`, so those actionable causes cannot be hidden by breaker cooldown.
+When enabled, each provider opens after three qualifying failures from distinct public requests within a rolling 30-second window. Accounting happens once after all internal retries for that provider: a final default-policy `451`, provider connection/bootstrap failure, direct provider transport failure, or genuine provider response/progress timeout counts. Local queue/admission expiry, collateral pipeline cancellation, hard article absence, caller cancellation, health preemption, isolated article corruption, authentication, quota, configuration, and explicit service-unavailable states do not count. A provider-mapped article `451` sequence is entirely neutral: it neither increments nor resets failures, advances cooldown, nor consumes a half-open recovery probe. Bootstrap preserves `ErrAuthRequired`/`ErrAuthRejected` and marks recognized local address or TLS policy failures with `ErrInvalidProviderConfiguration`, so those actionable causes cannot be hidden by breaker cooldown.
 
-An open provider is skipped while alternatives are tried. After cooldown, exactly one request receives an exclusive half-open probe on a fresh transport; concurrent requests receive `ErrCircuitBreakerOpen` with a `*CircuitBreakerError`. Failed probes advance cooldowns through 10, 20, 40, 80, and 120 seconds, capped at 120 seconds. Any successful provider request closes the breaker and resets its failure window and cooldown immediately.
+An open provider is skipped while alternatives are tried. After cooldown, exactly one request receives an exclusive half-open probe on a fresh transport; concurrent requests receive `ErrCircuitBreakerOpen` with a `*CircuitBreakerError`. Failed probes advance cooldowns through 10, 20, 40, 80, and 120 seconds, capped at 120 seconds. A successful provider request normally closes the breaker immediately; a success reached only after a mapped article `451` remains neutral because it does not establish provider transport recovery.
 
 nntppool does not wait for a cooldown or run caller retry/backoff policy. `ProviderStats.CircuitBreaker` exposes the current in-memory state, failure count, cooldown deadline, and probe occupancy. This transient state is transport telemetry, not durable article-availability evidence.
 
@@ -791,7 +800,7 @@ Both return immediately with a buffered channel (capacity 1). The caller receive
 
 ### v4 source compatibility
 
-Existing v4 methods and their signatures remain available. Zero values and external keyed composite literals remain source-compatible as additive provider identity, result evidence, validation, and telemetry fields are introduced. The provider circuit breaker is opt-in and disabled by default, so existing clients retain their routing behavior. External unkeyed literals of exported structs are not part of this compatibility guarantee: Go requires their field count and order to remain frozen, which is incompatible with the plan's explicitly additive v4 fields. The test suite includes an external-package compile fixture for the supported keyed and method-call surface.
+Existing v4 methods and their signatures remain available. Zero values and external keyed composite literals remain source-compatible as additive provider identity, result evidence, validation, and telemetry fields are introduced. The provider circuit breaker is opt-in and disabled by default, and an omitted `Response451Policy` is `Response451Temporary`, so existing clients retain their routing behavior. External unkeyed literals of exported structs are not part of this compatibility guarantee: Go requires their field count and order to remain frozen, which is incompatible with the plan's explicitly additive v4 fields. The test suite includes an external-package compile fixture for the supported keyed and method-call surface.
 
 ### Provider management
 
@@ -853,6 +862,14 @@ type AttemptEvidence struct {
     PipelineHeadWaitDuration time.Duration
     ResponseServiceDuration  time.Duration
 }
+
+// Response451Policy is provider-scoped. Its zero value is temporary.
+type Response451Policy uint8
+
+const (
+    Response451Temporary Response451Policy = iota
+    Response451AbsentAfterRetry
+)
 
 // TransportError wraps the existing sentinel/protocol cause so errors.Is and
 // errors.As checks remain valid after provider exhaustion or cancellation.
@@ -918,8 +935,10 @@ type StatResult struct {
 
 // ArticleHead holds the result of a HEAD command.
 type ArticleHead struct {
-    MessageID string
-    Headers   map[string][]string // RFC 5322 headers, multi-value, folding resolved
+    MessageID  string
+    ProviderID string
+    Attempts   []AttemptEvidence
+    Headers    map[string][]string // RFC 5322 headers, multi-value, folding resolved
 }
 
 // ProviderStats is a snapshot of one provider's metrics.
@@ -928,7 +947,7 @@ type ProviderStats struct {
     ProviderID        string
     AvgSpeed          float64       // bytes/sec since client start
     BytesConsumed     int64         // raw wire bytes
-    Missing           int64         // 430/423 responses
+    Missing           int64         // 423/430 and mapped article 451 wire responses
     Errors            int64         // network errors and bad status codes
     ActiveConnections int           // currently running connection slots
     MaxConnections    int           // configured Connections value
@@ -945,6 +964,11 @@ type ProviderStats struct {
     QuotaExceeded     bool
 }
 ```
+
+`ProviderStats.Missing` is a wire-response counter, not a count of conclusive
+provider requests. A mapped `451` followed by success therefore adds one missing
+response, while two mapped `451` responses add two; default-policy `451` remains
+an error response.
 
 ---
 
@@ -970,6 +994,7 @@ type ProviderStats struct {
 | `ThrottleRestore` | `time.Duration` | 30s | How long to wait before restoring throttled slots after a 502/400 greeting |
 | `KeepAlive` | `time.Duration` | 30s | TCP keep-alive interval; negative disables OS-level keep-alive |
 | `ReconnectDelay` | `time.Duration` | 0 (disabled) | If set, re-adds the provider this long after a 502 removal |
+| `Response451Policy` | `Response451Policy` | `Response451Temporary` | Provider-local article-operation meaning of 451. `Response451AbsentAfterRetry` makes only a retry 451/423/430 conclusive hard absence; invalid values fail client/provider validation |
 | `AttemptTimeout` | `time.Duration` | adaptive, 2s–10s | Time-to-first-response-byte bound starting only at FIFO response head; caller context owns pool and pipeline wait |
 | `StallTimeout` | `time.Duration` | 8s | Rolling body-progress timeout; negative disables it |
 | `AbandonedBodyDrainBytes` | `int` | 1 MiB | Maximum obsolete BODY bytes drained after cancellation before retiring the socket |
@@ -1004,7 +1029,7 @@ nntppool.WithProviderCircuitBreaker(true)
 
 | Error | NNTP Code | Meaning |
 |-------|-----------|---------|
-| `ErrArticleNotFound` | 430 or 423 | Article does not exist on this provider (semantic match: both codes satisfy `errors.Is`) |
+| `ErrArticleNotFound` | 430, 423, or mapped 451 aggregate | Article does not exist on this provider (mapped 451 requires its conclusive fresh retry and retains the raw 451 cause) |
 | `ErrPostingNotPermitted` | 440 | Server does not allow posting |
 | `ErrPostingFailed` | 441 | Server rejected the article |
 | `ErrAuthRequired` | 480 | Authentication required before this command |
@@ -1019,7 +1044,7 @@ nntppool.WithProviderCircuitBreaker(true)
 | `ErrInvalidProviderConfiguration` | — | Local address, authentication setup, TLS policy, or explicitly classified custom-factory configuration is invalid; never trips the temporary provider breaker |
 | `ErrCircuitBreakerOpen` | — | The provider is temporarily suppressed; use `errors.As` for `*CircuitBreakerError` state and retry time |
 
-`ErrArticleNotFound` uses category matching: `errors.Is(err, ErrArticleNotFound)` returns true for both 430 and 423 responses.
+`ErrArticleNotFound` uses category matching: `errors.Is(err, ErrArticleNotFound)` returns true for 430, 423, and a uniform hard-absence aggregate containing a provider-mapped 451. Mapped results preserve the raw 451 through `errors.As`; no synthetic 430 response is created.
 
 `ErrCircuitBreakerOpen` is a temporary eligibility outcome. nntppool does not wait until `CircuitBreakerError.RetryAt`; callers that need deadline-aware retry orchestration own that policy.
 

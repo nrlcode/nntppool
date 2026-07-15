@@ -47,8 +47,10 @@ type ArticleBody struct {
 
 // ArticleHead holds the parsed result of a HEAD command.
 type ArticleHead struct {
-	MessageID string
-	Headers   map[string][]string // RFC 5322 headers with folding resolved
+	MessageID  string
+	ProviderID string
+	Attempts   []AttemptEvidence
+	Headers    map[string][]string // RFC 5322 headers with folding resolved
 }
 
 // StatResult holds the parsed result of a STAT command.
@@ -198,8 +200,10 @@ func (c *Client) Head(ctx context.Context, messageID string) (*ArticleHead, erro
 	}
 
 	return &ArticleHead{
-		MessageID: messageID,
-		Headers:   parseHeaders(resp.Lines),
+		MessageID:  messageID,
+		ProviderID: resp.ProviderID,
+		Attempts:   cloneAttempts(resp.Attempts),
+		Headers:    parseHeaders(resp.Lines),
 	}, nil
 }
 

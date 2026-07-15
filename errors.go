@@ -1,6 +1,7 @@
 package nntppool
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -30,6 +31,7 @@ const (
 	OperationBody    Operation = "BODY"
 	OperationStat    Operation = "STAT"
 	OperationHead    Operation = "HEAD"
+	OperationArticle Operation = "ARTICLE"
 	OperationPost    Operation = "POST"
 )
 
@@ -126,20 +128,40 @@ func (e *TransportError) Unwrap() error {
 }
 
 func operationFromPayload(payload []byte) Operation {
-	for _, candidate := range []struct {
-		prefix string
-		op     Operation
-	}{
-		{"BODY ", OperationBody},
-		{"STAT ", OperationStat},
-		{"HEAD ", OperationHead},
-		{"POST", OperationPost},
-	} {
-		if len(payload) >= len(candidate.prefix) && string(payload[:len(candidate.prefix)]) == candidate.prefix {
-			return candidate.op
+	end := len(payload)
+	for index, char := range payload {
+		switch char {
+		case ' ', '\t', '\r', '\n':
+			end = index
+		}
+		if end != len(payload) {
+			break
 		}
 	}
-	return OperationUnknown
+	command := payload[:end]
+	switch {
+	case bytes.EqualFold(command, []byte("BODY")):
+		return OperationBody
+	case bytes.EqualFold(command, []byte("STAT")):
+		return OperationStat
+	case bytes.EqualFold(command, []byte("HEAD")):
+		return OperationHead
+	case bytes.EqualFold(command, []byte("ARTICLE")):
+		return OperationArticle
+	case bytes.EqualFold(command, []byte("POST")):
+		return OperationPost
+	default:
+		return OperationUnknown
+	}
+}
+
+func isArticleOperation(operation Operation) bool {
+	switch operation {
+	case OperationStat, OperationBody, OperationHead, OperationArticle:
+		return true
+	default:
+		return false
+	}
 }
 
 func classifyOutcome(code int, err error) OutcomeKind {
@@ -236,6 +258,12 @@ func newTransportError(attempts []AttemptEvidence, cause error) *TransportError 
 			}
 			break
 		}
+	}
+	if kind == OutcomeHardArticleAbsence && cause != nil {
+		// Preserve a mapped vendor 451 as the representative raw cause while
+		// retaining the established ErrArticleNotFound sentinel contract. The
+		// classification wrapper exposes both causes without fabricating a 430.
+		cause = withErrorClassification(cause, ErrArticleNotFound)
 	}
 	return &TransportError{
 		Kind:         kind,

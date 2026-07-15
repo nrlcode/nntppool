@@ -24,7 +24,7 @@ type PingResult struct {
 // Used on the hot path — no mutex, atomic only.
 type providerStats struct {
 	BytesConsumed       atomic.Int64 // wire bytes consumed (used to compute AvgSpeed)
-	Missing             atomic.Int64 // 430/423 responses
+	Missing             atomic.Int64 // 423/430 and provider-mapped article 451 wire responses
 	Errors              atomic.Int64 // network errors, bad status codes
 	PipelineInUse       atomic.Int64
 	BackgroundStatInUse atomic.Int64
@@ -112,7 +112,7 @@ type ProviderStats struct {
 	AvgSpeed            float64 // bytes/sec average since client start
 	SpeedEWMA           float64 // bytes/sec recent throughput estimate (drives speed-aware dispatch); 0 = no sample
 	BytesConsumed       int64   // raw wire bytes consumed since client start
-	Missing             int64
+	Missing             int64   // hard-absence wire responses, not conclusive provider-request count
 	Errors              int64
 	ActiveConnections   int           // currently running connections
 	MaxConnections      int           // configured connection slots

@@ -259,6 +259,14 @@ func classifyCircuitBreakerCompletion(resp Response, ok, cancelled bool) circuit
 	if cancelled || !ok || len(resp.Attempts) == 0 {
 		return circuitBreakerNeutral
 	}
+	for _, attempt := range resp.Attempts {
+		if attempt.ResponseCode == 451 && attempt.Outcome == OutcomeHardArticleAbsence {
+			// Provider-mapped article evidence is neither provider failure nor
+			// transport recovery. Keep the bounded retry sequence neutral even
+			// when a later attempt succeeds or fails at the transport layer.
+			return circuitBreakerNeutral
+		}
+	}
 	final := resp.Attempts[len(resp.Attempts)-1]
 	switch final.Outcome {
 	case OutcomeSuccess:
