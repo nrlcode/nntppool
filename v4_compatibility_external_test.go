@@ -22,6 +22,8 @@ var (
 	_                            = nntppool.Request{Ctx: context.Background(), Payload: []byte("DATE\r\n"), RespCh: make(chan nntppool.Response, 1)}
 	_                            = nntppool.Response{StatusCode: 200, Status: "200 ready"}
 	_                            = nntppool.ArticleBody{MessageID: "fixture@example.invalid", Bytes: []byte("payload")}
+	_                            = nntppool.ArticleHead{MessageID: "fixture@example.invalid", Headers: map[string][]string{"Subject": {"fixture"}}}
+	_                            = nntppool.ArticleHead{MessageID: "fixture@example.invalid", ProviderID: "provider", Attempts: []nntppool.AttemptEvidence{{Operation: nntppool.OperationHead}}}
 	_                            = nntppool.StatResult{MessageID: "fixture@example.invalid", Number: 1}
 	_                            = nntppool.ProviderStats{Name: "provider"}
 	_                            = nntppool.ClientStats{}
