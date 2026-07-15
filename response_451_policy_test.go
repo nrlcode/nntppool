@@ -255,6 +255,91 @@ func Test451AHeadSuccessRetainsMappedRetryEvidence(t *testing.T) {
 	}
 }
 
+type response451FailingWriter struct {
+	err   error
+	bytes atomic.Int64
+}
+
+func (w *response451FailingWriter) Write(payload []byte) (int, error) {
+	w.bytes.Add(int64(len(payload)))
+	return 0, w.err
+}
+
+func Test451AArticleWriterCommitStopsFallbackForEveryCommandForm(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		payload       string
+		commandPrefix string
+		responseCode  string
+	}{
+		{name: "mixed_case_body", payload: "BoDy <fixture@example.invalid>\r\n", commandPrefix: "BoDy", responseCode: "222"},
+		{name: "article", payload: "ARTICLE <fixture@example.invalid>\r\n", commandPrefix: "ARTICLE", responseCode: "220"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			committedErr := errors.New("deterministic committed writer failure")
+			writer := &response451FailingWriter{err: committedErr}
+			primary := &regressionProvider{
+				host: "writer-commit-primary-" + test.name + ".invalid:119",
+				respond: func(connection int, _ string) []byte {
+					if connection == 1 {
+						return []byte("451 mapped article absence\r\n")
+					}
+					response := yencSinglePart([]byte("committed writer payload"), "committed.bin")
+					copy(response[:3], test.responseCode)
+					return response
+				},
+			}
+			fallback := &regressionProvider{
+				host: "writer-commit-fallback-" + test.name + ".invalid:119",
+				respond: func(_ int, _ string) []byte {
+					response := yencSinglePart([]byte("forbidden fallback payload"), "fallback.bin")
+					copy(response[:3], test.responseCode)
+					return response
+				},
+			}
+			client := newResponse451Client(t,
+				response451Provider(primary, "writer-commit-primary", false, Response451AbsentAfterRetry),
+				response451Provider(fallback, "writer-commit-fallback", false, Response451Temporary),
+			)
+
+			response := <-client.Send(context.Background(), []byte(test.payload), writer)
+			err := responseError(response)
+			if !errors.Is(err, committedErr) {
+				t.Fatalf("Send() error = %v, want committed writer failure", err)
+			}
+			if writer.bytes.Load() == 0 {
+				t.Fatal("writer received no decoded bytes before its committed failure")
+			}
+			if fallback.commandCount(test.commandPrefix) != 0 {
+				t.Fatalf("fallback commands = %d, committed writer must stop cross-provider restart", fallback.commandCount(test.commandPrefix))
+			}
+			if len(response.Attempts) != 2 ||
+				response.Attempts[0].Outcome != OutcomeHardArticleAbsence ||
+				response.Attempts[0].ResponseCode != 451 ||
+				response.Attempts[1].Operation == OperationUnknown {
+				t.Fatalf("attempts = %+v, want mapped 451 then committed article-operation failure", response.Attempts)
+			}
+		})
+	}
+}
+
+func Test451AMappedClassificationPreservesNonNilErrorPrecedence(t *testing.T) {
+	req := &Request{
+		Ctx:               context.Background(),
+		Payload:           []byte("STAT <fixture@example.invalid>\r\n"),
+		response451Policy: Response451AbsentAfterRetry,
+		submittedAt:       time.Now(),
+	}
+	attempt := buildAttemptEvidence(req, "mapped-error-precedence", Response{
+		StatusCode: 451,
+		Status:     "451 mapped article absence",
+		Err:        context.Canceled,
+	}, time.Now())
+	if attempt.Outcome != OutcomeCancellation || !errors.Is(attempt.Cause, context.Canceled) {
+		t.Fatalf("attempt = %+v, non-nil cancellation must take precedence over mapped status", attempt)
+	}
+}
+
 func Test451AMappedRetryRejectsEveryPreexistingHotTransport(t *testing.T) {
 	var connections atomic.Int32
 	var bodyAttempts atomic.Int32
