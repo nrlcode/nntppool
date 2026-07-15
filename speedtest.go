@@ -215,43 +215,28 @@ func (c *Client) SpeedTest(ctx context.Context, opts SpeedTestOptions) (*SpeedTe
 	}, nil
 }
 
-// sendToGroup dispatches a request directly to a specific provider group,
-// bypassing the round-robin sendWithRetry logic.
+// sendToGroup dispatches a request to exactly one provider group while retaining
+// the provider-local fresh-transport retry and circuit-breaker state machine.
 func (c *Client) sendToGroup(ctx context.Context, g *providerGroup, payload []byte, bodyWriter io.Writer) <-chan Response {
 	outerCh := make(chan Response, 1)
 	go func() {
 		defer close(outerCh)
-		innerCh := make(chan Response, 1)
-		req := &Request{
-			Ctx:        ctx,
-			Payload:    payload,
-			RespCh:     innerCh,
-			BodyWriter: bodyWriter,
-		}
-		select {
-		case <-ctx.Done():
-			outerCh <- Response{Err: ctx.Err()}
-			return
-		case <-c.ctx.Done():
-			outerCh <- Response{Err: c.ctx.Err()}
-			return
-		case <-g.ctx.Done():
-			outerCh <- Response{Err: context.Canceled}
-			return
-		case g.reqCh <- req:
-		}
-		select {
-		case resp, ok := <-innerCh:
-			if ok {
-				outerCh <- resp
+		resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, bodyWriter, nil, false, false, false)
+		if cancelled {
+			cause := ctx.Err()
+			if cause == nil {
+				cause = c.ctx.Err()
 			}
-		case <-ctx.Done():
-			outerCh <- Response{Err: ctx.Err()}
-		case <-c.ctx.Done():
-			outerCh <- Response{Err: c.ctx.Err()}
-		case <-g.ctx.Done():
-			outerCh <- Response{Err: context.Canceled}
+			if cause == nil {
+				cause = context.Canceled
+			}
+			outerCh <- cancellationResponse(resp.Attempts, cause)
+			return
 		}
+		if !ok && resp.Err == nil {
+			resp.Err = ErrConnectionDied
+		}
+		outerCh <- resp
 	}()
 	return outerCh
 }

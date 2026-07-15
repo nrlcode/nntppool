@@ -161,6 +161,10 @@ type Request struct {
 	ValidateBody   bool
 	FreshTransport bool
 
+	// response451Policy is copied from the exact provider group at dispatch so
+	// attempt evidence cannot be reinterpreted after configuration changes.
+	response451Policy Response451Policy
+
 	// Optional: called with yEnc metadata once =ybegin/=ypart headers are parsed, before body decoding.
 	OnMeta func(YEncMeta)
 	// decodeFn is an internal deterministic test seam for native decoder
@@ -478,22 +482,20 @@ func keepaliveExpectedCode(cmd string) int {
 	}
 }
 
-// statCmdPrefix identifies STAT commands, the only bodyless request the pool
-// issues through the normal write path (keepalive DATE has its own path). STAT
-// has a single-line reply and no payload, so it may pipeline to the deeper
-// StatInflight depth without acquiring a bodySem slot.
-var statCmdPrefix = []byte("STAT ")
-var bodyCmdPrefix = []byte("BODY ")
-
 // isCheapCommand reports whether payload is a bodyless command that should
 // bypass the BODY concurrency bound (bodySem) and pipeline to the full
 // inflightSem (StatInflight) depth.
 func isCheapCommand(payload []byte) bool {
-	return bytes.HasPrefix(payload, statCmdPrefix)
+	return operationFromPayload(payload) == OperationStat
 }
 
 func isBodyCommand(payload []byte) bool {
-	return bytes.HasPrefix(payload, bodyCmdPrefix)
+	switch operationFromPayload(payload) {
+	case OperationBody, OperationArticle:
+		return true
+	default:
+		return false
+	}
 }
 
 func failRequest(ch chan Response, err error) {
@@ -1586,7 +1588,7 @@ func (c *NNTPConnection) readerLoop() {
 			}
 			if resp.Err != nil && classifyOutcome(resp.StatusCode, resp.Err) != OutcomeCancellation {
 				c.stats.Errors.Add(1)
-			} else if decoder.StatusCode == 430 || decoder.StatusCode == 423 {
+			} else if decoder.StatusCode == 430 || decoder.StatusCode == 423 || requestMaps451ToAbsence(req, decoder.StatusCode) {
 				c.stats.Missing.Add(1)
 			} else if decoder.StatusCode < 200 || decoder.StatusCode >= 400 {
 				c.stats.Errors.Add(1)
@@ -1738,6 +1740,25 @@ func withCircuitBreakerClock(clock circuitBreakerClock) ClientOption {
 	return func(cfg *clientConfig) { cfg.circuitBreakerClock = clock }
 }
 
+// Response451Policy controls the provider-local meaning of NNTP 451 replies
+// for article existence and retrieval commands. Its zero value preserves the
+// v4 behavior in which 451 remains temporary after the existing fresh retry.
+type Response451Policy uint8
+
+const (
+	Response451Temporary Response451Policy = iota
+	Response451AbsentAfterRetry
+)
+
+func validateResponse451Policy(policy Response451Policy) error {
+	switch policy {
+	case Response451Temporary, Response451AbsentAfterRetry:
+		return nil
+	default:
+		return fmt.Errorf("%w: unknown 451 response policy %d", ErrInvalidProviderConfiguration, policy)
+	}
+}
+
 // Provider describes a single NNTP server with its own credentials and connection count.
 type Provider struct {
 	// ID is the caller's stable transport identity for result and attempt
@@ -1758,6 +1779,10 @@ type Provider struct {
 	ThrottleRestore        time.Duration // 0 defaults to 30s
 	KeepAlive              time.Duration // TCP keep-alive interval; 0 defaults to 30s; negative disables
 	ReconnectDelay         time.Duration // 0 disables auto-reconnect after 502; when set, re-adds provider after this delay
+	// Response451Policy applies only to STAT, BODY, HEAD, and ARTICLE. The zero
+	// value keeps 451 temporary; AbsentAfterRetry makes a conclusive repeated
+	// fresh-transport 451 provider-local hard-absence evidence.
+	Response451Policy Response451Policy
 
 	// AttemptTimeout bounds time-to-first-response-byte starting only when the
 	// request becomes response head on its NNTP connection. Pool admission and
@@ -2156,6 +2181,9 @@ func NewClient(ctx context.Context, providers []Provider, opts ...ClientOption) 
 	seen := make(map[string]struct{}, len(providers))
 	seenIDs := make(map[string]struct{}, len(providers))
 	for i, p := range providers {
+		if err := validateResponse451Policy(p.Response451Policy); err != nil {
+			return nil, err
+		}
 		if p.Connections <= 0 {
 			return nil, fmt.Errorf("nntp: provider connections must be > 0")
 		}
@@ -2365,7 +2393,7 @@ func (c *Client) raceCandidates(
 			}
 			return false, false, fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
 		}
-		if resp.StatusCode == 430 || resp.StatusCode == 423 {
+		if responseIsHardArticleAbsence(resp) {
 			c.nextIdx.Add(1)
 			return false, false, lastErr
 		}
@@ -2405,16 +2433,16 @@ func (c *Client) raceCandidates(
 			continue
 		}
 		g := pr.g
-		switch pr.resp.StatusCode {
-		case 502:
+		switch {
+		case pr.resp.StatusCode == 502:
 			_ = c.RemoveProvider(g.name)
 			if g.p.ReconnectDelay > 0 {
 				c.scheduleReconnect(g)
 			}
 			lastErr = fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
-		case 430, 423:
+		case responseIsHardArticleAbsence(pr.resp):
 			c.nextIdx.Add(1)
-		case 223:
+		case pr.resp.StatusCode == 223:
 			winners = append(winners, g)
 		default:
 			lastErr = fmt.Errorf("%s: %w", g.name, toError(pr.resp.StatusCode, pr.resp.Status))
@@ -2449,7 +2477,7 @@ func (c *Client) raceCandidates(
 			lastErr = resp.Err
 			continue
 		}
-		if resp.StatusCode == 430 || resp.StatusCode == 423 {
+		if responseIsHardArticleAbsence(resp) {
 			c.nextIdx.Add(1)
 			continue
 		}
@@ -2508,17 +2536,18 @@ func (c *Client) tryGroup(
 
 	innerCh := make(chan Response, 1)
 	req := &Request{
-		Ctx:             reqCtx,
-		Payload:         payload,
-		RespCh:          innerCh,
-		BodyWriter:      bodyWriter,
-		ValidateBody:    validateBody,
-		FreshTransport:  freshTransport,
-		Priority:        priority,
-		OnMeta:          onMeta,
-		decodeFn:        c.decodeFn,
-		submittedAt:     time.Now(),
-		responseTimeout: g.attemptTimeout(),
+		Ctx:               reqCtx,
+		Payload:           payload,
+		RespCh:            innerCh,
+		BodyWriter:        bodyWriter,
+		ValidateBody:      validateBody,
+		FreshTransport:    freshTransport,
+		response451Policy: g.p.Response451Policy,
+		Priority:          priority,
+		OnMeta:            onMeta,
+		decodeFn:          c.decodeFn,
+		submittedAt:       time.Now(),
+		responseTimeout:   g.attemptTimeout(),
 	}
 	failAttempt := func(cause error) Response {
 		response := Response{Err: cause, Request: req, ProviderID: g.id}
@@ -2581,9 +2610,13 @@ func buildAttemptEvidence(req *Request, providerID string, resp Response, comple
 	if cause == nil {
 		cause = toError(resp.StatusCode, resp.Status)
 	}
+	operation := operationFromPayload(req.Payload)
 	outcome := classifyOutcome(resp.StatusCode, cause)
+	if resp.Err == nil && requestMaps451ToAbsence(req, resp.StatusCode) {
+		outcome = OutcomeHardArticleAbsence
+	}
 	validation := BodyValidationNotApplicable
-	if operationFromPayload(req.Payload) == OperationBody {
+	if operation == OperationBody {
 		if !req.ValidateBody {
 			validation = BodyValidationNotRequested
 		} else {
@@ -2624,7 +2657,7 @@ func buildAttemptEvidence(req *Request, providerID string, resp Response, comple
 	}
 	return AttemptEvidence{
 		ProviderID:               providerID,
-		Operation:                operationFromPayload(req.Payload),
+		Operation:                operation,
 		Outcome:                  outcome,
 		ResponseCode:             resp.StatusCode,
 		BodyValidation:           validation,
@@ -2636,9 +2669,30 @@ func buildAttemptEvidence(req *Request, providerID string, resp Response, comple
 	}
 }
 
+func requestMaps451ToAbsence(req *Request, responseCode int) bool {
+	return responseCode == 451 &&
+		req != nil &&
+		req.response451Policy == Response451AbsentAfterRetry &&
+		isArticleOperation(operationFromPayload(req.Payload))
+}
+
 func buildEligibilityEvidence(payload []byte, providerID string, cause error, validateBody bool) AttemptEvidence {
 	req := &Request{Payload: payload, ValidateBody: validateBody}
 	return buildAttemptEvidence(req, providerID, Response{Err: cause}, time.Now())
+}
+
+// responseIsHardArticleAbsence recognizes both protocol-native 423/430 and a
+// conclusive provider-mapped 451 retry. The final mapped attempt is consulted
+// so the first 451 alone never completes the provider conclusion.
+func responseIsHardArticleAbsence(resp Response) bool {
+	if resp.StatusCode == 423 || resp.StatusCode == 430 {
+		return true
+	}
+	if resp.StatusCode != 451 || len(resp.Attempts) == 0 {
+		return false
+	}
+	final := resp.Attempts[len(resp.Attempts)-1]
+	return final.ResponseCode == 451 && final.Outcome == OutcomeHardArticleAbsence
 }
 
 // maxSpeedScore is the highest multiplier speed-aware dispatch applies to a
@@ -2750,6 +2804,7 @@ func (c *Client) tryGroupResilient(
 	var attempts []AttemptEvidence
 	connRetries := 0
 	temporaryRetried := false
+	mapped451Retry := false
 	for {
 		resp, ok, cancelled = c.tryGroup(ctx, g, payload, bodyWriter, onMeta, priority, validateBody, freshTransport)
 		attempts = append(attempts, resp.Attempts...)
@@ -2770,6 +2825,7 @@ func (c *Client) tryGroupResilient(
 		}
 		if !temporaryRetried && resp.Err == nil && resp.StatusCode == 451 {
 			temporaryRetried = true
+			mapped451Retry = requestMaps451ToAbsence(resp.Request, resp.StatusCode)
 			delay := temporaryRetryMinDelay + time.Duration(rand.Int64N(int64(temporaryRetryJitter)+1))
 			select {
 			case <-time.After(delay):
@@ -2783,6 +2839,13 @@ func (c *Client) tryGroupResilient(
 				resp.Attempts = cloneAttempts(attempts)
 				return resp, true, true
 			}
+		}
+		// A mapped 451 receives exactly one consistency retry. If that required
+		// retry loses its transport, the provider conclusion is inconclusive;
+		// another same-provider attempt would exceed the accepted bound.
+		if mapped451Retry && isConnectionDeathError(resp.Err) {
+			resp.Attempts = cloneAttempts(attempts)
+			return
 		}
 		if connRetries < maxConnDiedRetries && isConnectionDeathError(resp.Err) {
 			connRetries++
@@ -2888,7 +2951,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			lastErr = fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
 			continue
 		}
-		if resp.StatusCode == 430 || resp.StatusCode == 423 {
+		if responseIsHardArticleAbsence(resp) {
 			c.nextIdx.Add(1) // bias next request away from this provider
 			lastResp = resp
 			hasResp = true
@@ -2995,7 +3058,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 				continue
 			}
 			resp.Attempts = cloneAttempts(attempts)
-			if resp.StatusCode == 430 || resp.StatusCode == 423 {
+			if responseIsHardArticleAbsence(resp) {
 				lastResp = resp
 				hasResp = true
 				continue
@@ -3085,6 +3148,9 @@ func (c *Client) Stats() ClientStats {
 // AddProvider validates, pings, and registers a new provider at runtime.
 // Ping failures are recorded in the group's stats but do not cause an error return.
 func (c *Client) AddProvider(p Provider) error {
+	if err := validateResponse451Policy(p.Response451Policy); err != nil {
+		return err
+	}
 	if p.Connections <= 0 {
 		return fmt.Errorf("nntp: provider connections must be > 0")
 	}
