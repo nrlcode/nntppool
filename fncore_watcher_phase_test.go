@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -370,6 +371,15 @@ func TestFNCORELaterPipelinedCancellationPreservesEarlierResponseAndReuse(t *tes
 	case <-twoCommandsSeen:
 	case <-time.After(5 * time.Second):
 		t.Fatal("server did not receive both fully-written pipelined requests")
+	}
+	writtenDeadline := time.After(5 * time.Second)
+	for later.writtenAt.Load() == 0 {
+		select {
+		case <-writtenDeadline:
+			t.Fatal("later pipelined request was not marked written after server receipt")
+		default:
+			runtime.Gosched()
+		}
 	}
 	cancelLater()
 	close(releaseResponses)
