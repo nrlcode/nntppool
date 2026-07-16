@@ -327,6 +327,7 @@ func TestPR1CancelledPipelineDoesNotDelayNewPriorityBody(t *testing.T) {
 	largeBody := yencSinglePart(bytes.Repeat([]byte("q"), regressionBodySize), "obsolete.bin")
 	priorityBody := yencSinglePart([]byte("priority payload"), "priority.bin")
 	firstCommandsRead := make(chan struct{})
+	releaseFirstConnection := make(chan struct{})
 	var connections atomic.Int32
 	factory := func(context.Context) (net.Conn, error) {
 		connection := connections.Add(1)
@@ -342,7 +343,8 @@ func TestPR1CancelledPipelineDoesNotDelayNewPriorityBody(t *testing.T) {
 					}
 				}
 				close(firstCommandsRead)
-				_, _ = server.Write(largeBody)
+				_, _ = server.Write(largeBody[:32*1024])
+				<-releaseFirstConnection
 				return
 			}
 			if _, err := reader.ReadString('\n'); err != nil {
@@ -376,6 +378,7 @@ func TestPR1CancelledPipelineDoesNotDelayNewPriorityBody(t *testing.T) {
 	for _, cancel := range cancels {
 		cancel()
 	}
+	close(releaseFirstConnection)
 	start := time.Now()
 	body, err := client.BodyPriority(context.Background(), "priority@example.invalid")
 	if err != nil {
