@@ -31,18 +31,6 @@ func fncoreTargetedStat(ctx context.Context, client *Client, providerID, message
 	return result
 }
 
-type fncoreSignalWriter struct {
-	once  sync.Once
-	wrote chan struct{}
-	bytes bytes.Buffer
-}
-
-func (w *fncoreSignalWriter) Write(p []byte) (int, error) {
-	n, err := w.bytes.Write(p)
-	w.once.Do(func() { close(w.wrote) })
-	return n, err
-}
-
 type fncoreRacingErrorWriter struct {
 	once    sync.Once
 	started chan struct{}
@@ -72,17 +60,113 @@ func (c *fncoreWriteFailConn) Write(p []byte) (int, error) {
 
 type fncoreBlockingWriteConn struct {
 	net.Conn
-	once    sync.Once
-	started chan struct{}
-	release chan struct{}
+	once              sync.Once
+	started           chan struct{}
+	release           chan struct{}
+	blockedAtNanos    atomic.Int64
+	readDeadlineCalls atomic.Int32
+	readDeadlineNanos atomic.Int64
 }
 
 func (c *fncoreBlockingWriteConn) Write(p []byte) (int, error) {
 	c.once.Do(func() {
+		c.blockedAtNanos.Store(time.Now().UnixNano())
 		close(c.started)
 		<-c.release
 	})
 	return c.Conn.Write(p)
+}
+
+func (c *fncoreBlockingWriteConn) SetReadDeadline(deadline time.Time) error {
+	c.readDeadlineCalls.Add(1)
+	c.readDeadlineNanos.Store(deadline.UnixNano())
+	return c.Conn.SetReadDeadline(deadline)
+}
+
+type fncoreFinalizationDecodeBarrier struct {
+	entered     chan struct{}
+	release     chan struct{}
+	enteredOnce sync.Once
+	releaseOnce sync.Once
+	calls       atomic.Int32
+	errMu       sync.Mutex
+	err         error
+}
+
+func newFNCOREFinalizationDecodeBarrier() *fncoreFinalizationDecodeBarrier {
+	return &fncoreFinalizationDecodeBarrier{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (b *fncoreFinalizationDecodeBarrier) setError(err error) {
+	b.errMu.Lock()
+	if b.err == nil {
+		b.err = err
+	}
+	b.errMu.Unlock()
+}
+
+func (b *fncoreFinalizationDecodeBarrier) Error() error {
+	b.errMu.Lock()
+	defer b.errMu.Unlock()
+	return b.err
+}
+
+func (b *fncoreFinalizationDecodeBarrier) Release() {
+	b.releaseOnce.Do(func() { close(b.release) })
+}
+
+func (b *fncoreFinalizationDecodeBarrier) Decode(
+	dst, src []byte,
+	state *rapidyenc.State,
+) (nDst, nSrc int, end rapidyenc.End, err error) {
+	switch call := b.calls.Add(1); call {
+	case 1:
+		// Consume only the encoded data. The first decode therefore writes all
+		// caller bytes and returns before the already-buffered trailer is parsed.
+		trailer := bytes.Index(src, []byte("\r\n=yend "))
+		if trailer <= 0 {
+			b.setError(errors.New("first decoder invocation did not contain the complete encoded body and trailer"))
+			b.enteredOnce.Do(func() { close(b.entered) })
+			<-b.release
+			return 0, 0, rapidyenc.EndNone, b.Error()
+		}
+		return rapidyenc.DecodeIncremental(dst[:trailer], src[:trailer], state)
+	case 2:
+		if !bytes.Contains(src, []byte("=yend ")) {
+			b.setError(errors.New("second decoder invocation did not begin with the buffered yEnc trailer"))
+		}
+		b.enteredOnce.Do(func() { close(b.entered) })
+		<-b.release
+		return rapidyenc.DecodeIncremental(dst, src, state)
+	default:
+		return rapidyenc.DecodeIncremental(dst, src, state)
+	}
+}
+
+func fncoreBufferedTrailerFactory(response []byte) ConnFactory {
+	return func(context.Context) (net.Conn, error) {
+		client, server := net.Pipe()
+		go func() {
+			defer func() { _ = server.Close() }()
+			_, _ = server.Write([]byte("200 regression server ready\r\n"))
+			reader := bufio.NewReader(server)
+			if _, err := reader.ReadString('\n'); err != nil {
+				return
+			}
+			if _, err := server.Write(response); err != nil {
+				return
+			}
+			// feedUntilDoneControlled asks the socket for more input after a
+			// partial decode even when the yEnc trailer remains in readBuffer.
+			// This byte satisfies only that read; the second decode invocation
+			// still begins at the already-buffered trailer.
+			_, _ = server.Write([]byte("x"))
+		}()
+		return client, nil
+	}
 }
 
 type fncoreDeadlineTimeout struct{}
@@ -125,6 +209,8 @@ func (c *fncoreCallerDeadlineConn) lastDeadline() time.Time {
 func TestFNCOREHalfOpenCancellationBeforeTransportAdmissionIsPromptAndNeutral(t *testing.T) {
 	clock := newBreakerFakeClock()
 	var blockDial atomic.Bool
+	var recovering atomic.Bool
+	var healthyProbeCommands atomic.Int32
 	dialStarted := make(chan struct{})
 	dialRelease := make(chan struct{})
 	var releaseOnce sync.Once
@@ -133,7 +219,8 @@ func TestFNCOREHalfOpenCancellationBeforeTransportAdmissionIsPromptAndNeutral(t 
 	wireObservation := make(chan string, 1)
 	var dialOnce sync.Once
 	factory := func(context.Context) (net.Conn, error) {
-		if blockDial.Load() {
+		blocked := blockDial.Load()
+		if blocked {
 			dialOnce.Do(func() { close(dialStarted) })
 			<-dialRelease
 		}
@@ -149,9 +236,14 @@ func TestFNCOREHalfOpenCancellationBeforeTransportAdmissionIsPromptAndNeutral(t 
 				return
 			}
 			if _, err := reader.ReadString('\n'); err == nil {
+				if recovering.Load() {
+					healthyProbeCommands.Add(1)
+					_, _ = server.Write([]byte("223 1 <pre-admission@example.invalid> exists\r\n"))
+					return
+				}
 				_, _ = server.Write([]byte("451 temporary failure\r\n"))
 			}
-		}(blockDial.Load())
+		}(blocked)
 		return client, nil
 	}
 	provider := Provider{
@@ -201,37 +293,34 @@ func TestFNCOREHalfOpenCancellationBeforeTransportAdmissionIsPromptAndNeutral(t 
 	case <-time.After(5 * time.Second):
 		t.Fatal("blocked admission did not settle after release")
 	}
+	stats = providerBreakerStats(t, client, provider.ID)
+	if stats.State != CircuitBreakerHalfOpen || stats.ProbeInFlight || stats.QualifyingFailures != 0 {
+		t.Fatalf("late pre-admission settlement changed breaker state: %+v", stats)
+	}
+
+	blockDial.Store(false)
+	recovering.Store(true)
+	healthy := fncoreTargetedStat(context.Background(), client, provider.ID, "pre-admission@example.invalid")
+	if healthy.Err != nil || healthy.Result == nil {
+		t.Fatalf("healthy half-open probe result = %+v", healthy)
+	}
+	if got := healthyProbeCommands.Load(); got != 1 {
+		t.Fatalf("healthy half-open wire commands = %d, want exactly one", got)
+	}
+	stats = providerBreakerStats(t, client, provider.ID)
+	if stats.State != CircuitBreakerClosed || stats.ProbeInFlight || stats.QualifyingFailures != 0 {
+		t.Fatalf("healthy probe did not close and reset breaker: %+v", stats)
+	}
 }
 
 func TestFNCORECommittedFinalWriterToFinalizationRemovalIsTerminal(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	t.Cleanup(func() { runtime.GOMAXPROCS(previous) })
 	payload := []byte("final writer payload")
-	response := yencSinglePart(payload, "final.bin")
-	trailer := bytes.Index(response, []byte("\r\n=yend"))
-	if trailer < 0 {
-		t.Fatal("fixture omitted yEnc trailer")
-	}
-	releaseTrailer := make(chan struct{})
-	primaryFactory := func(context.Context) (net.Conn, error) {
-		client, server := net.Pipe()
-		go func() {
-			defer func() { _ = server.Close() }()
-			_, _ = server.Write([]byte("200 regression server ready\r\n"))
-			reader := bufio.NewReader(server)
-			if _, err := reader.ReadString('\n'); err != nil {
-				return
-			}
-			if _, err := server.Write(response[:trailer+2]); err != nil {
-				return
-			}
-			<-releaseTrailer
-			_, _ = server.Write(response[trailer+2:])
-		}()
-		return client, nil
-	}
 	primary := Provider{
 		ID:          "finalization-primary",
 		Host:        "finalization-primary.invalid:119",
-		Factory:     primaryFactory,
+		Factory:     fncoreBufferedTrailerFactory(yencSinglePart(payload, "final.bin")),
 		Connections: 1,
 		Inflight:    1,
 		SkipPing:    true,
@@ -243,25 +332,34 @@ func TestFNCORECommittedFinalWriterToFinalizationRemovalIsTerminal(t *testing.T)
 		},
 	}
 	client := fncoreClient(t, primary, backup.provider(true))
-	writer := &fncoreSignalWriter{wrote: make(chan struct{})}
+	barrier := newFNCOREFinalizationDecodeBarrier()
+	defer barrier.Release()
+	client.decodeFn = barrier.Decode
+	var writer bytes.Buffer
 	result := make(chan error, 1)
 	go func() {
-		_, err := client.BodyStream(context.Background(), "fixture@example.invalid", writer)
+		_, err := client.BodyStream(context.Background(), "fixture@example.invalid", &writer)
 		result <- err
 	}()
 	select {
-	case <-writer.wrote:
+	case <-barrier.entered:
 	case <-time.After(5 * time.Second):
-		t.Fatal("final caller write did not occur")
+		t.Fatalf("decoder did not reach the buffered finalization seam (calls=%d, error=%v)", barrier.calls.Load(), barrier.Error())
+	}
+	if err := barrier.Error(); err != nil {
+		t.Fatalf("decoder seam error = %v", err)
+	}
+	if !bytes.Equal(writer.Bytes(), payload) {
+		t.Fatalf("caller bytes at finalization seam = %q, want %q", writer.Bytes(), payload)
 	}
 	if err := client.RemoveProvider(primary.Host); err != nil {
 		t.Fatalf("RemoveProvider() error = %v", err)
 	}
-	close(releaseTrailer)
+	barrier.Release()
 	select {
 	case err := <-result:
-		if err == nil {
-			t.Fatal("provider removal between final write and finalization returned success")
+		if !errors.Is(err, ErrConnectionDied) {
+			t.Fatalf("provider removal between final write and finalization error = %v, want connection retirement", err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("committed finalization race did not settle")
@@ -269,42 +367,21 @@ func TestFNCORECommittedFinalWriterToFinalizationRemovalIsTerminal(t *testing.T)
 	if got := backup.commandCount("BODY"); got != 0 {
 		t.Fatalf("backup BODY commands = %d, want zero after final caller write", got)
 	}
-	if !bytes.Equal(writer.bytes.Bytes(), payload) {
-		t.Fatalf("caller bytes = %q, want only primary payload %q", writer.bytes.Bytes(), payload)
+	if !bytes.Equal(writer.Bytes(), payload) {
+		t.Fatalf("caller bytes = %q, want only primary payload %q", writer.Bytes(), payload)
 	}
 }
 
 func TestFNCORECommittedFinalWriterToFinalizationCancellationAndShutdownAreTerminal(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	t.Cleanup(func() { runtime.GOMAXPROCS(previous) })
 	for _, mode := range []string{"caller cancellation", "client shutdown"} {
 		t.Run(mode, func(t *testing.T) {
 			payload := []byte("final lifecycle payload")
-			response := yencSinglePart(payload, "final-lifecycle.bin")
-			trailer := bytes.Index(response, []byte("\r\n=yend"))
-			if trailer < 0 {
-				t.Fatal("fixture omitted yEnc trailer")
-			}
-			releaseTrailer := make(chan struct{})
-			factory := func(context.Context) (net.Conn, error) {
-				client, server := net.Pipe()
-				go func() {
-					defer func() { _ = server.Close() }()
-					_, _ = server.Write([]byte("200 regression server ready\r\n"))
-					reader := bufio.NewReader(server)
-					if _, err := reader.ReadString('\n'); err != nil {
-						return
-					}
-					if _, err := server.Write(response[:trailer+2]); err != nil {
-						return
-					}
-					<-releaseTrailer
-					_, _ = server.Write(response[trailer+2:])
-				}()
-				return client, nil
-			}
 			primary := Provider{
 				ID:          "final-lifecycle-primary",
 				Host:        "final-lifecycle-primary.invalid:119",
-				Factory:     factory,
+				Factory:     fncoreBufferedTrailerFactory(yencSinglePart(payload, "final-lifecycle.bin")),
 				Connections: 1,
 				Inflight:    1,
 				SkipPing:    true,
@@ -316,56 +393,63 @@ func TestFNCORECommittedFinalWriterToFinalizationCancellationAndShutdownAreTermi
 				},
 			}
 			client := fncoreClient(t, primary, backup.provider(true))
-			writer := &fncoreSignalWriter{wrote: make(chan struct{})}
+			barrier := newFNCOREFinalizationDecodeBarrier()
+			defer barrier.Release()
+			client.decodeFn = barrier.Decode
+			var writer bytes.Buffer
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			result := make(chan error, 1)
 			go func() {
-				_, err := client.BodyStream(ctx, "fixture@example.invalid", writer)
+				_, err := client.BodyStream(ctx, "fixture@example.invalid", &writer)
 				result <- err
 			}()
 			select {
-			case <-writer.wrote:
+			case <-barrier.entered:
 			case <-time.After(5 * time.Second):
-				t.Fatal("final caller write did not occur")
+				t.Fatalf("decoder did not reach the buffered finalization seam (calls=%d, error=%v)", barrier.calls.Load(), barrier.Error())
 			}
-			var closeResult chan error
+			if err := barrier.Error(); err != nil {
+				t.Fatalf("decoder seam error = %v", err)
+			}
+			if !bytes.Equal(writer.Bytes(), payload) {
+				t.Fatalf("caller bytes at finalization seam = %q, want %q", writer.Bytes(), payload)
+			}
+			var want error
 			switch mode {
 			case "caller cancellation":
 				cancel()
+				want = context.Canceled
 			case "client shutdown":
-				closeResult = make(chan error, 1)
-				go func() { closeResult <- client.Close() }()
-				select {
-				case <-client.ctx.Done():
-				case <-time.After(5 * time.Second):
-					t.Fatal("client shutdown did not become active")
-				}
+				// Close begins with this exact cancellation. Calling it directly
+				// keeps the lifecycle transition and decoder release in one
+				// GOMAXPROCS(1) critical sequence, so an API waiter cannot fill in
+				// the missing finalization sample on the reader's behalf.
+				client.cancel()
+				want = context.Canceled
 			}
-			close(releaseTrailer)
+			for range 8 {
+				runtime.Gosched()
+			}
 			select {
 			case err := <-result:
-				if err == nil {
-					t.Fatalf("%s between final write and finalization returned success", mode)
+				t.Fatalf("%s returned before committed decoder finalization: %v", mode, err)
+			default:
+			}
+			barrier.Release()
+			select {
+			case err := <-result:
+				if !errors.Is(err, want) {
+					t.Fatalf("%s between final write and finalization error = %v, want %v", mode, err, want)
 				}
 			case <-time.After(5 * time.Second):
 				t.Fatalf("%s finalization race did not settle", mode)
 			}
-			if closeResult != nil {
-				select {
-				case err := <-closeResult:
-					if err != nil {
-						t.Fatalf("Close() error = %v", err)
-					}
-				case <-time.After(5 * time.Second):
-					t.Fatal("Close() did not settle")
-				}
-			}
 			if got := backup.commandCount("BODY"); got != 0 {
 				t.Fatalf("backup BODY commands = %d, want zero after %s", got, mode)
 			}
-			if !bytes.Equal(writer.bytes.Bytes(), payload) {
-				t.Fatalf("caller bytes = %q, want only primary payload %q", writer.bytes.Bytes(), payload)
+			if !bytes.Equal(writer.Bytes(), payload) {
+				t.Fatalf("caller bytes = %q, want only primary payload %q", writer.Bytes(), payload)
 			}
 		})
 	}
@@ -375,7 +459,10 @@ func TestFNCOREWriterErrorWinsFinalizationRemovalRace(t *testing.T) {
 	writerErr := errors.New("final writer local failure")
 	primary := &regressionProvider{
 		host: "writer-race-primary.invalid:119",
-		respond: func(int, string) []byte {
+		respond: func(_ int, command string) []byte {
+			if bytes.HasPrefix([]byte(command), []byte("STAT ")) {
+				return []byte("451 temporary failure\r\n")
+			}
 			return yencSinglePart([]byte("primary payload"), "primary.bin")
 		},
 	}
@@ -387,7 +474,17 @@ func TestFNCOREWriterErrorWinsFinalizationRemovalRace(t *testing.T) {
 			return yencSinglePart([]byte("must not replay"), "backup.bin")
 		},
 	}
-	client := fncoreClient(t, provider, backup.provider(true))
+	client := newBreakerClient(t, newBreakerFakeClock(), provider, backup.provider(true))
+	group := fncoreProviderGroup(t, client, provider.ID)
+	preload := fncoreTargetedStat(context.Background(), client, provider.ID, "preload@example.invalid")
+	if preload.Err == nil {
+		t.Fatal("breaker preload STAT error = nil, want one qualifying provider failure")
+	}
+	preloadStats := group.breaker.snapshot()
+	if preloadStats.State != CircuitBreakerClosed || preloadStats.QualifyingFailures != 1 {
+		t.Fatalf("breaker preload state = %+v, want one closed-state failure", preloadStats)
+	}
+	providerErrors := group.stats.Errors.Load()
 	writer := &fncoreRacingErrorWriter{
 		started: make(chan struct{}),
 		release: make(chan struct{}),
@@ -412,11 +509,35 @@ func TestFNCOREWriterErrorWinsFinalizationRemovalRace(t *testing.T) {
 		if !errors.Is(err, writerErr) {
 			t.Fatalf("finalization race error = %v, want local writer cause", err)
 		}
+		var transportErr *TransportError
+		if !errors.As(err, &transportErr) || len(transportErr.Attempts) == 0 {
+			t.Fatalf("finalization race error = %v, want structured local attempt", err)
+		}
+		if transportErr.Kind != OutcomeKind("local_failure") {
+			t.Fatalf("finalization race transport kind = %q, want local_failure", transportErr.Kind)
+		}
+		attempt := transportErr.Attempts[len(transportErr.Attempts)-1]
+		if attempt.Outcome != OutcomeKind("local_failure") {
+			t.Fatalf("finalization race attempt outcome = %q, want local_failure", attempt.Outcome)
+		}
+		if !errors.Is(attempt.Cause, writerErr) {
+			t.Fatalf("finalization race attempt cause = %v, want underlying writer error", attempt.Cause)
+		}
+		if attempt.ProviderResponseTimeout {
+			t.Fatalf("finalization race local writer attempt marked provider timeout: %+v", attempt)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("writer-error finalization race did not settle")
 	}
 	if got := backup.commandCount("BODY"); got != 0 {
 		t.Fatalf("backup BODY commands = %d, want zero after writer error", got)
+	}
+	if got := group.stats.Errors.Load(); got != providerErrors {
+		t.Fatalf("provider errors after local writer race = %d, want unchanged %d", got, providerErrors)
+	}
+	stats := group.breaker.snapshot()
+	if stats.State != CircuitBreakerClosed || stats.ProbeInFlight || stats.QualifyingFailures != 1 {
+		t.Fatalf("local writer race reset or incremented breaker evidence: %+v", stats)
 	}
 }
 
@@ -457,40 +578,63 @@ func TestFNCORECommandFlushFailureBeforeResponseHeadTripsBreaker(t *testing.T) {
 	}
 }
 
-func TestFNCOREPostFlushFailureBeforeResponseHeadTripsBreaker(t *testing.T) {
-	previous := runtime.GOMAXPROCS(1)
-	t.Cleanup(func() { runtime.GOMAXPROCS(previous) })
+func TestFNCOREDirectPostFlushFailureIsCurrentProviderTransportFailure(t *testing.T) {
 	failure := errors.New("deterministic POST flush failure")
-	provider := Provider{
-		ID:          "post-flush-failure",
-		Host:        "post-flush-failure.invalid:119",
-		Factory:     fncoreFlushFailureFactory(1, failure),
-		Connections: 1,
-		Inflight:    1,
-		SkipPing:    true,
+	conn, err := fncoreFlushFailureFactory(1, failure)(context.Background())
+	if err != nil {
+		t.Fatalf("flush-failure factory error = %v", err)
 	}
-	client := newBreakerClient(t, newBreakerFakeClock(), provider)
-	headers := PostHeaders{
-		From:       "user@example.invalid",
-		Subject:    "flush failure",
-		Newsgroups: []string{"alt.binaries.test"},
-		MessageID:  "<flush@example.invalid>",
+	reqCh := make(chan *Request)
+	connection, err := newNNTPConnectionFromConn(
+		context.Background(), conn, 1, reqCh, nil, Auth{}, "", nil, nil,
+	)
+	if err != nil {
+		t.Fatalf("newNNTPConnectionFromConn() error = %v", err)
 	}
-	meta := rapidyenc.Meta{
-		FileName:   "flush.bin",
-		FileSize:   1,
-		PartNumber: 1,
-		TotalParts: 1,
-		PartSize:   1,
+	connection.providerID = "post-flush-failure"
+	go connection.Run()
+	t.Cleanup(func() {
+		_ = connection.Close()
+		<-connection.Done()
+	})
+	req := &Request{
+		Ctx:         context.Background(),
+		Payload:     []byte("POST\r\n"),
+		PayloadBody: bytes.NewReader([]byte("article body\r\n.\r\n")),
+		PostMode:    true,
+		RespCh:      make(chan Response, 1),
+		submittedAt: time.Now(),
 	}
-	for request := 1; request <= providerBreakerFailureThreshold; request++ {
-		if _, err := client.PostYenc(context.Background(), headers, bytes.NewReader([]byte("x")), meta); err == nil {
-			t.Fatalf("request %d POST flush error = nil", request)
-		}
+	reqCh <- req
+	var response Response
+	select {
+	case response = <-req.RespCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("direct POST request did not settle after Flush failure")
 	}
-	stats := providerBreakerStats(t, client, provider.ID)
-	if stats.State != CircuitBreakerOpen || stats.Cooldown != providerBreakerCooldowns[0] {
-		t.Fatalf("POST flush breaker state = %+v, want open", stats)
+	if response.Request != req || response.ProviderID != connection.providerID {
+		t.Fatalf("POST Flush response attribution = request %p provider %q, want request %p provider %q",
+			response.Request, response.ProviderID, req, connection.providerID)
+	}
+	if !errors.Is(response.Err, failure) {
+		t.Fatalf("POST Flush response error = %v, want underlying transport failure", response.Err)
+	}
+	if writtenAt := req.writtenAt.Load(); writtenAt != 0 {
+		t.Fatalf("POST request marked written before failed Flush: %d", writtenAt)
+	}
+	if headAt := req.responseHeadAt.Load(); headAt != 0 {
+		t.Fatalf("POST request reached response head before failed Flush: %d", headAt)
+	}
+	response.Attempts = []AttemptEvidence{
+		buildAttemptEvidence(req, connection.providerID, response, time.Now()),
+	}
+	attempt := response.Attempts[0]
+	if attempt.Operation != OperationPost || attempt.Outcome != OutcomeTransportFailure ||
+		attempt.ProviderID != connection.providerID || !errors.Is(attempt.Cause, failure) {
+		t.Fatalf("POST Flush attempt evidence = %+v, want factual provider transport failure", attempt)
+	}
+	if completion := classifyCircuitBreakerCompletion(response, true, false); completion != circuitBreakerFailure {
+		t.Fatalf("POST Flush breaker completion = %v, want provider failure", completion)
 	}
 }
 
@@ -578,64 +722,114 @@ func TestFNCOREPreviouslyFlushedPendingRequestIsCollateralNeutral(t *testing.T) 
 }
 
 func TestFNCOREBlockingSuccessfulFlushIsPoolTimeNotResponseTimeout(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	t.Cleanup(func() { runtime.GOMAXPROCS(previous) })
 	writeStarted := make(chan struct{})
 	writeRelease := make(chan struct{})
-	factory := func(context.Context) (net.Conn, error) {
-		client, server := net.Pipe()
-		go func() {
-			defer func() { _ = server.Close() }()
-			_, _ = server.Write([]byte("200 regression server ready\r\n"))
-			reader := bufio.NewReader(server)
-			if _, err := reader.ReadString('\n'); err == nil {
-				_, _ = server.Write([]byte("223 1 <fixture@example.invalid> exists\r\n"))
-			}
-		}()
-		return &fncoreBlockingWriteConn{Conn: client, started: writeStarted, release: writeRelease}, nil
+	clientConn, serverConn := net.Pipe()
+	blockedConn := &fncoreBlockingWriteConn{
+		Conn:    clientConn,
+		started: writeStarted,
+		release: writeRelease,
 	}
-	provider := Provider{
-		ID:             "blocking-flush-timing",
-		Host:           "blocking-flush-timing.invalid:119",
-		Factory:        factory,
-		Connections:    1,
-		Inflight:       1,
-		SkipPing:       true,
-		AttemptTimeout: 50 * time.Millisecond,
-	}
-	client := fncoreClient(t, provider)
-	result := make(chan StatManyResult, 1)
 	go func() {
-		result <- fncoreTargetedStat(context.Background(), client, provider.ID, "fixture@example.invalid")
+		defer func() { _ = serverConn.Close() }()
+		_, _ = serverConn.Write([]byte("200 regression server ready\r\n"))
+		reader := bufio.NewReader(serverConn)
+		if _, err := reader.ReadString('\n'); err == nil {
+			_, _ = serverConn.Write([]byte("223 1 <fixture@example.invalid> exists\r\n"))
+		}
 	}()
+	reqCh := make(chan *Request)
+	connection, err := newNNTPConnectionFromConn(
+		context.Background(), blockedConn, 1, reqCh, nil, Auth{}, "", nil, nil,
+	)
+	if err != nil {
+		t.Fatalf("newNNTPConnectionFromConn() error = %v", err)
+	}
+	connection.providerID = "blocking-flush-timing"
+	// The unbuffered handoff makes writeStarted proof that readerLoop owns this
+	// exact Request while Flush remains blocked.
+	connection.pending = make(chan *Request)
+	readDeadlineBaseline := blockedConn.readDeadlineCalls.Load()
+	go connection.Run()
+	t.Cleanup(func() {
+		select {
+		case <-writeRelease:
+		default:
+			close(writeRelease)
+		}
+		_ = connection.Close()
+		<-connection.Done()
+	})
+	req := &Request{
+		Ctx:             context.Background(),
+		Payload:         []byte("STAT <fixture@example.invalid>\r\n"),
+		RespCh:          make(chan Response, 1),
+		submittedAt:     time.Now(),
+		responseTimeout: time.Hour,
+	}
+	reqCh <- req
 	select {
 	case <-writeStarted:
 	case <-time.After(5 * time.Second):
 		t.Fatal("command flush did not block")
 	}
-	time.Sleep(150 * time.Millisecond)
-	select {
-	case early := <-result:
-		close(writeRelease)
-		t.Fatalf("request completed while successful command flush was blocked: %+v", early)
-	default:
+	// Give the already-rendezvoused reader multiple explicit turns. A correct
+	// reader blocks on wire readiness; an eager reader publishes response-head
+	// state and arms its service deadline.
+	for range 16 {
+		runtime.Gosched()
 	}
+	if writtenAt := req.writtenAt.Load(); writtenAt != 0 {
+		t.Fatalf("request marked written while Flush was blocked: %d", writtenAt)
+	}
+	if headAt := req.responseHeadAt.Load(); headAt != 0 {
+		t.Fatalf("response head started while Flush was blocked: %d", headAt)
+	}
+	if calls := blockedConn.readDeadlineCalls.Load(); calls != readDeadlineBaseline {
+		t.Fatalf("response read deadline armed while Flush was blocked: calls %d, baseline %d, deadline %v",
+			calls, readDeadlineBaseline, time.Unix(0, blockedConn.readDeadlineNanos.Load()))
+	}
+	releaseAt := time.Now()
 	close(writeRelease)
+	var response Response
 	select {
-	case stat := <-result:
-		if stat.Err != nil || stat.Result == nil {
-			t.Fatalf("blocking-flush STAT result = %+v", stat)
-		}
-		if len(stat.Result.Attempts) != 1 {
-			t.Fatalf("blocking-flush attempts = %+v", stat.Result.Attempts)
-		}
-		attempt := stat.Result.Attempts[0]
-		if attempt.PoolQueueDuration < 100*time.Millisecond {
-			t.Fatalf("pool/write duration = %v, want blocked flush time", attempt.PoolQueueDuration)
-		}
-		if attempt.ResponseServiceDuration >= 50*time.Millisecond {
-			t.Fatalf("response service duration = %v, included successful flush delay", attempt.ResponseServiceDuration)
-		}
+	case response = <-req.RespCh:
 	case <-time.After(5 * time.Second):
 		t.Fatal("request did not complete after successful flush")
+	}
+	if response.Err != nil || response.StatusCode != 223 {
+		t.Fatalf("blocking-flush response = %+v, want successful STAT", response)
+	}
+	writtenAt := req.writtenAt.Load()
+	headAt := req.responseHeadAt.Load()
+	if writtenAt < releaseAt.UnixNano() {
+		t.Fatalf("written timestamp %v precedes Flush release %v", time.Unix(0, writtenAt), releaseAt)
+	}
+	if headAt < writtenAt {
+		t.Fatalf("response-head timestamp %v precedes successful write %v", time.Unix(0, headAt), time.Unix(0, writtenAt))
+	}
+	if calls := blockedConn.readDeadlineCalls.Load(); calls <= readDeadlineBaseline {
+		t.Fatalf("response read deadline was not armed after successful Flush: calls %d, baseline %d", calls, readDeadlineBaseline)
+	}
+	if deadline := blockedConn.readDeadlineNanos.Load(); deadline <= headAt {
+		t.Fatalf("response read deadline %v does not follow response head %v", time.Unix(0, deadline), time.Unix(0, headAt))
+	}
+	if len(response.Attempts) != 1 {
+		t.Fatalf("blocking-flush attempts = %+v", response.Attempts)
+	}
+	attempt := response.Attempts[0]
+	blockedAt := time.Unix(0, blockedConn.blockedAtNanos.Load())
+	blockedInterval := releaseAt.Sub(blockedAt)
+	if blockedInterval <= 0 || attempt.PoolQueueDuration < blockedInterval {
+		t.Fatalf("pool/write duration = %v, want complete blocked Flush interval %v", attempt.PoolQueueDuration, blockedInterval)
+	}
+	// The two atomic transport timestamps are the attribution boundary: since
+	// responseHeadAt follows Flush release, none of the blocked interval can be
+	// included in ResponseServiceDuration.
+	if attempt.ResponseServiceDuration < 0 {
+		t.Fatalf("response service duration = %v, want non-negative post-Flush service", attempt.ResponseServiceDuration)
 	}
 }
 
