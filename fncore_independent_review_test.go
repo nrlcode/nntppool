@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io"
 	"net"
 	"runtime"
 	"strings"
@@ -132,6 +131,16 @@ func TestFNCORECommittedWriterErrorWinsCallerAndClientCancellation(t *testing.T)
 	}
 }
 
+type fncoreProgressSignalWriter struct {
+	progress chan struct{}
+	once     sync.Once
+}
+
+func (w *fncoreProgressSignalWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.progress) })
+	return len(p), nil
+}
+
 func TestFNCOREHeadBodyCancellationDrainsWithinBudgetAndReusesSocket(t *testing.T) {
 	payload := bytes.Repeat([]byte("d"), 32*1024)
 	response := yencSinglePart(payload, "bounded-drain.bin")
@@ -181,6 +190,7 @@ func TestFNCOREHeadBodyCancellationDrainsWithinBudgetAndReusesSocket(t *testing.
 		t.Fatalf("newNNTPConnectionFromConn() error = %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	writer := &fncoreProgressSignalWriter{progress: make(chan struct{})}
 	t.Cleanup(func() {
 		_ = serverConn.Close()
 		_ = connection.Close()
@@ -189,7 +199,7 @@ func TestFNCOREHeadBodyCancellationDrainsWithinBudgetAndReusesSocket(t *testing.
 		Ctx:          ctx,
 		Payload:      []byte("BODY <bounded-drain@example.invalid>\r\n"),
 		RespCh:       make(chan Response, 1),
-		BodyWriter:   io.Discard,
+		BodyWriter:   writer,
 		ValidateBody: true,
 		submittedAt:  time.Now(),
 	}
@@ -199,6 +209,11 @@ func TestFNCOREHeadBodyCancellationDrainsWithinBudgetAndReusesSocket(t *testing.
 	case <-prefixConsumed:
 	case <-time.After(5 * time.Second):
 		t.Fatal("BODY response did not reach the response-head drain seam")
+	}
+	select {
+	case <-writer.progress:
+	case <-time.After(5 * time.Second):
+		t.Fatal("BODY response did not cross the decoded progress boundary")
 	}
 	cancel()
 	close(releaseTail)
