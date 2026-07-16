@@ -237,3 +237,77 @@ func TestFNCOREBlockedClosablePayloadBodyIsCancelled(t *testing.T) {
 		t.Fatal("server did not observe retired POST connection")
 	}
 }
+
+func TestFNCOREBlockedResponseReadCancellationSettlesOwnership(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	commandSeen := make(chan struct{})
+	serverObservedClose := make(chan error, 1)
+	go func() {
+		defer func() { _ = serverConn.Close() }()
+		_, _ = serverConn.Write([]byte("200 regression server ready\r\n"))
+		reader := bufio.NewReader(serverConn)
+		if _, err := reader.ReadString('\n'); err != nil {
+			serverObservedClose <- err
+			return
+		}
+		close(commandSeen)
+		_, err := reader.ReadByte()
+		serverObservedClose <- err
+	}()
+
+	reqCh := make(chan *Request, 1)
+	connection, err := newNNTPConnectionFromConn(
+		context.Background(), clientConn, 1, reqCh, nil, Auth{}, "", nil, nil,
+	)
+	if err != nil {
+		t.Fatalf("newNNTPConnectionFromConn() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	req := &Request{
+		Ctx:         ctx,
+		Payload:     []byte("STAT <silent-response@example.invalid>\r\n"),
+		RespCh:      make(chan Response, 1),
+		submittedAt: time.Now(),
+	}
+	go connection.Run()
+	reqCh <- req
+	select {
+	case <-commandSeen:
+	case <-time.After(5 * time.Second):
+		_ = serverConn.Close()
+		_ = connection.Close()
+		t.Fatal("server did not receive the request before cancellation")
+	}
+
+	cancel()
+	select {
+	case err := <-serverObservedClose:
+		if err == nil {
+			t.Fatal("server read unexpectedly succeeded after request cancellation")
+		}
+	case <-time.After(2 * time.Second):
+		_ = serverConn.Close()
+		_ = connection.Close()
+		t.Fatal("request cancellation did not interrupt the blocked response read")
+	}
+	select {
+	case response := <-req.RespCh:
+		if !errors.Is(response.Err, context.Canceled) {
+			t.Fatalf("blocked response read error = %v, want context cancellation", response.Err)
+		}
+	case <-time.After(2 * time.Second):
+		_ = serverConn.Close()
+		_ = connection.Close()
+		t.Fatal("transport-owned request did not settle after blocked response cancellation")
+	}
+	select {
+	case <-connection.Done():
+	case <-time.After(2 * time.Second):
+		_ = serverConn.Close()
+		_ = connection.Close()
+		t.Fatal("connection remained reusable after blocked response cancellation")
+	}
+	if got := len(connection.inflightSem); got != 0 {
+		t.Fatalf("inflight capacity after blocked response settlement = %d, want zero", got)
+	}
+}
