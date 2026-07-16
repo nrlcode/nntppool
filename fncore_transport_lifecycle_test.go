@@ -34,6 +34,17 @@ type zeroProgressWriter struct{}
 
 func (zeroProgressWriter) Write([]byte) (int, error) { return 0, nil }
 
+type partialErrorWriter struct {
+	err   error
+	bytes bytes.Buffer
+}
+
+func (w *partialErrorWriter) Write(p []byte) (int, error) {
+	n := max(1, len(p)/2)
+	_, _ = w.bytes.Write(p[:n])
+	return n, w.err
+}
+
 func fncoreClient(t *testing.T, providers ...Provider) *Client {
 	t.Helper()
 	client, err := NewClient(
@@ -83,47 +94,59 @@ func TestFNCORECommittedWriterRemovalIsTerminal(t *testing.T) {
 	}
 }
 
-func TestFNCOREStreamingClassifierIsCaseInsensitiveForArticle(t *testing.T) {
-	firstPayload := []byte("article-primary")
-	secondPayload := []byte("article-backup")
-	articleResponse := func(payload []byte, name string) []byte {
-		response := yencSinglePart(payload, name)
-		return append([]byte("220"), response[3:]...)
-	}
-	first := &regressionProvider{
-		host: "article-primary.invalid:119",
-		respond: func(int, string) []byte {
-			return articleResponse(firstPayload, "article-first.bin")
-		},
-	}
-	backup := &regressionProvider{
-		host: "article-backup.invalid:119",
-		respond: func(int, string) []byte {
-			return articleResponse(secondPayload, "article-backup.bin")
-		},
-	}
-	client := fncoreClient(t, first.provider(false), backup.provider(true))
-	writer := &removeProviderWriter{client: client, provider: first.host}
+func TestFNCOREStreamingClassifierIsCaseInsensitive(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		command    string
+		operation  Operation
+		statusCode string
+	}{
+		{name: "mixed BODY", command: "bOdY", operation: Operation("BODY"), statusCode: "222"},
+		{name: "mixed ARTICLE", command: "aRtIcLe", operation: Operation("ARTICLE"), statusCode: "220"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			firstPayload := []byte("first-" + test.name)
+			secondPayload := []byte("backup-" + test.name)
+			responseFor := func(payload []byte, name string) []byte {
+				response := yencSinglePart(payload, name)
+				return append([]byte(test.statusCode), response[3:]...)
+			}
+			first := &regressionProvider{
+				host: "stream-primary-" + test.statusCode + ".invalid:119",
+				respond: func(int, string) []byte {
+					return responseFor(firstPayload, "stream-first.bin")
+				},
+			}
+			backup := &regressionProvider{
+				host: "stream-backup-" + test.statusCode + ".invalid:119",
+				respond: func(int, string) []byte {
+					return responseFor(secondPayload, "stream-backup.bin")
+				},
+			}
+			client := fncoreClient(t, first.provider(false), backup.provider(true))
+			writer := &removeProviderWriter{client: client, provider: first.host}
 
-	response := <-client.Send(
-		context.Background(),
-		[]byte("aRtIcLe <fixture@example.invalid>\r\n"),
-		writer,
-	)
-	if response.Err == nil {
-		t.Fatal("mixed-case ARTICLE error = nil, want terminal committed-attempt error")
-	}
-	if writer.removeErr != nil {
-		t.Fatalf("RemoveProvider() error = %v", writer.removeErr)
-	}
-	if !bytes.Equal(writer.bytes.Bytes(), firstPayload) {
-		t.Fatalf("ARTICLE caller sink = %q, want only %q", writer.bytes.Bytes(), firstPayload)
-	}
-	if got := backup.commandCount("aRtIcLe"); got != 0 {
-		t.Fatalf("backup ARTICLE attempts = %d, want zero after commitment", got)
-	}
-	if len(response.Attempts) == 0 || response.Attempts[len(response.Attempts)-1].Operation != Operation("ARTICLE") {
-		t.Fatalf("ARTICLE attempts = %+v, want factual ARTICLE operation", response.Attempts)
+			response := <-client.Send(
+				context.Background(),
+				[]byte(test.command+" <fixture@example.invalid>\r\n"),
+				writer,
+			)
+			if response.Err == nil {
+				t.Fatalf("mixed-case %s error = nil, want terminal committed-attempt error", test.operation)
+			}
+			if writer.removeErr != nil {
+				t.Fatalf("RemoveProvider() error = %v", writer.removeErr)
+			}
+			if !bytes.Equal(writer.bytes.Bytes(), firstPayload) {
+				t.Fatalf("%s caller sink = %q, want only %q", test.operation, writer.bytes.Bytes(), firstPayload)
+			}
+			if got := backup.commandCount(test.command); got != 0 {
+				t.Fatalf("backup %s attempts = %d, want zero after commitment", test.operation, got)
+			}
+			if len(response.Attempts) == 0 || response.Attempts[len(response.Attempts)-1].Operation != test.operation {
+				t.Fatalf("%s attempts = %+v, want factual operation", test.operation, response.Attempts)
+			}
+		})
 	}
 }
 
@@ -136,7 +159,15 @@ func TestFNCORECallerWriterFailuresAreLocalAndBreakerNeutral(t *testing.T) {
 			return yencSinglePart([]byte("healthy provider payload"), "healthy.bin")
 		},
 	)
-	client := newBreakerClient(t, newBreakerFakeClock(), provider)
+	backup, backupProvider := breakerProvider(
+		"local-writer-backup",
+		"local-writer-backup.invalid:119",
+		func(int, string) []byte {
+			return yencSinglePart([]byte("backup must not be used"), "backup.bin")
+		},
+	)
+	backupProvider.Backup = true
+	client := newBreakerClient(t, newBreakerFakeClock(), provider, backupProvider)
 
 	for request := 1; request <= 3; request++ {
 		_, err := client.BodyStream(context.Background(), "fixture@example.invalid", failingWriter{err: writerErr})
@@ -157,6 +188,9 @@ func TestFNCORECallerWriterFailuresAreLocalAndBreakerNeutral(t *testing.T) {
 	if got := server.commandCount("BODY"); got != 3 {
 		t.Fatalf("healthy provider BODY commands = %d, want 3", got)
 	}
+	if got := backup.commandCount("BODY"); got != 0 {
+		t.Fatalf("backup BODY commands = %d, want zero after terminal local writer faults", got)
+	}
 	stats := providerBreakerStats(t, client, provider.ID)
 	if stats.State != CircuitBreakerClosed || stats.QualifyingFailures != 0 {
 		t.Fatalf("local writer failures changed breaker state: %+v", stats)
@@ -175,7 +209,13 @@ func TestFNCOREZeroProgressWriterIsTerminalShortWrite(t *testing.T) {
 	}
 	provider := server.provider(false)
 	provider.ID = "short-writer"
-	client := fncoreClient(t, provider)
+	backup := &regressionProvider{
+		host: "short-writer-backup.invalid:119",
+		respond: func(int, string) []byte {
+			return yencSinglePart([]byte("backup must not be used"), "backup.bin")
+		},
+	}
+	client := fncoreClient(t, provider, backup.provider(true))
 
 	_, err := client.BodyStream(context.Background(), "fixture@example.invalid", zeroProgressWriter{})
 	if !errors.Is(err, io.ErrShortWrite) {
@@ -183,6 +223,42 @@ func TestFNCOREZeroProgressWriterIsTerminalShortWrite(t *testing.T) {
 	}
 	if got := client.Stats().Providers[0].Errors; got != 0 {
 		t.Fatalf("provider errors = %d, want local short write excluded", got)
+	}
+	if got := backup.commandCount("BODY"); got != 0 {
+		t.Fatalf("backup BODY commands = %d, want zero after terminal short write", got)
+	}
+}
+
+func TestFNCOREPartialCallerWriterErrorPreservesCauseAndNeverReplays(t *testing.T) {
+	writerErr := errors.New("partial local sink failure")
+	primaryPayload := bytes.Repeat([]byte("p"), 32*1024)
+	primary := &regressionProvider{
+		host: "partial-writer.invalid:119",
+		respond: func(int, string) []byte {
+			return yencSinglePart(primaryPayload, "partial.bin")
+		},
+	}
+	backup := &regressionProvider{
+		host: "partial-writer-backup.invalid:119",
+		respond: func(int, string) []byte {
+			return yencSinglePart([]byte("backup must not be appended"), "backup.bin")
+		},
+	}
+	client := fncoreClient(t, primary.provider(false), backup.provider(true))
+	writer := &partialErrorWriter{err: writerErr}
+
+	_, err := client.BodyStream(context.Background(), "fixture@example.invalid", writer)
+	if !errors.Is(err, writerErr) {
+		t.Fatalf("BodyStream() error = %v, want underlying partial writer error", err)
+	}
+	if writer.bytes.Len() == 0 || writer.bytes.Len() >= len(primaryPayload) {
+		t.Fatalf("partial caller bytes = %d, want nonzero prefix below %d", writer.bytes.Len(), len(primaryPayload))
+	}
+	if got := backup.commandCount("BODY"); got != 0 {
+		t.Fatalf("backup BODY commands = %d, want zero after partial local write", got)
+	}
+	if got := client.Stats().Providers[0].Errors; got != 0 {
+		t.Fatalf("provider errors = %d, want partial local sink failure excluded", got)
 	}
 }
 
@@ -273,7 +349,7 @@ func TestFNCORESubQuantumStallTimeoutRollsWithProgress(t *testing.T) {
 		Inflight:       1,
 		SkipPing:       true,
 		AttemptTimeout: 500 * time.Millisecond,
-		StallTimeout:   40 * time.Millisecond,
+		StallTimeout:   120 * time.Millisecond,
 	})
 
 	body, err := client.Body(context.Background(), "fixture@example.invalid")
@@ -371,11 +447,10 @@ func TestFNCORECancelledHalfOpenRemainsExclusiveUntilWriterSettles(t *testing.T)
 		t.Fatal("half-open BODY did not reach caller writer")
 	}
 	cancelProbe()
-	var earlyProbeErr error
-	probeReturned := false
 	select {
-	case earlyProbeErr = <-probeResult:
-		probeReturned = true
+	case earlyProbeErr := <-probeResult:
+		close(writerRelease)
+		t.Fatalf("canceled half-open BODY returned before caller writer settled: %v", earlyProbeErr)
 	case <-time.After(50 * time.Millisecond):
 		// A committed caller writer keeps transport ownership until Write settles.
 	}
@@ -385,12 +460,6 @@ func TestFNCORECancelledHalfOpenRemainsExclusiveUntilWriterSettles(t *testing.T)
 		t.Fatalf("concurrent half-open request error = %v, want breaker-open until transport settles", secondErr)
 	}
 	close(writerRelease)
-	if probeReturned {
-		if !errors.Is(earlyProbeErr, context.Canceled) {
-			t.Fatalf("early canceled half-open BODY error = %v, want context cancellation", earlyProbeErr)
-		}
-		return
-	}
 	select {
 	case err := <-probeResult:
 		if !errors.Is(err, context.Canceled) {
