@@ -66,6 +66,19 @@ func (*readWithEOFConn) SetDeadline(time.Time) error      { return nil }
 func (*readWithEOFConn) SetReadDeadline(time.Time) error  { return nil }
 func (*readWithEOFConn) SetWriteDeadline(time.Time) error { return nil }
 
+type blockingCloseConn struct {
+	net.Conn
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingCloseConn) Close() error {
+	c.once.Do(func() { close(c.started) })
+	<-c.release
+	return c.Conn.Close()
+}
+
 func (w *partialErrorWriter) Write(p []byte) (int, error) {
 	n := max(1, len(p)/2)
 	_, _ = w.bytes.Write(p[:n])
@@ -210,6 +223,9 @@ func TestFNCORECallerWriterFailuresAreLocalAndBreakerNeutral(t *testing.T) {
 		}
 		if transportErr.Attempts[len(transportErr.Attempts)-1].ProviderResponseTimeout {
 			t.Fatalf("request %d local sink failure marked provider response timeout", request)
+		}
+		if cause := transportErr.Attempts[len(transportErr.Attempts)-1].Cause; cause == nil || cause.Error() != writerErr.Error() {
+			t.Fatalf("request %d attempt cause = %v, want unprefixed local cause %q", request, cause, writerErr)
 		}
 	}
 	if got := server.commandCount("BODY"); got != 3 {
@@ -400,8 +416,8 @@ func TestFNCOREReadWithDataAndEOFFeedsFinalBytes(t *testing.T) {
 	connection := &readWithEOFConn{data: []byte("complete")}
 	var received []byte
 	feeder := &mockFeeder{feedFunc: func(in []byte, _ io.Writer) (int, bool, error) {
-		received = append(received, in...)
-		return len(in), true, nil
+		received = append(received, in[0])
+		return 1, len(received) == len("complete"), nil
 	}}
 	var buffer readBuffer
 
@@ -413,6 +429,214 @@ func TestFNCOREReadWithDataAndEOFFeedsFinalBytes(t *testing.T) {
 	}
 	if string(received) != "complete" {
 		t.Fatalf("received = %q, want complete", received)
+	}
+}
+
+func TestFNCORELargeCommandAutoFlushCannotStrandReader(t *testing.T) {
+	commandSeen := make(chan struct{})
+	factory := func(context.Context) (net.Conn, error) {
+		client, server := net.Pipe()
+		go func() {
+			defer func() { _ = server.Close() }()
+			_, _ = server.Write([]byte("200 regression server ready\r\n"))
+			reader := bufio.NewReader(server)
+			if _, err := reader.ReadString('\n'); err != nil {
+				return
+			}
+			close(commandSeen)
+			_, _ = server.Write([]byte("200 large command accepted\r\n"))
+		}()
+		return client, nil
+	}
+	client := fncoreClient(t, Provider{
+		ID:          "large-command",
+		Host:        "large-command.invalid:119",
+		Factory:     factory,
+		Connections: 1,
+		Inflight:    1,
+		SkipPing:    true,
+	})
+	payload := []byte("XTEST " + strings.Repeat("x", 8*1024) + "\r\n")
+	responseCh := client.Send(context.Background(), payload, nil)
+	select {
+	case response := <-responseCh:
+		if response.Err != nil || response.StatusCode != 200 {
+			t.Fatalf("large-command response = %+v", response)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("large auto-flushed command stranded response reader")
+	}
+	select {
+	case <-commandSeen:
+	default:
+		t.Fatal("server did not receive large command")
+	}
+}
+
+func TestFNCOREBootstrapFreshRejectionSettlesDeferredNormal(t *testing.T) {
+	connection := mockServer(t, func(server net.Conn) {
+		_, _ = server.Write([]byte("200 regression server ready\r\n"))
+		_, _ = io.Copy(io.Discard, server)
+	})
+	reqCh := make(chan *Request)
+	nntpConnection, err := newNNTPConnectionFromConn(
+		context.Background(), connection, 1, reqCh, nil, Auth{}, "", nil, nil,
+	)
+	if err != nil {
+		t.Fatalf("newNNTPConnectionFromConn() error = %v", err)
+	}
+	t.Cleanup(func() { _ = nntpConnection.Close() })
+
+	freshResponse := make(chan Response, 1)
+	deferredResponse := make(chan Response, 1)
+	nntpConnection.firstReq = &Request{
+		Ctx:            context.Background(),
+		Payload:        []byte("BODY <fresh@example.invalid>\r\n"),
+		RespCh:         freshResponse,
+		FreshTransport: true,
+		submittedAt:    nntpConnection.createdAt.Add(time.Second),
+	}
+	nntpConnection.secondReq = &Request{
+		Ctx:     context.Background(),
+		Payload: []byte("STAT <deferred@example.invalid>\r\n"),
+		RespCh:  deferredResponse,
+	}
+	go nntpConnection.Run()
+
+	select {
+	case response := <-freshResponse:
+		if !errors.Is(response.Err, errFreshTransportRequired) {
+			t.Fatalf("fresh bootstrap error = %v, want fresh-transport rejection", response.Err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fresh bootstrap request was stranded")
+	}
+	select {
+	case response := <-deferredResponse:
+		if !errors.Is(response.Err, ErrConnectionDied) {
+			t.Fatalf("deferred normal error = %v, want deterministic connection retirement", response.Err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("deferred normal request was stranded by bootstrap rejection")
+	}
+}
+
+func TestFNCOREHalfOpenCompletionWaitsForSocketRetirement(t *testing.T) {
+	clock := newBreakerFakeClock()
+	var recovering atomic.Bool
+	closeStarted := make(chan struct{})
+	closeRelease := make(chan struct{})
+	writerErr := errors.New("retiring local writer")
+	factory := func(context.Context) (net.Conn, error) {
+		client, server := net.Pipe()
+		go func() {
+			defer func() { _ = server.Close() }()
+			_, _ = server.Write([]byte("200 regression server ready\r\n"))
+			reader := bufio.NewReader(server)
+			for {
+				command, err := reader.ReadString('\n')
+				if err != nil {
+					return
+				}
+				if !recovering.Load() {
+					_, _ = server.Write([]byte("451 temporary failure\r\n"))
+					continue
+				}
+				if strings.HasPrefix(command, "STAT") {
+					_, _ = server.Write([]byte("223 1 <fixture@example.invalid> exists\r\n"))
+					continue
+				}
+				_, _ = server.Write(yencSinglePart([]byte("healthy provider body"), "healthy.bin"))
+			}
+		}()
+		if recovering.Load() {
+			return &blockingCloseConn{Conn: client, started: closeStarted, release: closeRelease}, nil
+		}
+		return client, nil
+	}
+	provider := Provider{
+		ID:          "half-open-retirement",
+		Host:        "half-open-retirement.invalid:119",
+		Factory:     factory,
+		Connections: 2,
+		Inflight:    1,
+		SkipPing:    true,
+	}
+	client := newBreakerClient(t, clock, provider)
+	for range providerBreakerFailureThreshold {
+		_ = targetedBreakerStat(client, provider.ID)
+	}
+	recovering.Store(true)
+	clock.Advance(providerBreakerCooldowns[0])
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := client.BodyStream(context.Background(), "fixture@example.invalid", failingWriter{err: writerErr})
+		result <- err
+	}()
+	select {
+	case <-closeStarted:
+	case <-time.After(2 * time.Second):
+		close(closeRelease)
+		t.Fatal("writer-error socket did not begin retirement")
+	}
+	select {
+	case err := <-result:
+		close(closeRelease)
+		t.Fatalf("half-open request returned before socket retirement: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := targetedBreakerStat(client, provider.ID); !errors.Is(err, ErrCircuitBreakerOpen) {
+		close(closeRelease)
+		t.Fatalf("second half-open request error = %v, want breaker-open during socket retirement", err)
+	}
+	close(closeRelease)
+	select {
+	case err := <-result:
+		if !errors.Is(err, writerErr) {
+			t.Fatalf("retired half-open request error = %v, want local writer cause", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("half-open request did not return after socket retirement")
+	}
+}
+
+func TestFNCORENearMissCommandDoesNotTriggerStatProbe(t *testing.T) {
+	for _, command := range []string{"BODYX", "XTEST"} {
+		t.Run(command, func(t *testing.T) {
+			first := &regressionProvider{
+				host:    "near-miss-first.invalid:119",
+				respond: func(int, string) []byte { return []byte("430 no such article\r\n") },
+			}
+			second := &regressionProvider{
+				host: "near-miss-second.invalid:119",
+				respond: func(_ int, payload string) []byte {
+					if strings.HasPrefix(payload, "STAT") {
+						return []byte("223 1 <fixture@example.invalid> exists\r\n")
+					}
+					return []byte("200 near-miss command accepted\r\n")
+				},
+			}
+			third := &regressionProvider{
+				host:    "near-miss-third.invalid:119",
+				respond: func(int, string) []byte { return []byte("430 no such article\r\n") },
+			}
+			client := newRegressionClient(t, first.provider(false), second.provider(false), third.provider(false))
+			response := <-client.Send(
+				context.Background(),
+				[]byte(command+" <fixture@example.invalid>\r\n"),
+				nil,
+			)
+			if response.Err != nil || response.StatusCode != 200 {
+				t.Fatalf("%s response = %+v, want direct fallback success", command, response)
+			}
+			if got := second.commandCount("STAT"); got != 0 {
+				t.Fatalf("near-miss STAT probes = %d, want zero", got)
+			}
+			if got := second.commandCount(command); got != 1 {
+				t.Fatalf("near-miss direct commands = %d, want one", got)
+			}
+		})
 	}
 }
 
