@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -99,6 +100,30 @@ func fncoreClient(t *testing.T, providers ...Provider) *Client {
 	}
 	t.Cleanup(func() { _ = client.Close() })
 	return client
+}
+
+func fncoreProviderGroup(t *testing.T, client *Client, providerID string) *providerGroup {
+	t.Helper()
+	for _, groups := range [...]*[]*providerGroup{client.mainGroups.Load(), client.backupGroups.Load()} {
+		for _, group := range *groups {
+			if group.id == providerID {
+				return group
+			}
+		}
+	}
+	t.Fatalf("provider group %q not found", providerID)
+	return nil
+}
+
+func waitForFNCOREGateAvailability(t *testing.T, group *providerGroup, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for group.gate.available.Load() != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("provider gate available = %d, want %d", group.gate.available.Load(), want)
+		}
+		runtime.Gosched()
+	}
 }
 
 func TestFNCORECommittedWriterRemovalIsTerminal(t *testing.T) {
@@ -226,6 +251,8 @@ func TestFNCORECallerWriterFailuresAreLocalAndBreakerNeutral(t *testing.T) {
 		}
 		if cause := transportErr.Attempts[len(transportErr.Attempts)-1].Cause; cause == nil || cause.Error() != writerErr.Error() {
 			t.Fatalf("request %d attempt cause = %v, want unprefixed local cause %q", request, cause, writerErr)
+		} else if !errors.Is(cause, writerErr) {
+			t.Fatalf("request %d attempt cause = %v, want errors.Is local cause %q", request, cause, writerErr)
 		}
 	}
 	if got := server.commandCount("BODY"); got != 3 {
@@ -433,17 +460,18 @@ func TestFNCOREReadWithDataAndEOFFeedsFinalBytes(t *testing.T) {
 }
 
 func TestFNCORELargeCommandAutoFlushCannotStrandReader(t *testing.T) {
-	commandSeen := make(chan struct{})
+	commandSeen := make(chan []byte, 1)
 	factory := func(context.Context) (net.Conn, error) {
 		client, server := net.Pipe()
 		go func() {
 			defer func() { _ = server.Close() }()
 			_, _ = server.Write([]byte("200 regression server ready\r\n"))
 			reader := bufio.NewReader(server)
-			if _, err := reader.ReadString('\n'); err != nil {
+			command, err := reader.ReadBytes('\n')
+			if err != nil {
 				return
 			}
-			close(commandSeen)
+			commandSeen <- bytes.Clone(command)
 			_, _ = server.Write([]byte("200 large command accepted\r\n"))
 		}()
 		return client, nil
@@ -463,20 +491,27 @@ func TestFNCORELargeCommandAutoFlushCannotStrandReader(t *testing.T) {
 		if response.Err != nil || response.StatusCode != 200 {
 			t.Fatalf("large-command response = %+v", response)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("large auto-flushed command stranded response reader")
 	}
 	select {
-	case <-commandSeen:
-	default:
+	case command := <-commandSeen:
+		if !bytes.Equal(command, payload) {
+			t.Fatalf("server command length/content = %d/%q, want exact %d-byte payload", len(command), command, len(payload))
+		}
+	case <-time.After(5 * time.Second):
 		t.Fatal("server did not receive large command")
 	}
 }
 
 func TestFNCOREBootstrapFreshRejectionSettlesDeferredNormal(t *testing.T) {
+	wireRead := make(chan []byte, 1)
 	connection := mockServer(t, func(server net.Conn) {
 		_, _ = server.Write([]byte("200 regression server ready\r\n"))
-		_, _ = io.Copy(io.Discard, server)
+		_ = server.SetReadDeadline(time.Now().Add(time.Second))
+		buffer := make([]byte, 256)
+		n, _ := server.Read(buffer)
+		wireRead <- bytes.Clone(buffer[:n])
 	})
 	reqCh := make(chan *Request)
 	nntpConnection, err := newNNTPConnectionFromConn(
@@ -503,21 +538,75 @@ func TestFNCOREBootstrapFreshRejectionSettlesDeferredNormal(t *testing.T) {
 	}
 	go nntpConnection.Run()
 
-	select {
-	case response := <-freshResponse:
-		if !errors.Is(response.Err, errFreshTransportRequired) {
-			t.Fatalf("fresh bootstrap error = %v, want fresh-transport rejection", response.Err)
+	assertSingleSettlement := func(name string, responses <-chan Response, want error) {
+		t.Helper()
+		select {
+		case response, ok := <-responses:
+			if !ok {
+				t.Fatalf("%s response channel closed without a response", name)
+			}
+			if !errors.Is(response.Err, want) {
+				t.Fatalf("%s error = %v, want %v", name, response.Err, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s request was stranded", name)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("fresh bootstrap request was stranded")
+		select {
+		case response, ok := <-responses:
+			if ok {
+				t.Fatalf("%s settled more than once: %+v", name, response)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s response channel was not closed after settlement", name)
+		}
 	}
+	assertSingleSettlement("fresh bootstrap", freshResponse, errFreshTransportRequired)
+	assertSingleSettlement("deferred normal", deferredResponse, ErrConnectionDied)
 	select {
-	case response := <-deferredResponse:
-		if !errors.Is(response.Err, ErrConnectionDied) {
-			t.Fatalf("deferred normal error = %v, want deterministic connection retirement", response.Err)
+	case wire := <-wireRead:
+		if len(wire) != 0 {
+			t.Fatalf("bootstrap rejection wrote commands to wire: %q", wire)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("deferred normal request was stranded by bootstrap rejection")
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not observe deterministic bootstrap retirement")
+	}
+}
+
+func TestFNCOREPublicFreshBootstrapAdmissionSucceeds(t *testing.T) {
+	server := &regressionProvider{
+		host: "fresh-bootstrap-public.invalid:119",
+		respond: func(_ int, command string) []byte {
+			if strings.HasPrefix(command, "STAT") {
+				return []byte("223 1 <normal@example.invalid> exists\r\n")
+			}
+			return yencSinglePart([]byte("fresh bootstrap"), "fresh.bin")
+		},
+	}
+	provider := server.provider(false)
+	provider.ID = "fresh-bootstrap-public"
+	client := fncoreClient(t, provider)
+
+	body, err := client.BodyTargeted(context.Background(), "fresh@example.invalid", TargetedBodyOptions{
+		Provider:       provider.ID,
+		FreshTransport: true,
+	})
+	if err != nil {
+		t.Fatalf("first public fresh bootstrap error = %v", err)
+	}
+	if body == nil || body.ProviderID != provider.ID || body.BytesDecoded != len("fresh bootstrap") {
+		t.Fatalf("first public fresh bootstrap result = %+v", body)
+	}
+	if _, err := client.Stat(context.Background(), "normal@example.invalid"); err != nil {
+		t.Fatalf("normal request after public fresh bootstrap error = %v", err)
+	}
+	if got := server.commandCount("BODY"); got != 1 {
+		t.Fatalf("public fresh bootstrap BODY commands = %d, want one", got)
+	}
+	if got := server.commandCount("STAT"); got != 1 {
+		t.Fatalf("normal STAT commands = %d, want one", got)
+	}
+	if got := server.connections.Load(); got != 1 {
+		t.Fatalf("public bootstrap connections = %d, want one", got)
 	}
 }
 
@@ -526,6 +615,9 @@ func TestFNCOREHalfOpenCompletionWaitsForSocketRetirement(t *testing.T) {
 	var recovering atomic.Bool
 	closeStarted := make(chan struct{})
 	closeRelease := make(chan struct{})
+	var closeReleaseOnce sync.Once
+	releaseClose := func() { closeReleaseOnce.Do(func() { close(closeRelease) }) }
+	defer releaseClose()
 	writerErr := errors.New("retiring local writer")
 	factory := func(context.Context) (net.Conn, error) {
 		client, server := net.Pipe()
@@ -563,6 +655,7 @@ func TestFNCOREHalfOpenCompletionWaitsForSocketRetirement(t *testing.T) {
 		SkipPing:    true,
 	}
 	client := newBreakerClient(t, clock, provider)
+	group := fncoreProviderGroup(t, client, provider.ID)
 	for range providerBreakerFailureThreshold {
 		_ = targetedBreakerStat(client, provider.ID)
 	}
@@ -577,33 +670,92 @@ func TestFNCOREHalfOpenCompletionWaitsForSocketRetirement(t *testing.T) {
 	select {
 	case <-closeStarted:
 	case <-time.After(2 * time.Second):
-		close(closeRelease)
 		t.Fatal("writer-error socket did not begin retirement")
+	}
+	stats := providerBreakerStats(t, client, provider.ID)
+	if stats.State != CircuitBreakerHalfOpen || !stats.ProbeInFlight || stats.QualifyingFailures != 0 {
+		t.Fatalf("breaker completed before socket retirement: %+v", stats)
 	}
 	select {
 	case err := <-result:
-		close(closeRelease)
 		t.Fatalf("half-open request returned before socket retirement: %v", err)
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
 	if err := targetedBreakerStat(client, provider.ID); !errors.Is(err, ErrCircuitBreakerOpen) {
-		close(closeRelease)
 		t.Fatalf("second half-open request error = %v, want breaker-open during socket retirement", err)
 	}
-	close(closeRelease)
+	if got := group.gate.available.Load(); got != int32(provider.Connections-1) {
+		t.Fatalf("provider gate available during retirement = %d, want %d", got, provider.Connections-1)
+	}
+	releaseClose()
 	select {
 	case err := <-result:
 		if !errors.Is(err, writerErr) {
 			t.Fatalf("retired half-open request error = %v, want local writer cause", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("half-open request did not return after socket retirement")
+	}
+	stats = providerBreakerStats(t, client, provider.ID)
+	if stats.State != CircuitBreakerClosed || stats.ProbeInFlight || stats.QualifyingFailures != 0 {
+		t.Fatalf("breaker state after retired local writer = %+v, want closed neutral state", stats)
+	}
+	waitForFNCOREGateAvailability(t, group, int32(provider.Connections))
+}
+
+func TestFNCORESuccessfulHalfOpenReturnsAfterPipelineSettlement(t *testing.T) {
+	clock := newBreakerFakeClock()
+	var recovering atomic.Bool
+	server, provider := breakerProvider(
+		"half-open-success-settlement",
+		"half-open-success-settlement.invalid:119",
+		func(_ int, _ string) []byte {
+			if !recovering.Load() {
+				return []byte("451 temporary failure\r\n")
+			}
+			return []byte("223 1 <fixture@example.invalid> exists\r\n")
+		},
+	)
+	provider.Connections = 2
+	provider.Inflight = 1
+	provider.StatInflight = 1
+	client := newBreakerClient(t, clock, provider)
+	group := fncoreProviderGroup(t, client, provider.ID)
+	for range providerBreakerFailureThreshold {
+		_ = targetedBreakerStat(client, provider.ID)
+	}
+	commandsBeforeRecovery := server.commandCount("STAT")
+	recovering.Store(true)
+	clock.Advance(providerBreakerCooldowns[0])
+
+	if err := targetedBreakerStat(client, provider.ID); err != nil {
+		t.Fatalf("successful half-open STAT error = %v", err)
+	}
+	stats := providerBreakerStats(t, client, provider.ID)
+	if stats.State != CircuitBreakerClosed || stats.ProbeInFlight || stats.QualifyingFailures != 0 {
+		t.Fatalf("successful half-open breaker state = %+v, want closed", stats)
+	}
+	providerStats := client.Stats().Providers[0]
+	if providerStats.PipelineInUse != 0 {
+		t.Fatalf("successful half-open returned with %d pipeline slots still in use", providerStats.PipelineInUse)
+	}
+	if got := group.gate.available.Load(); got < 1 {
+		t.Fatalf("successful half-open returned without provider gate capacity: %d", got)
+	}
+	if got := server.commandCount("STAT"); got != commandsBeforeRecovery+1 {
+		t.Fatalf("successful half-open STAT commands = %d, want %d", got, commandsBeforeRecovery+1)
 	}
 }
 
 func TestFNCORENearMissCommandDoesNotTriggerStatProbe(t *testing.T) {
-	for _, command := range []string{"BODYX", "XTEST"} {
-		t.Run(command, func(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		payload string
+	}{
+		{name: "BODYX", payload: "BODYX <fixture@example.invalid>\r\n"},
+		{name: "arbitrary identifier syntax", payload: "XTEST <arbitrary-identifier@example.invalid>\r\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			first := &regressionProvider{
 				host:    "near-miss-first.invalid:119",
 				respond: func(int, string) []byte { return []byte("430 no such article\r\n") },
@@ -624,17 +776,28 @@ func TestFNCORENearMissCommandDoesNotTriggerStatProbe(t *testing.T) {
 			client := newRegressionClient(t, first.provider(false), second.provider(false), third.provider(false))
 			response := <-client.Send(
 				context.Background(),
-				[]byte(command+" <fixture@example.invalid>\r\n"),
+				[]byte(test.payload),
 				nil,
 			)
 			if response.Err != nil || response.StatusCode != 200 {
-				t.Fatalf("%s response = %+v, want direct fallback success", command, response)
+				t.Fatalf("%s response = %+v, want direct fallback success", test.name, response)
 			}
-			if got := second.commandCount("STAT"); got != 0 {
-				t.Fatalf("near-miss STAT probes = %d, want zero", got)
+			for providerIndex, provider := range []*regressionProvider{first, second, third} {
+				if got := provider.commandCount("STAT"); got != 0 {
+					t.Fatalf("provider %d near-miss STAT probes = %d, want zero", providerIndex, got)
+				}
 			}
+			command := strings.Fields(test.payload)[0]
 			if got := second.commandCount(command); got != 1 {
 				t.Fatalf("near-miss direct commands = %d, want one", got)
+			}
+			if len(response.Attempts) == 0 {
+				t.Fatal("near-miss response omitted attempt evidence")
+			}
+			for attemptIndex, attempt := range response.Attempts {
+				if attempt.Operation != OperationUnknown {
+					t.Fatalf("attempt %d operation = %q, want UNKNOWN", attemptIndex, attempt.Operation)
+				}
 			}
 		})
 	}
