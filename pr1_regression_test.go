@@ -1108,6 +1108,10 @@ func TestPR1PipelineWaitDoesNotConsumeResponseTimeout(t *testing.T) {
 			_, _ = server.Write([]byte("200 regression server ready\r\n"))
 			reader := bufio.NewReader(server)
 			_, _ = reader.ReadString('\n')
+			// Read both commands before delaying response 1. This makes request 2
+			// successfully flushed/written and then genuinely blocked behind the
+			// first FIFO response instead of blocking inside its own Flush.
+			_, _ = reader.ReadString('\n')
 			chunk := len(response) / 8
 			for offset := 0; offset < len(response); offset += chunk {
 				end := min(offset+chunk, len(response))
@@ -1116,7 +1120,6 @@ func TestPR1PipelineWaitDoesNotConsumeResponseTimeout(t *testing.T) {
 					time.Sleep(25 * time.Millisecond)
 				}
 			}
-			_, _ = reader.ReadString('\n')
 			_, _ = server.Write(yencSinglePart([]byte("second"), "second.bin"))
 		}()
 		return client, nil
