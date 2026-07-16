@@ -39,6 +39,33 @@ type partialErrorWriter struct {
 	bytes bytes.Buffer
 }
 
+type timeoutSinkError struct{}
+
+func (timeoutSinkError) Error() string   { return "local sink timeout" }
+func (timeoutSinkError) Timeout() bool   { return true }
+func (timeoutSinkError) Temporary() bool { return true }
+
+type readWithEOFConn struct {
+	data []byte
+}
+
+func (c *readWithEOFConn) Read(p []byte) (int, error) {
+	if len(c.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, c.data)
+	c.data = c.data[n:]
+	return n, io.EOF
+}
+
+func (*readWithEOFConn) Write(p []byte) (int, error)      { return len(p), nil }
+func (*readWithEOFConn) Close() error                     { return nil }
+func (*readWithEOFConn) LocalAddr() net.Addr              { return nil }
+func (*readWithEOFConn) RemoteAddr() net.Addr             { return nil }
+func (*readWithEOFConn) SetDeadline(time.Time) error      { return nil }
+func (*readWithEOFConn) SetReadDeadline(time.Time) error  { return nil }
+func (*readWithEOFConn) SetWriteDeadline(time.Time) error { return nil }
+
 func (w *partialErrorWriter) Write(p []byte) (int, error) {
 	n := max(1, len(p)/2)
 	_, _ = w.bytes.Write(p[:n])
@@ -262,6 +289,226 @@ func TestFNCOREPartialCallerWriterErrorPreservesCauseAndNeverReplays(t *testing.
 	}
 }
 
+func TestFNCORETimeoutLikeCallerWriterErrorRemainsLocal(t *testing.T) {
+	primary := &regressionProvider{
+		host: "timeout-writer.invalid:119",
+		respond: func(int, string) []byte {
+			return yencSinglePart([]byte("healthy provider payload"), "timeout.bin")
+		},
+	}
+	backup := &regressionProvider{
+		host: "timeout-writer-backup.invalid:119",
+		respond: func(int, string) []byte {
+			return yencSinglePart([]byte("backup must not be used"), "backup.bin")
+		},
+	}
+	client := fncoreClient(t, primary.provider(false), backup.provider(true))
+	writerErr := timeoutSinkError{}
+
+	_, err := client.BodyStream(context.Background(), "fixture@example.invalid", failingWriter{err: writerErr})
+	if !errors.Is(err, writerErr) {
+		t.Fatalf("BodyStream() error = %v, want timeout-like local sink error", err)
+	}
+	var transportErr *TransportError
+	if !errors.As(err, &transportErr) || len(transportErr.Attempts) == 0 {
+		t.Fatalf("BodyStream() error = %v, want structured attempt", err)
+	}
+	attempt := transportErr.Attempts[len(transportErr.Attempts)-1]
+	if attempt.Outcome != OutcomeKind("local_failure") || attempt.ProviderResponseTimeout {
+		t.Fatalf("timeout-like local attempt = %+v, want local failure without provider timeout", attempt)
+	}
+	if got := client.Stats().Providers[0].Errors; got != 0 {
+		t.Fatalf("provider errors = %d, want timeout-like local error excluded", got)
+	}
+	if got := backup.commandCount("BODY"); got != 0 {
+		t.Fatalf("backup BODY commands = %d, want zero after timeout-like local error", got)
+	}
+}
+
+func TestFNCOREBackupCommittedWriterRemovalIsTerminal(t *testing.T) {
+	missing := &regressionProvider{
+		host:    "missing-main.invalid:119",
+		respond: func(int, string) []byte { return []byte("430 no such article\r\n") },
+	}
+	firstBackup := &regressionProvider{
+		host: "committing-backup.invalid:119",
+		respond: func(int, string) []byte {
+			return yencSinglePart([]byte("first backup payload"), "first-backup.bin")
+		},
+	}
+	secondBackup := &regressionProvider{
+		host: "unused-backup.invalid:119",
+		respond: func(int, string) []byte {
+			return yencSinglePart([]byte("must not be appended"), "unused.bin")
+		},
+	}
+	client := fncoreClient(t, missing.provider(false), firstBackup.provider(true), secondBackup.provider(true))
+	writer := &removeProviderWriter{client: client, provider: firstBackup.host}
+
+	_, err := client.BodyStream(context.Background(), "fixture@example.invalid", writer)
+	if err == nil {
+		t.Fatal("BodyStream() error = nil, want terminal committed backup error")
+	}
+	if got := secondBackup.commandCount("BODY"); got != 0 {
+		t.Fatalf("later backup BODY attempts = %d, want zero after committed backup", got)
+	}
+}
+
+func TestFNCOREStatWinnerCommittedRemovalDoesNotReachBackup(t *testing.T) {
+	missing := &regressionProvider{
+		host:    "probe-missing.invalid:119",
+		respond: func(int, string) []byte { return []byte("430 no such article\r\n") },
+	}
+	winner := &regressionProvider{
+		host: "probe-winner.invalid:119",
+		respond: func(_ int, command string) []byte {
+			if strings.HasPrefix(command, "STAT") {
+				return []byte("223 1 <fixture@example.invalid> exists\r\n")
+			}
+			return yencSinglePart([]byte("winner payload"), "winner.bin")
+		},
+	}
+	probeMiss := &regressionProvider{
+		host:    "probe-other.invalid:119",
+		respond: func(int, string) []byte { return []byte("430 no such article\r\n") },
+	}
+	backup := &regressionProvider{
+		host: "probe-backup.invalid:119",
+		respond: func(int, string) []byte {
+			return yencSinglePart([]byte("must not be appended"), "backup.bin")
+		},
+	}
+	client := newRegressionClient(
+		t,
+		missing.provider(false),
+		winner.provider(false),
+		probeMiss.provider(false),
+		backup.provider(true),
+	)
+	writer := &removeProviderWriter{client: client, provider: winner.host}
+
+	_, err := client.BodyStream(context.Background(), "fixture@example.invalid", writer)
+	if err == nil {
+		t.Fatal("BodyStream() error = nil, want terminal committed STAT-winner error")
+	}
+	if got := backup.commandCount("BODY"); got != 0 {
+		t.Fatalf("backup BODY attempts = %d, want zero after committed STAT winner", got)
+	}
+}
+
+func TestFNCOREReadWithDataAndEOFFeedsFinalBytes(t *testing.T) {
+	connection := &readWithEOFConn{data: []byte("complete")}
+	var received []byte
+	feeder := &mockFeeder{feedFunc: func(in []byte, _ io.Writer) (int, bool, error) {
+		received = append(received, in...)
+		return len(in), true, nil
+	}}
+	var buffer readBuffer
+
+	err := buffer.feedUntilDone(connection, feeder, io.Discard, func(int) (time.Time, bool) {
+		return time.Time{}, false
+	})
+	if err != nil {
+		t.Fatalf("feedUntilDone() error = %v, want final bytes consumed before EOF", err)
+	}
+	if string(received) != "complete" {
+		t.Fatalf("received = %q, want complete", received)
+	}
+}
+
+func TestFNCOREProviderResponseTimeoutStartsAfterCommandFlush(t *testing.T) {
+	commandRead := make(chan struct{})
+	factory := func(context.Context) (net.Conn, error) {
+		client, server := net.Pipe()
+		go func() {
+			defer func() { _ = server.Close() }()
+			_, _ = server.Write([]byte("200 regression server ready\r\n"))
+			time.Sleep(150 * time.Millisecond)
+			reader := bufio.NewReader(server)
+			if _, err := reader.ReadString('\n'); err != nil {
+				return
+			}
+			close(commandRead)
+			_, _ = server.Write([]byte("223 1 <fixture@example.invalid> exists\r\n"))
+		}()
+		return client, nil
+	}
+	client := fncoreClient(t, Provider{
+		ID:             "flush-before-timeout",
+		Host:           "flush-before-timeout.invalid:119",
+		Factory:        factory,
+		Connections:    1,
+		Inflight:       1,
+		SkipPing:       true,
+		AttemptTimeout: 50 * time.Millisecond,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	result, err := client.Stat(ctx, "fixture@example.invalid")
+	if err != nil {
+		t.Fatalf("Stat() error = %v, command flush delay is not provider response time", err)
+	}
+	if result == nil || result.ProviderID != "flush-before-timeout" {
+		t.Fatalf("Stat() result = %+v", result)
+	}
+	select {
+	case <-commandRead:
+	default:
+		t.Fatal("server did not observe flushed command")
+	}
+}
+
+func TestFNCOREStaleSuccessCannotResetActiveHalfOpenGeneration(t *testing.T) {
+	clock := newBreakerFakeClock()
+	breaker := newProviderCircuitBreaker(true, clock)
+	stale, err := breaker.acquire("provider")
+	if err != nil {
+		t.Fatalf("stale acquire error = %v", err)
+	}
+	for range providerBreakerFailureThreshold {
+		lease, acquireErr := breaker.acquire("provider")
+		if acquireErr != nil {
+			t.Fatalf("closed acquire error = %v", acquireErr)
+		}
+		breaker.complete(lease, circuitBreakerFailure)
+	}
+	clock.Advance(providerBreakerCooldowns[0])
+	probe, err := breaker.acquire("provider")
+	if err != nil || !probe.probe {
+		t.Fatalf("half-open acquire = %+v, %v", probe, err)
+	}
+
+	breaker.complete(stale, circuitBreakerSuccess)
+	stats := breaker.snapshot()
+	if stats.State != CircuitBreakerHalfOpen || !stats.ProbeInFlight {
+		t.Fatalf("stale pre-open success reset active probe: %+v", stats)
+	}
+	breaker.complete(probe, circuitBreakerFailure)
+	stats = breaker.snapshot()
+	if stats.State != CircuitBreakerOpen || stats.Cooldown != 20*time.Second {
+		t.Fatalf("failed half-open probe progression = %+v, want reopened 20s cooldown", stats)
+	}
+}
+
+func TestFNCORECommandTokenNearMissAndRawBodyCompatibility(t *testing.T) {
+	if operation := operationFromPayload([]byte("BODYX <fixture@example.invalid>\r\n")); operation != OperationUnknown {
+		t.Fatalf("BODYX operation = %q, want UNKNOWN", operation)
+	}
+	provider := &regressionProvider{
+		host:    "raw-body-compat.invalid:119",
+		respond: func(int, string) []byte { return []byte("222 body follows\r\n.\r\n") },
+	}
+	client := fncoreClient(t, provider.provider(false))
+	response := <-client.Send(context.Background(), []byte("bOdY <fixture@example.invalid>\r\n"), nil)
+	if response.Err != nil || response.StatusCode != 222 {
+		t.Fatalf("raw mixed-case BODY response = %+v, want unvalidated success", response)
+	}
+	if len(response.Attempts) != 1 || response.Attempts[0].BodyValidation != BodyValidationNotRequested {
+		t.Fatalf("raw BODY attempts = %+v, want validation not requested", response.Attempts)
+	}
+}
+
 func TestFNCOREPrebufferedResponseProgressUsesStallDeadline(t *testing.T) {
 	firstResponse := yencSinglePart([]byte("first"), "first.bin")
 	secondResponse := yencSinglePart(bytes.Repeat([]byte("s"), 32*1024), "second.bin")
@@ -474,6 +721,9 @@ func TestFNCOREFreshTransportDoesNotAbortCommittedCollateralBody(t *testing.T) {
 	var connections atomic.Int32
 	streamPayload := bytes.Repeat([]byte("c"), 256*1024)
 	freshPayload := []byte("fresh payload")
+	bodyCommandSeen := make(chan struct{})
+	statCommandSeen := make(chan struct{})
+	releaseResponses := make(chan struct{})
 	factory := func(context.Context) (net.Conn, error) {
 		connection := connections.Add(1)
 		client, server := net.Pipe()
@@ -481,18 +731,28 @@ func TestFNCOREFreshTransportDoesNotAbortCommittedCollateralBody(t *testing.T) {
 			defer func() { _ = server.Close() }()
 			_, _ = server.Write([]byte("200 regression server ready\r\n"))
 			reader := bufio.NewReader(server)
+			if connection == 1 {
+				if _, err := reader.ReadString('\n'); err != nil {
+					return
+				}
+				close(bodyCommandSeen)
+				if _, err := reader.ReadString('\n'); err != nil {
+					return
+				}
+				close(statCommandSeen)
+				<-releaseResponses
+				if _, err := server.Write(yencSinglePart(streamPayload, "stream.bin")); err != nil {
+					return
+				}
+				_, _ = server.Write([]byte("223 1 <pending@example.invalid> exists\r\n"))
+				return
+			}
 			for {
 				_, err := reader.ReadString('\n')
 				if err != nil {
 					return
 				}
-				payload := freshPayload
-				name := "fresh.bin"
-				if connection == 1 {
-					payload = streamPayload
-					name = "stream.bin"
-				}
-				if _, err := server.Write(yencSinglePart(payload, name)); err != nil {
+				if _, err := server.Write(yencSinglePart(freshPayload, "fresh.bin")); err != nil {
 					return
 				}
 			}
@@ -500,12 +760,13 @@ func TestFNCOREFreshTransportDoesNotAbortCommittedCollateralBody(t *testing.T) {
 		return client, nil
 	}
 	provider := Provider{
-		ID:          "fresh-isolation",
-		Host:        "fresh-isolation.invalid:119",
-		Factory:     factory,
-		Connections: 1,
-		Inflight:    2,
-		SkipPing:    true,
+		ID:           "fresh-isolation",
+		Host:         "fresh-isolation.invalid:119",
+		Factory:      factory,
+		Connections:  1,
+		Inflight:     2,
+		StatInflight: 3,
+		SkipPing:     true,
 	}
 	client := fncoreClient(t, provider)
 	writer := &blockingWriter{started: make(chan struct{}), release: make(chan struct{})}
@@ -514,6 +775,22 @@ func TestFNCOREFreshTransportDoesNotAbortCommittedCollateralBody(t *testing.T) {
 		_, err := client.BodyStream(context.Background(), "stream@example.invalid", writer)
 		streamResult <- err
 	}()
+	select {
+	case <-bodyCommandSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not receive collateral BODY")
+	}
+	statResult := make(chan error, 1)
+	go func() {
+		_, err := client.Stat(context.Background(), "pending@example.invalid")
+		statResult <- err
+	}()
+	select {
+	case <-statCommandSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not receive pending collateral STAT")
+	}
+	close(releaseResponses)
 	select {
 	case <-writer.started:
 	case <-time.After(2 * time.Second):
@@ -542,6 +819,14 @@ func TestFNCOREFreshTransportDoesNotAbortCommittedCollateralBody(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("collateral BODY did not settle")
+	}
+	select {
+	case err := <-statResult:
+		if err != nil {
+			t.Fatalf("pending collateral STAT error = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("pending collateral STAT did not settle")
 	}
 	select {
 	case err := <-freshResult:
