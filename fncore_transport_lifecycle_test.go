@@ -739,8 +739,8 @@ func TestFNCORESuccessfulHalfOpenReturnsAfterPipelineSettlement(t *testing.T) {
 	if providerStats.PipelineInUse != 0 {
 		t.Fatalf("successful half-open returned with %d pipeline slots still in use", providerStats.PipelineInUse)
 	}
-	if got := group.gate.available.Load(); got < 1 {
-		t.Fatalf("successful half-open returned without provider gate capacity: %d", got)
+	if got := group.gate.available.Load(); got != int32(provider.Connections-1) {
+		t.Fatalf("successful half-open gate availability = %d, want %d with healthy connection retained", got, provider.Connections-1)
 	}
 	if got := server.commandCount("STAT"); got != commandsBeforeRecovery+1 {
 		t.Fatalf("successful half-open STAT commands = %d, want %d", got, commandsBeforeRecovery+1)
