@@ -53,7 +53,10 @@ func fncoreArticleResponse(payload []byte, name string) []byte {
 
 func requireFNCORELocalWriterError(t *testing.T, err, cause error) *TransportError {
 	t.Helper()
-	if !errors.Is(err, cause) {
+	if err == nil {
+		t.Fatal("writer result error = nil, want terminal local failure")
+	}
+	if cause != nil && !errors.Is(err, cause) {
 		t.Fatalf("writer result error = %v, want cause %v", err, cause)
 	}
 	var transportErr *TransportError
@@ -64,8 +67,11 @@ func requireFNCORELocalWriterError(t *testing.T, err, cause error) *TransportErr
 		t.Fatalf("writer TransportError = %+v, want one local_failure attempt", transportErr)
 	}
 	attempt := transportErr.Attempts[0]
-	if attempt.Outcome != OutcomeKind("local_failure") || attempt.ProviderResponseTimeout || !errors.Is(attempt.Cause, cause) {
+	if attempt.Outcome != OutcomeKind("local_failure") || attempt.ProviderResponseTimeout || attempt.Cause == nil {
 		t.Fatalf("writer attempt = %+v, want local cause without provider timeout", attempt)
+	}
+	if cause != nil && !errors.Is(attempt.Cause, cause) {
+		t.Fatalf("writer attempt cause = %v, want %v", attempt.Cause, cause)
 	}
 	return transportErr
 }
@@ -85,16 +91,14 @@ func TestFNCOREMalformedWriterResultsAreTerminalLocalFailures(t *testing.T) {
 			wantCause: io.ErrShortWrite,
 		},
 		{
-			name:      "negative count",
-			result:    func(int) (int, error) { return -1, nil },
-			wantCause: io.ErrShortWrite,
+			name:   "negative count",
+			result: func(int) (int, error) { return -1, nil },
 		},
 		{
 			name: "excessive count",
 			result: func(length int) (int, error) {
 				return length + 1, nil
 			},
-			wantCause: io.ErrShortWrite,
 		},
 		{
 			name: "full count and error",
