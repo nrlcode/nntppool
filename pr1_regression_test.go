@@ -23,9 +23,11 @@ type blockingWriter struct {
 	started chan struct{}
 	release chan struct{}
 	once    sync.Once
+	calls   atomic.Int32
 }
 
 func (w *blockingWriter) Write(p []byte) (int, error) {
+	w.calls.Add(1)
 	w.once.Do(func() { close(w.started) })
 	<-w.release
 	return len(p), nil

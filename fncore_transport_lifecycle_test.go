@@ -613,6 +613,8 @@ func TestFNCOREPublicFreshBootstrapAdmissionSucceeds(t *testing.T) {
 func TestFNCOREHalfOpenCompletionWaitsForSocketRetirement(t *testing.T) {
 	clock := newBreakerFakeClock()
 	var recovering atomic.Bool
+	var blockNextRetirement atomic.Bool
+	var healthyProbeCommands atomic.Int32
 	closeStarted := make(chan struct{})
 	closeRelease := make(chan struct{})
 	var closeReleaseOnce sync.Once
@@ -635,13 +637,14 @@ func TestFNCOREHalfOpenCompletionWaitsForSocketRetirement(t *testing.T) {
 					continue
 				}
 				if strings.HasPrefix(command, "STAT") {
+					healthyProbeCommands.Add(1)
 					_, _ = server.Write([]byte("223 1 <fixture@example.invalid> exists\r\n"))
 					continue
 				}
 				_, _ = server.Write(yencSinglePart([]byte("healthy provider body"), "healthy.bin"))
 			}
 		}()
-		if recovering.Load() {
+		if recovering.Load() && blockNextRetirement.CompareAndSwap(true, false) {
 			return &blockingCloseConn{Conn: client, started: closeStarted, release: closeRelease}, nil
 		}
 		return client, nil
@@ -660,6 +663,7 @@ func TestFNCOREHalfOpenCompletionWaitsForSocketRetirement(t *testing.T) {
 		_ = targetedBreakerStat(client, provider.ID)
 	}
 	recovering.Store(true)
+	blockNextRetirement.Store(true)
 	clock.Advance(providerBreakerCooldowns[0])
 
 	result := make(chan error, 1)
@@ -697,10 +701,20 @@ func TestFNCOREHalfOpenCompletionWaitsForSocketRetirement(t *testing.T) {
 		t.Fatal("half-open request did not return after socket retirement")
 	}
 	stats = providerBreakerStats(t, client, provider.ID)
-	if stats.State != CircuitBreakerClosed || stats.ProbeInFlight || stats.QualifyingFailures != 0 {
-		t.Fatalf("breaker state after retired local writer = %+v, want closed neutral state", stats)
+	if stats.State != CircuitBreakerHalfOpen || stats.ProbeInFlight || stats.QualifyingFailures != 0 {
+		t.Fatalf("breaker state after retired local writer = %+v, want neutral half-open state", stats)
 	}
 	waitForFNCOREGateAvailability(t, group, int32(provider.Connections))
+	if err := targetedBreakerStat(client, provider.ID); err != nil {
+		t.Fatalf("healthy probe after neutral local writer error = %v", err)
+	}
+	if got := healthyProbeCommands.Load(); got != 1 {
+		t.Fatalf("healthy recovery probe commands = %d, want exactly one", got)
+	}
+	stats = providerBreakerStats(t, client, provider.ID)
+	if stats.State != CircuitBreakerClosed || stats.ProbeInFlight || stats.QualifyingFailures != 0 {
+		t.Fatalf("healthy probe did not close/reset breaker after local writer error: %+v", stats)
+	}
 }
 
 func TestFNCORESuccessfulHalfOpenReturnsAfterPipelineSettlement(t *testing.T) {
@@ -1023,11 +1037,12 @@ func TestFNCOREProviderPrivateDeadlineTripsBreaker(t *testing.T) {
 }
 
 func TestFNCORECancelledHalfOpenRemainsExclusiveUntilWriterSettles(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	t.Cleanup(func() { runtime.GOMAXPROCS(previous) })
 	clock := newBreakerFakeClock()
 	var recovering atomic.Bool
 	writerStarted := make(chan struct{})
 	writerRelease := make(chan struct{})
-	var writerOnce sync.Once
 	factory := func(context.Context) (net.Conn, error) {
 		client, server := net.Pipe()
 		go func() {
@@ -1068,7 +1083,7 @@ func TestFNCORECancelledHalfOpenRemainsExclusiveUntilWriterSettles(t *testing.T)
 	recovering.Store(true)
 	clock.Advance(10 * time.Second)
 
-	writer := &blockingWriter{started: writerStarted, release: writerRelease, once: writerOnce}
+	writer := &blockingWriter{started: writerStarted, release: writerRelease}
 	probeCtx, cancelProbe := context.WithCancel(context.Background())
 	probeResult := make(chan error, 1)
 	go func() {
@@ -1081,11 +1096,14 @@ func TestFNCORECancelledHalfOpenRemainsExclusiveUntilWriterSettles(t *testing.T)
 		t.Fatal("half-open BODY did not reach caller writer")
 	}
 	cancelProbe()
+	for range 16 {
+		runtime.Gosched()
+	}
 	select {
 	case earlyProbeErr := <-probeResult:
 		close(writerRelease)
 		t.Fatalf("canceled half-open BODY returned before caller writer settled: %v", earlyProbeErr)
-	case <-time.After(50 * time.Millisecond):
+	default:
 		// A committed caller writer keeps transport ownership until Write settles.
 	}
 
@@ -1101,6 +1119,9 @@ func TestFNCORECancelledHalfOpenRemainsExclusiveUntilWriterSettles(t *testing.T)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("canceled half-open BODY did not return after writer settled")
+	}
+	if got := writer.calls.Load(); got != 1 {
+		t.Fatalf("caller writer invocations after cancellation settlement = %d, want exactly one", got)
 	}
 }
 

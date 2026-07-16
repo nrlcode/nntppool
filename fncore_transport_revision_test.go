@@ -431,19 +431,29 @@ func TestFNCORECommittedFinalWriterToFinalizationCancellationAndShutdownAreTermi
 			for range 8 {
 				runtime.Gosched()
 			}
+			var terminalErr error
+			joinedAPI := false
 			select {
-			case err := <-result:
-				t.Fatalf("%s returned before committed decoder finalization: %v", mode, err)
+			case terminalErr = <-result:
+				// Once the caller Write returned, prompt terminal context
+				// cancellation is permitted even while decoder finalization is
+				// paused at the buffered trailer.
+				joinedAPI = true
 			default:
 			}
 			barrier.Release()
-			select {
-			case err := <-result:
-				if !errors.Is(err, want) {
-					t.Fatalf("%s between final write and finalization error = %v, want %v", mode, err, want)
+			if !joinedAPI {
+				select {
+				case terminalErr = <-result:
+				case <-time.After(5 * time.Second):
+					t.Fatalf("%s finalization race did not settle", mode)
 				}
-			case <-time.After(5 * time.Second):
-				t.Fatalf("%s finalization race did not settle", mode)
+			}
+			if !errors.Is(terminalErr, want) {
+				t.Fatalf("%s between final write and finalization error = %v, want %v", mode, terminalErr, want)
+			}
+			if err := client.Close(); err != nil {
+				t.Fatalf("Close() after %s error = %v", mode, err)
 			}
 			if got := backup.commandCount("BODY"); got != 0 {
 				t.Fatalf("backup BODY commands = %d, want zero after %s", got, mode)
@@ -748,8 +758,8 @@ func TestFNCOREBlockingSuccessfulFlushIsPoolTimeNotResponseTimeout(t *testing.T)
 		t.Fatalf("newNNTPConnectionFromConn() error = %v", err)
 	}
 	connection.providerID = "blocking-flush-timing"
-	// The unbuffered handoff makes writeStarted proof that readerLoop owns this
-	// exact Request while Flush remains blocked.
+	// Keep any pending handoff unbuffered so premature response admission cannot
+	// be hidden by channel capacity while this exact Request's Flush is blocked.
 	connection.pending = make(chan *Request)
 	readDeadlineBaseline := blockedConn.readDeadlineCalls.Load()
 	go connection.Run()
@@ -775,9 +785,9 @@ func TestFNCOREBlockingSuccessfulFlushIsPoolTimeNotResponseTimeout(t *testing.T)
 	case <-time.After(5 * time.Second):
 		t.Fatal("command flush did not block")
 	}
-	// Give the already-rendezvoused reader multiple explicit turns. A correct
-	// reader blocks on wire readiness; an eager reader publishes response-head
-	// state and arms its service deadline.
+	// Give every transport goroutine multiple explicit turns. A correct writer
+	// does not publish the request to response service until Flush succeeds; an
+	// eager path publishes response-head state and arms its service deadline.
 	for range 16 {
 		runtime.Gosched()
 	}
