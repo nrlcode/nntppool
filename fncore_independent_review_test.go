@@ -99,7 +99,7 @@ func TestFNCORECommittedWriterErrorWinsCallerAndClientCancellation(t *testing.T)
 			}
 			transportErr := requireFNCORELocalWriterError(t, terminalErr, writerErr)
 			attempt := transportErr.Attempts[0]
-			if attempt.Operation != OperationBody || attempt.ProviderID != provider.ID || attempt.Outcome != OutcomeLocalFailure {
+			if attempt.Operation != OperationBody || attempt.ProviderID != provider.ID || attempt.Outcome != OutcomeKind("local_failure") {
 				t.Fatalf("%s attempt = %+v, want one factual local BODY failure", mode, attempt)
 			}
 			if got := writer.calls.Load(); got != 1 {
