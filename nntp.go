@@ -2253,7 +2253,8 @@ type Client struct {
 	breakerOn    bool
 	breakerClock circuitBreakerClock
 
-	nextGenerated uint64
+	nextGenerated           uint64
+	nextLifecycleGeneration uint64
 	// decodeFn is copied to each request when non-nil. It remains unexported so
 	// production callers cannot replace the transport decoder.
 	decodeFn func(dst, src []byte, state *rapidyenc.State) (nDst, nSrc int, end rapidyenc.End, err error)
@@ -2543,15 +2544,20 @@ func NewClient(ctx context.Context, providers []Provider, opts ...ClientOption) 
 	registry.ownerByToken = owners
 
 	for _, spec := range resolved {
+		c.registryMu.Lock()
+		generation := c.nextProviderGenerationLocked()
+		c.registryMu.Unlock()
 		group := c.startProviderGroup(spec, c.pingResolvedProvider(c.ctx, spec))
 		registry.byID[spec.id] = providerRegistration{
-			spec:  spec,
-			group: group,
-			epoch: 1,
+			spec:       spec,
+			group:      group,
+			generation: generation,
 		}
 		registry.orderedIDs = append(registry.orderedIDs, spec.id)
 	}
+	c.registryMu.Lock()
 	c.publishRegistryLocked(registry)
+	c.registryMu.Unlock()
 
 	return c, nil
 }

@@ -17,9 +17,9 @@ type resolvedProvider struct {
 }
 
 type providerRegistration struct {
-	spec  resolvedProvider
-	group *providerGroup
-	epoch uint64
+	spec       resolvedProvider
+	group      *providerGroup
+	generation uint64
 }
 
 // providerRegistry is an immutable snapshot. Production readers load this
@@ -72,6 +72,13 @@ func (c *Client) publishRegistryLocked(next *providerRegistry) {
 	// Production routing and lookup always read c.registry.
 	c.mainGroups.Store(&next.mains)
 	c.backupGroups.Store(&next.backups)
+}
+
+// nextProviderGenerationLocked allocates a client-wide lifecycle token. It is
+// called only while registryMu is held and is never reset when an ID is reused.
+func (c *Client) nextProviderGenerationLocked() uint64 {
+	c.nextLifecycleGeneration++
+	return c.nextLifecycleGeneration
 }
 
 // resolveInitialProviders reserves every fixed ID and operational name before
@@ -212,23 +219,26 @@ func (c *Client) resolveAddedProviderLocked(provider Provider) (resolvedProvider
 	return spec, nil
 }
 
-func (c *Client) reserveProviderLocked(spec resolvedProvider) {
+func (c *Client) reserveProviderLocked(spec resolvedProvider) uint64 {
 	next := c.registry.Load().clone()
+	generation := c.nextProviderGenerationLocked()
 	next.ownerByToken[spec.id] = spec.id
 	next.ownerByToken[spec.name] = spec.id
 	next.byID[spec.id] = providerRegistration{
-		spec:  spec,
-		epoch: 1,
+		spec:       spec,
+		generation: generation,
 	}
 	next.orderedIDs = append(next.orderedIDs, spec.id)
 	c.publishRegistryLocked(next)
+	return generation
 }
 
-func (c *Client) completeProviderStart(id string, epoch uint64, ping PingResult) bool {
+func (c *Client) completeProviderStart(id string, generation uint64, ping PingResult) bool {
 	c.registryMu.Lock()
 	current := c.registry.Load()
 	registration, exists := current.byID[id]
-	if c.closed || c.ctx.Err() != nil || !exists || registration.group != nil || registration.epoch != epoch {
+	if c.closed || c.ctx.Err() != nil || !exists || registration.group != nil ||
+		registration.generation != generation {
 		c.registryMu.Unlock()
 		return false
 	}
@@ -285,7 +295,7 @@ func (c *Client) deactivateProvider(group *providerGroup, retain bool) (uint64, 
 	next := current.clone()
 	if retain {
 		registration.group = nil
-		registration.epoch++
+		registration.generation = c.nextProviderGenerationLocked()
 		next.byID[group.id] = registration
 	} else {
 		removeRegistration(next, group.id)
@@ -295,18 +305,18 @@ func (c *Client) deactivateProvider(group *providerGroup, retain bool) (uint64, 
 
 	group.cancel()
 	group.gate.stop()
-	return registration.epoch, true
+	return registration.generation, true
 }
 
 func (c *Client) retireUnavailableProvider(group *providerGroup) {
 	retain := group.p.ReconnectDelay > 0
-	epoch, changed := c.deactivateProvider(group, retain)
+	generation, changed := c.deactivateProvider(group, retain)
 	if changed && retain {
-		c.scheduleReconnect(group.id, epoch, group.p.ReconnectDelay)
+		c.scheduleReconnect(group.id, generation, group.p.ReconnectDelay)
 	}
 }
 
-func (c *Client) scheduleReconnect(id string, epoch uint64, delay time.Duration) {
+func (c *Client) scheduleReconnect(id string, generation uint64, delay time.Duration) {
 	go func() {
 		timer := time.NewTimer(delay)
 		defer timer.Stop()
@@ -314,28 +324,29 @@ func (c *Client) scheduleReconnect(id string, epoch uint64, delay time.Duration)
 		case <-c.ctx.Done():
 			return
 		case <-timer.C:
-			c.reconnectProvider(id, epoch)
+			c.reconnectProvider(id, generation)
 		}
 	}()
 }
 
-func (c *Client) reconnectProvider(id string, epoch uint64) {
+func (c *Client) reconnectProvider(id string, generation uint64) {
 	c.registryMu.Lock()
 	current := c.registry.Load()
 	registration, exists := current.byID[id]
-	if c.closed || c.ctx.Err() != nil || !exists || registration.group != nil || registration.epoch != epoch {
+	if c.closed || c.ctx.Err() != nil || !exists || registration.group != nil ||
+		registration.generation != generation {
 		c.registryMu.Unlock()
 		return
 	}
 
 	next := current.clone()
-	registration.epoch++
+	registration.generation = c.nextProviderGenerationLocked()
 	next.byID[id] = registration
 	c.publishRegistryLocked(next)
 	c.registryMu.Unlock()
 
 	ping := c.pingResolvedProvider(c.ctx, registration.spec)
-	_ = c.completeProviderStart(id, registration.epoch, ping)
+	_ = c.completeProviderStart(id, registration.generation, ping)
 }
 
 func (c *Client) registrationForToken(token string) (providerRegistration, bool) {
@@ -387,11 +398,11 @@ func (c *Client) addProvider(provider Provider) error {
 		c.registryMu.Unlock()
 		return err
 	}
-	c.reserveProviderLocked(spec)
+	generation := c.reserveProviderLocked(spec)
 	c.registryMu.Unlock()
 
 	ping := c.pingResolvedProvider(c.ctx, spec)
-	if !c.completeProviderStart(spec.id, 1, ping) {
+	if !c.completeProviderStart(spec.id, generation, ping) {
 		if err := c.ctx.Err(); err != nil {
 			return err
 		}
