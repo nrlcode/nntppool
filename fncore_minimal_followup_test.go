@@ -43,13 +43,16 @@ type fncoreFollowupConn struct {
 	writeSeen   chan struct{}
 	writeOnce   sync.Once
 
-	readCalls    atomic.Int32
-	observeRead  atomic.Int32
-	readObserved chan struct{}
-	readOnce     sync.Once
-	readEvent    atomic.Uint64
-	closeEvent   atomic.Uint64
-	events       *fncoreEventSequence
+	readCalls       atomic.Int32
+	observeRead     atomic.Int32
+	observeReadData []byte
+	observeReadErr  error
+	readObserved    chan struct{}
+	readOnce        sync.Once
+	readMatched     atomic.Bool
+	readEvent       atomic.Uint64
+	closeEvent      atomic.Uint64
+	events          *fncoreEventSequence
 }
 
 func newFNCOREFollowupConn(blockClose bool, reads ...fncoreFollowupRead) *fncoreFollowupConn {
@@ -77,6 +80,7 @@ func (c *fncoreFollowupConn) Read(p []byte) (int, error) {
 		n := copy(p, result.data)
 		if call := c.readCalls.Add(1); call == c.observeRead.Load() {
 			c.readOnce.Do(func() {
+				c.readMatched.Store(bytes.Equal(result.data, c.observeReadData) && errors.Is(result.err, c.observeReadErr))
 				if c.events != nil {
 					c.readEvent.Store(c.events.record())
 				}
@@ -120,8 +124,10 @@ func (c *fncoreFollowupConn) releaseClose() {
 	c.releaseOnce.Do(func() { close(c.closeRelease) })
 }
 
-func (c *fncoreFollowupConn) observeReadCall(call int32) {
+func (c *fncoreFollowupConn) observeReadResult(call int32, data []byte, err error) {
 	c.observeRead.Store(call)
+	c.observeReadData = bytes.Clone(data)
+	c.observeReadErr = err
 }
 
 func (c *fncoreFollowupConn) recordEvents(events *fncoreEventSequence) {
@@ -423,14 +429,22 @@ type fncoreBlockingPostCloseBody struct {
 	enterEvent   atomic.Uint64
 	exitEvent    atomic.Uint64
 	events       *fncoreEventSequence
+	post         *Request
+
+	preReturnHeldBody       atomic.Bool
+	preReturnHeldInflight   atomic.Bool
+	preReturnResponseLength atomic.Int32
+	preReturnSnapshot       chan struct{}
+	snapshotOnce            sync.Once
 }
 
 func newFNCOREBlockingPostCloseBody(data []byte, events *fncoreEventSequence) *fncoreBlockingPostCloseBody {
 	return &fncoreBlockingPostCloseBody{
-		data:         data,
-		closeEntered: make(chan struct{}),
-		closeRelease: make(chan struct{}),
-		events:       events,
+		data:              data,
+		closeEntered:      make(chan struct{}),
+		closeRelease:      make(chan struct{}),
+		preReturnSnapshot: make(chan struct{}),
+		events:            events,
 	}
 }
 
@@ -451,12 +465,25 @@ func (b *fncoreBlockingPostCloseBody) Close() error {
 		close(b.closeEntered)
 	})
 	<-b.closeRelease
-	b.exitedOnce.Do(func() { b.exitEvent.Store(b.events.record()) })
+	b.exitedOnce.Do(func() {
+		// PayloadBody.Close is still on the request's completion path here.
+		// Snapshot ownership immediately before returning: the response send
+		// synchronizes the later post-response reads with capacity release.
+		b.preReturnHeldBody.Store(b.post.heldBody)
+		b.preReturnHeldInflight.Store(b.post.heldInflight)
+		b.preReturnResponseLength.Store(int32(len(b.post.RespCh)))
+		b.exitEvent.Store(b.events.record())
+		b.snapshotOnce.Do(func() { close(b.preReturnSnapshot) })
+	})
 	return nil
 }
 
 func (b *fncoreBlockingPostCloseBody) releaseClose() {
 	b.releaseOnce.Do(func() { close(b.closeRelease) })
+}
+
+func (b *fncoreBlockingPostCloseBody) attachPost(post *Request) {
+	b.post = post
 }
 
 func assertFNCOREEventOrder(t *testing.T, label string, events ...uint64) {
@@ -471,22 +498,19 @@ func assertFNCOREEventOrder(t *testing.T, label string, events ...uint64) {
 	}
 }
 
-func assertFNCOREPostCloseStillOwnsResponse(
-	t *testing.T,
-	post *Request,
-	responseCh <-chan Response,
-	label string,
-) {
+func assertFNCOREPostPreReturnOwnership(t *testing.T, body *fncoreBlockingPostCloseBody, label string) {
 	t.Helper()
-	if !post.heldBody || !post.heldInflight {
-		t.Fatalf("%s released request capacity while PayloadBody.Close was blocked: body=%t inflight=%t", label, post.heldBody, post.heldInflight)
-	}
-	timer := time.NewTimer(100 * time.Millisecond)
-	defer timer.Stop()
 	select {
-	case response := <-responseCh:
-		t.Fatalf("%s response published while PayloadBody.Close was blocked: %+v", label, response)
-	case <-timer.C:
+	case <-body.preReturnSnapshot:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s PayloadBody.Close did not record its pre-return ownership snapshot", label)
+	}
+	if !body.preReturnHeldBody.Load() || !body.preReturnHeldInflight.Load() {
+		t.Fatalf("%s released request capacity before PayloadBody.Close returned: body=%t inflight=%t",
+			label, body.preReturnHeldBody.Load(), body.preReturnHeldInflight.Load())
+	}
+	if got := body.preReturnResponseLength.Load(); got != 0 {
+		t.Fatalf("%s buffered %d response(s) before PayloadBody.Close returned", label, got)
 	}
 }
 
@@ -517,7 +541,7 @@ func TestFNCOREPostFinalReadDoesNotWaitForPayloadBodyClose(t *testing.T) {
 			}
 			conn := newFNCOREFollowupConn(false, reads...)
 			conn.recordEvents(events)
-			conn.observeReadCall(3)
+			conn.observeReadResult(3, test.final.data, test.final.err)
 			reqCh := make(chan *Request, 2)
 			connection := fncoreFollowupConnection(t, conn, 1, reqCh)
 			body := newFNCOREBlockingPostCloseBody([]byte("article\r\n.\r\n"), events)
@@ -530,6 +554,7 @@ func TestFNCOREPostFinalReadDoesNotWaitForPayloadBodyClose(t *testing.T) {
 				RespCh:      make(chan Response, 1),
 				submittedAt: time.Now(),
 			}
+			body.attachPost(post)
 			go connection.Run()
 			reqCh <- post
 
@@ -538,29 +563,21 @@ func TestFNCOREPostFinalReadDoesNotWaitForPayloadBodyClose(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("clean POST did not reach blocking PayloadBody.Close")
 			}
-			if test.name == "EOF" {
-				assertFNCOREEventOrder(t, "POST final EOF before body-close release",
-					conn.readEvent.Load(), conn.closeEvent.Load(), body.enterEvent.Load())
-			} else {
-				assertFNCOREEventOrder(t, "POST final 240 before body-close release",
-					conn.readEvent.Load(), body.enterEvent.Load())
-				select {
-				case <-conn.closeEntered:
-					t.Fatal("successful POST retired its reusable transport")
-				default:
-				}
-			}
 			if got := body.closeCalls.Load(); got != 1 {
 				t.Fatalf("PayloadBody.Close calls while blocked = %d, want one", got)
 			}
-			assertFNCOREPostCloseStillOwnsResponse(t, post, post.RespCh, test.name+" POST")
 
 			body.releaseClose()
+			assertFNCOREPostPreReturnOwnership(t, body, test.name+" POST")
 			response := awaitFNCOREPhaseResponse(t, post.RespCh, test.name+" POST after body close")
+			responseEvent := events.record()
 			assertFNCOREPostCapacityReleased(t, post, test.name+" POST")
+			if !conn.readMatched.Load() {
+				t.Fatalf("POST final %s observation was not the exact configured transport result", test.name)
+			}
 			if test.name == "240" {
-				assertFNCOREEventOrder(t, "POST final 240 body-close lifecycle",
-					conn.readEvent.Load(), body.enterEvent.Load(), body.exitEvent.Load())
+				assertFNCOREEventOrder(t, "POST complete final 240 frame, body-close, and response lifecycle",
+					conn.readEvent.Load(), body.enterEvent.Load(), body.exitEvent.Load(), responseEvent)
 				if response.Err != nil || response.StatusCode != 240 || len(response.Attempts) != 1 ||
 					response.Attempts[0].Outcome != OutcomeSuccess {
 					t.Fatalf("successful POST response = %+v", response)
@@ -583,7 +600,7 @@ func TestFNCOREPostFinalReadDoesNotWaitForPayloadBodyClose(t *testing.T) {
 				}
 			} else {
 				assertFNCOREEventOrder(t, "POST final EOF body-close lifecycle",
-					conn.readEvent.Load(), conn.closeEvent.Load(), body.enterEvent.Load(), body.exitEvent.Load())
+					conn.readEvent.Load(), conn.closeEvent.Load(), body.enterEvent.Load(), body.exitEvent.Load(), responseEvent)
 				if !errors.Is(response.Err, io.EOF) || len(response.Attempts) != 1 ||
 					response.Attempts[0].Outcome != OutcomeTransportFailure {
 					t.Fatalf("POST final EOF response = %+v", response)
@@ -611,7 +628,7 @@ func TestFNCOREPostInterim340WithEOFClosesWithoutReadingBody(t *testing.T) {
 		fncoreFollowupRead{data: []byte("340 send article\r\n"), err: io.EOF},
 	)
 	conn.recordEvents(events)
-	conn.observeReadCall(2)
+	conn.observeReadResult(2, []byte("340 send article\r\n"), io.EOF)
 	conn.writeNeedle = []byte("STAT <collateral@example.invalid>")
 	reqCh := make(chan *Request, 2)
 	connection := fncoreFollowupConnection(t, conn, 1, reqCh)
@@ -625,6 +642,7 @@ func TestFNCOREPostInterim340WithEOFClosesWithoutReadingBody(t *testing.T) {
 		RespCh:      make(chan Response, 1),
 		submittedAt: time.Now(),
 	}
+	body.attachPost(post)
 	go connection.Run()
 	reqCh <- post
 
@@ -639,15 +657,16 @@ func TestFNCOREPostInterim340WithEOFClosesWithoutReadingBody(t *testing.T) {
 	if got := body.closeCalls.Load(); got != 1 {
 		t.Fatalf("interim 340+EOF PayloadBody.Close calls while blocked = %d, want one", got)
 	}
-	assertFNCOREEventOrder(t, "interim 340+EOF before body-close release",
-		conn.readEvent.Load(), conn.closeEvent.Load(), body.enterEvent.Load())
-	assertFNCOREPostCloseStillOwnsResponse(t, post, post.RespCh, "interim 340+EOF POST")
-
 	body.releaseClose()
+	assertFNCOREPostPreReturnOwnership(t, body, "interim 340+EOF POST")
 	response := awaitFNCOREPhaseResponse(t, post.RespCh, "interim 340+EOF POST after body close")
+	responseEvent := events.record()
 	assertFNCOREPostCapacityReleased(t, post, "interim 340+EOF POST")
 	assertFNCOREEventOrder(t, "interim 340+EOF body-close lifecycle",
-		conn.readEvent.Load(), conn.closeEvent.Load(), body.enterEvent.Load(), body.exitEvent.Load())
+		conn.readEvent.Load(), conn.closeEvent.Load(), body.enterEvent.Load(), body.exitEvent.Load(), responseEvent)
+	if !conn.readMatched.Load() {
+		t.Fatal("interim POST observation was not the complete configured 340+EOF transport result")
+	}
 	if !errors.Is(response.Err, io.EOF) || response.StatusCode != 340 || len(response.Attempts) != 1 ||
 		response.Attempts[0].Operation != OperationPost ||
 		response.Attempts[0].Outcome != OutcomeTransportFailure ||
