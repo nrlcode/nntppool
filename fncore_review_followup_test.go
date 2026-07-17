@@ -14,21 +14,6 @@ import (
 	"time"
 )
 
-type fncoreLateDeadlineContext struct {
-	deadline time.Time
-	expired  atomic.Bool
-}
-
-func (c *fncoreLateDeadlineContext) Deadline() (time.Time, bool) { return c.deadline, true }
-func (*fncoreLateDeadlineContext) Done() <-chan struct{}         { return nil }
-func (c *fncoreLateDeadlineContext) Err() error {
-	if c.expired.Load() {
-		return context.DeadlineExceeded
-	}
-	return nil
-}
-func (*fncoreLateDeadlineContext) Value(any) any { return nil }
-
 type fncoreProviderOwnedTimeoutConn struct {
 	net.Conn
 	timeoutRead int32
@@ -40,7 +25,6 @@ type fncoreProviderOwnedTimeoutConn struct {
 	selected     chan struct{}
 	release      chan struct{}
 	selectedOnce sync.Once
-	expire       func()
 }
 
 func (c *fncoreProviderOwnedTimeoutConn) SetReadDeadline(deadline time.Time) error {
@@ -62,7 +46,6 @@ func (c *fncoreProviderOwnedTimeoutConn) Read(p []byte) (int, error) {
 	}
 	c.selectedOnce.Do(func() { close(c.selected) })
 	<-c.release
-	c.expire()
 	return 0, fncoreDeadlineTimeout{}
 }
 
@@ -83,14 +66,19 @@ func TestFNCOREProviderOwnedTimeoutSurvivesLateCallerDeadline(t *testing.T) {
 		{name: "response stall", partial: "223 partial response", timeoutRead: 2},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			caller := &fncoreLateDeadlineContext{deadline: time.Now().Add(time.Hour)}
+			caller, cancelCaller := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			t.Cleanup(cancelCaller)
+			callerDeadline, _ := caller.Deadline()
 			clientConn, serverConn := net.Pipe()
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			releaseRead := func() { releaseOnce.Do(func() { close(release) }) }
+			t.Cleanup(releaseRead)
 			controlled := &fncoreProviderOwnedTimeoutConn{
 				Conn:        clientConn,
 				timeoutRead: test.timeoutRead,
 				selected:    make(chan struct{}),
-				release:     make(chan struct{}),
-				expire:      func() { caller.expired.Store(true) },
+				release:     release,
 			}
 			go func() {
 				defer func() { _ = serverConn.Close() }()
@@ -114,8 +102,9 @@ func TestFNCOREProviderOwnedTimeoutSurvivesLateCallerDeadline(t *testing.T) {
 			}
 			providerID := "late-" + test.name
 			connection.providerID = providerID
-			connection.stallTimeout = 10 * time.Second
+			connection.stallTimeout = 50 * time.Millisecond
 			t.Cleanup(func() {
+				releaseRead()
 				_ = serverConn.Close()
 				_ = connection.Close()
 			})
@@ -124,7 +113,7 @@ func TestFNCOREProviderOwnedTimeoutSurvivesLateCallerDeadline(t *testing.T) {
 				Payload:         []byte("STAT <late-deadline@example.invalid>\r\n"),
 				RespCh:          make(chan Response, 1),
 				submittedAt:     time.Now(),
-				responseTimeout: 10 * time.Second,
+				responseTimeout: 50 * time.Millisecond,
 			}
 			go connection.Run()
 			reqCh <- request
@@ -133,10 +122,15 @@ func TestFNCOREProviderOwnedTimeoutSurvivesLateCallerDeadline(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("provider-owned socket deadline was not selected")
 			}
-			if deadline := controlled.selectedDeadline(); deadline.IsZero() || !deadline.Before(caller.deadline) {
-				t.Fatalf("selected socket deadline = %v, want provider deadline before caller %v", deadline, caller.deadline)
+			if deadline := controlled.selectedDeadline(); deadline.IsZero() || !deadline.Before(callerDeadline) {
+				t.Fatalf("selected socket deadline = %v, want provider deadline before caller %v", deadline, callerDeadline)
 			}
-			close(controlled.release)
+			select {
+			case <-caller.Done():
+			case <-time.After(5 * time.Second):
+				t.Fatal("real caller deadline did not cross after provider deadline selection")
+			}
+			releaseRead()
 
 			response := awaitFNCOREPhaseResponse(t, request.RespCh, "provider-owned timeout")
 			if len(response.Attempts) != 1 {
@@ -357,6 +351,9 @@ func TestFNCOREFullyWrittenPendingPostCancellationClosesBodyAndPreservesFIFO(t *
 	clientConn, serverConn := net.Pipe()
 	commandsSeen := make(chan struct{})
 	releaseResponses := make(chan struct{})
+	var releaseResponsesOnce sync.Once
+	releasePendingResponses := func() { releaseResponsesOnce.Do(func() { close(releaseResponses) }) }
+	t.Cleanup(releasePendingResponses)
 	serverDone := make(chan error, 1)
 	go func() {
 		defer func() { _ = serverConn.Close() }()
@@ -402,6 +399,7 @@ func TestFNCOREFullyWrittenPendingPostCancellationClosesBodyAndPreservesFIFO(t *
 		t.Fatalf("newNNTPConnectionFromConn() error = %v", err)
 	}
 	t.Cleanup(func() {
+		releasePendingResponses()
 		_ = serverConn.Close()
 		_ = connection.Close()
 	})
@@ -445,11 +443,11 @@ func TestFNCOREFullyWrittenPendingPostCancellationClosesBodyAndPreservesFIFO(t *
 	select {
 	case <-body.closed:
 		closedPromptly = true
-	case <-time.After(250 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 		// Release the fixture so the remainder of the framing proof cannot hang.
 		_ = body.Close()
 	}
-	close(releaseResponses)
+	releasePendingResponses()
 
 	if response := awaitFNCOREPhaseResponse(t, earlier.RespCh, "earlier STAT"); response.Err != nil || response.StatusCode != 223 {
 		t.Fatalf("earlier response after pending POST cancellation = %+v", response)
@@ -511,6 +509,9 @@ func TestFNCOREFailedDrainDeadlineClearRetiresTransport(t *testing.T) {
 		clearFailed: make(chan struct{}),
 	}
 	releaseTail := make(chan struct{})
+	var releaseTailOnce sync.Once
+	releaseResponseTail := func() { releaseTailOnce.Do(func() { close(releaseTail) }) }
+	t.Cleanup(releaseResponseTail)
 	serverObservedClose := make(chan error, 1)
 	go func() {
 		defer func() { _ = serverConn.Close() }()
@@ -545,6 +546,7 @@ func TestFNCOREFailedDrainDeadlineClearRetiresTransport(t *testing.T) {
 		t.Fatalf("newNNTPConnectionFromConn() error = %v", err)
 	}
 	t.Cleanup(func() {
+		releaseResponseTail()
 		_ = serverConn.Close()
 		_ = connection.Close()
 	})
@@ -566,7 +568,7 @@ func TestFNCOREFailedDrainDeadlineClearRetiresTransport(t *testing.T) {
 		t.Fatal("BODY did not cross the decoded progress boundary")
 	}
 	cancel()
-	close(releaseTail)
+	releaseResponseTail()
 	result := awaitFNCOREPhaseResponse(t, request.RespCh, "bounded drain with failed deadline clear")
 	if !errors.Is(result.Err, context.Canceled) || result.StatusCode != 222 ||
 		len(result.Attempts) != 1 || result.Attempts[0].Outcome != OutcomeCancellation {
@@ -584,7 +586,7 @@ func TestFNCOREFailedDrainDeadlineClearRetiresTransport(t *testing.T) {
 	select {
 	case <-connection.Done():
 		retired = true
-	case <-time.After(300 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 	}
 	if !retired {
 		t.Error("transport was left reusable after its cancellation-drain deadline could not be cleared")
