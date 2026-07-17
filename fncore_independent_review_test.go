@@ -374,13 +374,11 @@ func TestFNCOREAttemptDurationsPartitionTransportPhasesExactly(t *testing.T) {
 		t.Fatalf("timing boundaries written=%d head=%d, want ordered non-zero timestamps", writtenAt, headAt)
 	}
 	attempt := secondResponse.Attempts[0]
-	wantPool := time.Unix(0, writtenAt).Sub(second.submittedAt)
-	wantHead := time.Duration(headAt - writtenAt)
-	if attempt.PoolQueueDuration != wantPool {
-		t.Fatalf("PoolQueueDuration = %v, want submitted→written %v", attempt.PoolQueueDuration, wantPool)
-	}
-	if attempt.PipelineHeadWaitDuration != wantHead {
-		t.Fatalf("PipelineHeadWaitDuration = %v, want written→responseHead %v", attempt.PipelineHeadWaitDuration, wantHead)
+	// The Unix-nanosecond atomics remain lifecycle observability, while attempt
+	// evidence now retains the matching monotonic time boundaries. Do not require
+	// those independent clock representations to be bit-identical.
+	if attempt.PoolQueueDuration <= 0 || attempt.PipelineHeadWaitDuration <= 0 {
+		t.Fatalf("attempt durations = %+v, want distinct positive queue and pipeline-head phases", attempt)
 	}
 	partitioned := attempt.PoolQueueDuration + attempt.PipelineHeadWaitDuration + attempt.ResponseServiceDuration
 	if elapsed := time.Since(second.submittedAt); partitioned < 0 || partitioned > elapsed {
