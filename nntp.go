@@ -749,6 +749,10 @@ func normalizeRequestReadError(req *Request, owner readDeadlineOwner, err error)
 	req.recordDeadlineOwner(owner)
 	switch owner {
 	case readDeadlineCaller:
+		var networkError net.Error
+		if !errors.As(err, &networkError) || !networkError.Timeout() {
+			return err
+		}
 		req.recordCause(context.DeadlineExceeded)
 		return context.DeadlineExceeded
 	case readDeadlineAbandonedDrain:
