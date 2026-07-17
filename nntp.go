@@ -125,6 +125,18 @@ const (
 	attemptCommitted                 // decoded bytes crossed the output boundary
 )
 
+type requestPhase uint8
+
+const (
+	requestQueued requestPhase = iota
+	requestOwnedWriting
+	requestFIFOPending
+	requestResponseActive
+	requestSettling
+	requestSettled
+	requestStoppedBeforeTransport
+)
+
 type greetingError struct {
 	StatusCode int
 	Message    string
@@ -169,7 +181,8 @@ type Request struct {
 
 	// PayloadBody is an optional reader streamed to the connection after Payload.
 	// Used by POST to stream article content without buffering in memory.
-	PayloadBody io.Reader
+	PayloadBody  io.Reader
+	closePayload func()
 
 	// PostMode signals readerLoop to expect two NNTP responses (340 + 240/441).
 	PostMode bool
@@ -178,6 +191,8 @@ type Request struct {
 	// sends nil after reading 340 (proceed to write body) or a non-nil error
 	// otherwise (e.g. 440 posting not allowed). Buffered with capacity 1.
 	postReadyCh chan error
+	// postWriteDone starts the final-response clock after the body flushes.
+	postWriteDone chan struct{}
 
 	// responseTimeout starts only when this request becomes FIFO response head.
 	// Pool queue and pipeline-head wait remain governed solely by the caller ctx.
@@ -187,10 +202,27 @@ type Request struct {
 	// Decoded output advances responseHead→committed. Zero is attemptPending.
 	attemptState atomic.Int32
 
-	// decodedCommitted protects the v4 caller-writer contract independently of
-	// response timing: after any decoded byte crosses the writer boundary, the
-	// request must never restart on another provider.
-	decodedCommitted atomic.Bool
+	// lifecycleMu is the sole authority for request ownership, cancellation,
+	// caller-writer commitment, response progress, and final cause.
+	lifecycleMu      sync.Mutex
+	phase            requestPhase
+	lifecycleCause   error
+	finalCause       error
+	localWriterError error
+	transportOwned   bool
+	writerCommitted  bool
+	writerActive     bool
+	responseProgress bool
+	drainRequired    bool
+	deadlineOwner    readDeadlineOwner
+	transportCause   func() error
+
+	watchStop     chan struct{}
+	watchDone     chan struct{}
+	settledDone   chan struct{}
+	bodyCloseOnce sync.Once
+	responseOnce  sync.Once
+	capacityOnce  sync.Once
 
 	// submittedAt, writtenAt, and responseHeadAt delimit the three transport
 	// timing components exposed in AttemptEvidence.
@@ -201,6 +233,7 @@ type Request struct {
 	// heldBody is set by writeLoop when this (body-bearing) request acquired a
 	// bodySem slot, so readerLoop releases exactly the slots that were taken.
 	// Bodyless STAT requests never acquire bodySem and leave this false.
+	heldInflight       bool
 	heldBody           bool
 	heldBackgroundStat bool
 	heldPipeline       bool
@@ -279,6 +312,9 @@ type NNTPConnection struct {
 	done   chan struct{}
 	doneMu sync.Once
 
+	connCloseOnce sync.Once
+	connCloseErr  error
+
 	failMu sync.Mutex
 }
 
@@ -342,12 +378,12 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 	}
 	cctx, cancel := context.WithCancel(ctx)
 
-	var rb readBuffer
+	var readBuf []byte
 	if sharedBuf != nil && len(sharedBuf.buf) > 0 {
 		// Reuse the buffer from a previous connection, reset read positions and deadline cache.
-		rb = readBuffer{buf: sharedBuf.buf}
+		readBuf = sharedBuf.buf
 	} else {
-		rb = readBuffer{buf: make([]byte, defaultReadBufSize)}
+		readBuf = make([]byte, defaultReadBufSize)
 	}
 
 	c := &NNTPConnection{
@@ -364,7 +400,7 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 		bodySem:               make(chan struct{}, inflightLimit),
 		backgroundStatSem:     make(chan struct{}, inflightLimit),
 		backgroundStatFreed:   make(chan struct{}, 1),
-		rb:                    rb,
+		rb:                    readBuffer{buf: readBuf},
 		stats:                 stats,
 		done:                  make(chan struct{}),
 		userAgent:             userAgent,
@@ -478,22 +514,286 @@ func keepaliveExpectedCode(cmd string) int {
 	}
 }
 
-// statCmdPrefix identifies STAT commands, the only bodyless request the pool
-// issues through the normal write path (keepalive DATE has its own path). STAT
-// has a single-line reply and no payload, so it may pipeline to the deeper
-// StatInflight depth without acquiring a bodySem slot.
-var statCmdPrefix = []byte("STAT ")
-var bodyCmdPrefix = []byte("BODY ")
-
 // isCheapCommand reports whether payload is a bodyless command that should
 // bypass the BODY concurrency bound (bodySem) and pipeline to the full
 // inflightSem (StatInflight) depth.
 func isCheapCommand(payload []byte) bool {
-	return bytes.HasPrefix(payload, statCmdPrefix)
+	return operationFromPayload(payload) == OperationStat
 }
 
-func isBodyCommand(payload []byte) bool {
-	return bytes.HasPrefix(payload, bodyCmdPrefix)
+func isStreamingCommand(payload []byte) bool {
+	op := operationFromPayload(payload)
+	return op == OperationBody || op == operationArticle
+}
+
+func (req *Request) closePayloadBody() {
+	req.bodyCloseOnce.Do(func() {
+		if req.closePayload != nil {
+			req.closePayload()
+			return
+		}
+		if closer, ok := req.PayloadBody.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	})
+}
+
+func (req *Request) noteCauseLocked(cause error) error {
+	if req.lifecycleCause == nil {
+		if cause == nil && req.Ctx != nil {
+			cause = req.Ctx.Err()
+		}
+		if cause == nil && req.transportCause != nil {
+			cause = req.transportCause()
+		}
+		if cause != nil {
+			req.lifecycleCause = cause
+		}
+	}
+	return req.lifecycleCause
+}
+
+func (req *Request) stopBeforeTransport(cause error) bool {
+	req.lifecycleMu.Lock()
+	_ = req.noteCauseLocked(cause)
+	if req.phase != requestQueued {
+		req.lifecycleMu.Unlock()
+		return false
+	}
+	req.phase = requestStoppedBeforeTransport
+	req.lifecycleMu.Unlock()
+	if errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
+		req.closePayloadBody()
+	}
+	return true
+}
+
+func (req *Request) claimTransport() bool {
+	req.lifecycleMu.Lock()
+	if req.Ctx != nil && req.Ctx.Err() != nil {
+		_ = req.noteCauseLocked(req.Ctx.Err())
+	}
+	if req.phase != requestQueued || req.lifecycleCause != nil {
+		if req.phase == requestQueued {
+			req.phase = requestStoppedBeforeTransport
+		}
+		cause := req.lifecycleCause
+		req.lifecycleMu.Unlock()
+		if errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
+			req.closePayloadBody()
+		}
+		return false
+	}
+	req.phase = requestOwnedWriting
+	req.transportOwned = true
+	req.lifecycleMu.Unlock()
+	return true
+}
+
+func (req *Request) markPending() {
+	req.lifecycleMu.Lock()
+	req.phase = requestFIFOPending
+	req.lifecycleMu.Unlock()
+}
+
+func (req *Request) beginResponse() (cancelled bool) {
+	req.lifecycleMu.Lock()
+	req.phase = requestResponseActive
+	cancelled = req.noteCauseLocked(nil) != nil
+	if cancelled {
+		req.drainRequired = true
+	}
+	req.lifecycleMu.Unlock()
+	req.attemptState.CompareAndSwap(attemptPending, attemptResponseHead)
+	return cancelled
+}
+
+func (req *Request) startWatch(c *NNTPConnection) {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	req.watchStop, req.watchDone = stop, done
+	go func() {
+		defer close(done)
+		select {
+		case <-req.Ctx.Done():
+			req.cancelOwned(c, req.Ctx.Err())
+		case <-c.ctx.Done():
+			cause := error(ErrConnectionDied)
+			if req.transportCause != nil {
+				cause = req.transportCause()
+			}
+			req.cancelOwned(c, cause)
+		case <-stop:
+		}
+	}()
+}
+
+func (req *Request) cancelOwned(c *NNTPConnection, cause error) {
+	req.lifecycleMu.Lock()
+	_ = req.noteCauseLocked(cause)
+	retire := false
+	forceDrain := false
+	switch req.phase {
+	case requestOwnedWriting:
+		retire = true
+	case requestFIFOPending:
+	case requestResponseActive:
+		if req.drainRequired {
+			break
+		} else if isStreamingCommand(req.Payload) && req.responseProgress && !req.writerActive {
+			req.drainRequired = true
+			forceDrain = true
+		} else {
+			retire = true
+		}
+	}
+	req.lifecycleMu.Unlock()
+	if forceDrain {
+		if c.abandonedDrainTimeout <= 0 ||
+			c.rb.forceDrainDeadline(c.conn, time.Now().Add(c.abandonedDrainTimeout)) != nil {
+			retire = true
+		}
+	}
+	if retire {
+		_ = c.closeTransport()
+	}
+	req.closePayloadBody()
+}
+
+func (req *Request) joinWatch() {
+	stop, done := req.watchStop, req.watchDone
+	if stop == nil {
+		return
+	}
+	close(stop)
+	<-done
+}
+
+func (req *Request) recordDeadlineOwner(owner readDeadlineOwner) {
+	req.lifecycleMu.Lock()
+	req.deadlineOwner = owner
+	req.lifecycleMu.Unlock()
+}
+
+func (req *Request) deadlineCauseIsCaller() bool {
+	req.lifecycleMu.Lock()
+	defer req.lifecycleMu.Unlock()
+	if req.deadlineOwner != readDeadlineNone {
+		return req.deadlineOwner == readDeadlineCaller
+	}
+	return req.Ctx != nil && errors.Is(req.Ctx.Err(), context.DeadlineExceeded)
+}
+
+func (req *Request) providerDeadlineExpired(cause error) bool {
+	req.lifecycleMu.Lock()
+	owner := req.deadlineOwner
+	req.lifecycleMu.Unlock()
+	var networkError net.Error
+	return owner == readDeadlineProviderResponse &&
+		errors.As(cause, &networkError) && networkError.Timeout()
+}
+
+func (req *Request) finalize(cause error) error {
+	req.lifecycleMu.Lock()
+	if req.phase == requestSettling {
+		done := req.settledDone
+		req.lifecycleMu.Unlock()
+		<-done
+		req.lifecycleMu.Lock()
+		final := req.finalCause
+		req.lifecycleMu.Unlock()
+		return final
+	}
+	if req.phase == requestSettled {
+		final := req.finalCause
+		req.lifecycleMu.Unlock()
+		return final
+	}
+	providerTimeout := req.providerDeadlineExpiredLocked(cause)
+	_ = req.noteCauseLocked(nil)
+	switch {
+	case req.localWriterError != nil:
+		req.finalCause = req.localWriterError
+	case providerTimeout && errors.Is(req.lifecycleCause, context.DeadlineExceeded):
+		req.finalCause = cause
+	case req.lifecycleCause != nil:
+		req.finalCause = req.lifecycleCause
+	default:
+		req.finalCause = cause
+	}
+	if req.settledDone == nil {
+		req.settledDone = make(chan struct{})
+	}
+	req.phase = requestSettling
+	done := req.settledDone
+	final := req.finalCause
+	req.lifecycleMu.Unlock()
+	req.joinWatch()
+	req.lifecycleMu.Lock()
+	req.phase = requestSettled
+	close(done)
+	req.lifecycleMu.Unlock()
+	return final
+}
+
+func (req *Request) providerDeadlineExpiredLocked(cause error) bool {
+	var networkError net.Error
+	return (req.deadlineOwner == readDeadlineProviderResponse || req.deadlineOwner == readDeadlineProviderStall) &&
+		errors.As(cause, &networkError) && networkError.Timeout()
+}
+
+func normalizeRequestReadError(req *Request, owner readDeadlineOwner, err error) error {
+	if err == nil {
+		return nil
+	}
+	req.recordDeadlineOwner(owner)
+	switch owner {
+	case readDeadlineCaller:
+		var networkError net.Error
+		if !errors.As(err, &networkError) || !networkError.Timeout() {
+			return err
+		}
+		req.recordCause(context.DeadlineExceeded)
+		return context.DeadlineExceeded
+	case readDeadlineAbandonedDrain:
+		return errAbandonedBodyDrainLimit
+	default:
+		return err
+	}
+}
+
+func (req *Request) committed() bool {
+	req.lifecycleMu.Lock()
+	defer req.lifecycleMu.Unlock()
+	return req.transportOwned && (req.writerCommitted || operationFromPayload(req.Payload) == OperationPost)
+}
+
+func (req *Request) stoppedPretransport() bool {
+	req.lifecycleMu.Lock()
+	defer req.lifecycleMu.Unlock()
+	return !req.transportOwned &&
+		(req.phase == requestStoppedBeforeTransport || req.phase == requestSettling || req.phase == requestSettled)
+}
+
+func (req *Request) needsDrainClear() bool {
+	req.lifecycleMu.Lock()
+	defer req.lifecycleMu.Unlock()
+	return req.drainRequired
+}
+
+func deliverRequestResponse(req *Request, providerID string, resp Response) {
+	req.responseOnce.Do(func() {
+		resp.Request = req
+		if resp.ProviderID == "" {
+			resp.ProviderID = providerID
+		}
+		defer func() { _ = recover() }()
+		select {
+		case req.RespCh <- resp:
+		default:
+		}
+		close(req.RespCh)
+	})
 }
 
 func failRequest(ch chan Response, err error) {
@@ -503,6 +803,20 @@ func failRequest(ch chan Response, err error) {
 	default:
 	}
 	close(ch)
+}
+
+func finishUnadmittedRequest(req *Request, providerID string, cause error) {
+	if req.Ctx == nil {
+		req.Ctx = context.Background()
+	}
+	if !req.stoppedPretransport() {
+		req.stopBeforeTransport(cause)
+	}
+	resp := Response{Err: req.finalize(cause), Request: req, ProviderID: providerID}
+	if !errors.Is(resp.Err, errFreshTransportRequired) {
+		resp.Attempts = []AttemptEvidence{buildAttemptEvidence(req, providerID, resp, time.Now())}
+	}
+	deliverRequestResponse(req, providerID, resp)
 }
 
 func (c *NNTPConnection) failOutstanding() {
@@ -518,12 +832,9 @@ func (c *NNTPConnection) failOutstanding() {
 			if req == nil {
 				continue
 			}
-			c.releaseRequestPending(req)
-			failRequest(req.RespCh, connErr)
-			select {
-			case <-c.inflightSem:
-			default:
-			}
+			resp := Response{Err: req.finalize(connErr), Request: req, ProviderID: c.providerID}
+			resp.Attempts = []AttemptEvidence{buildAttemptEvidence(req, c.providerID, resp, time.Now())}
+			c.completeFinalizedRequest(req, resp)
 		default:
 			return
 		}
@@ -531,10 +842,15 @@ func (c *NNTPConnection) failOutstanding() {
 }
 
 func (c *NNTPConnection) Close() error {
-	c.cancel()
-	_ = c.conn.Close()
+	_ = c.closeTransport()
 	<-c.done
 	return nil
+}
+
+func (c *NNTPConnection) closeTransport() error {
+	c.cancel()
+	c.connCloseOnce.Do(func() { c.connCloseErr = c.conn.Close() })
+	return c.connCloseErr
 }
 
 // waitForInflightDrain acquires all semaphore slots, blocking until each
@@ -701,7 +1017,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 			select {
 			case priorityReq, priorityOK := <-prioCh:
 				if !priorityOK {
-					failRequest(firstReq.RespCh, ctx.Err())
+					finishUnadmittedRequest(firstReq, providerID, ctx.Err())
 					return
 				}
 				secondReq = firstReq
@@ -727,7 +1043,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 					select {
 					case priorityReq, priorityOK := <-prioCh:
 						if !priorityOK {
-							failRequest(firstReq.RespCh, ctx.Err())
+							finishUnadmittedRequest(firstReq, providerID, ctx.Err())
 							return
 						}
 						secondReq = firstReq
@@ -743,7 +1059,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		// Check if the request is already cancelled.
 		select {
 		case <-firstReq.Ctx.Done():
-			failRequest(firstReq.RespCh, firstReq.Ctx.Err())
+			finishUnadmittedRequest(firstReq, providerID, firstReq.Ctx.Err())
 			carriedReq = secondReq
 			continue
 		default:
@@ -752,7 +1068,11 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		// GATE: block if we're at the throttled capacity limit.
 		if !gate.enter(ctx, firstReq.Ctx) {
 			// Slot or request context cancelled while waiting at the gate.
-			failRequest(firstReq.RespCh, context.Canceled)
+			cause := error(context.Canceled)
+			if firstReq.Ctx.Err() != nil {
+				cause = firstReq.Ctx.Err()
+			}
+			finishUnadmittedRequest(firstReq, providerID, cause)
 			carriedReq = secondReq
 			continue
 		}
@@ -761,7 +1081,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		conn, err := factory(ctx)
 		if err != nil {
 			gate.exit()
-			failRequest(firstReq.RespCh, fmt.Errorf("%s: %w", providerName, err))
+			finishUnadmittedRequest(firstReq, providerID, fmt.Errorf("%s: %w", providerName, err))
 			carriedReq = secondReq
 			// Backoff before retrying to avoid thrashing.
 			select {
@@ -778,7 +1098,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		nc, err := newNNTPConnectionFromConn(ctx, conn, statInflight, reqCh, prioCh, auth, userAgent, &sharedBuf, stats)
 		if err != nil {
 			_ = conn.Close()
-			failRequest(firstReq.RespCh, fmt.Errorf("%s: %w", providerName, err))
+			finishUnadmittedRequest(firstReq, providerID, fmt.Errorf("%s: %w", providerName, err))
 			carriedReq = secondReq
 
 			if errors.Is(err, ErrMaxConnections) {
@@ -848,9 +1168,26 @@ type attemptWriter struct {
 	w   io.Writer
 }
 
+type callerWriterError struct{ cause error }
+
+func (e *callerWriterError) Error() string {
+	if e == nil || e.cause == nil {
+		return "nntp: caller writer failure"
+	}
+	return e.cause.Error()
+}
+
+func (e *callerWriterError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
 func markRequestWritten(req *Request) {
 	now := time.Now().UnixNano()
 	req.writtenAt.Store(now)
+	req.markPending()
 }
 
 func (c *NNTPConnection) acquireBackgroundStat(req *Request) error {
@@ -884,14 +1221,17 @@ func (c *NNTPConnection) releaseBackgroundStat(req *Request) {
 	}
 }
 
-func (c *NNTPConnection) markRequestPending(req *Request) {
+func (c *NNTPConnection) reservePipelineOccupancy(req *Request) {
+	if req.heldPipeline {
+		return
+	}
 	req.heldPipeline = true
 	if c.stats != nil {
 		c.stats.PipelineInUse.Add(1)
 	}
 }
 
-func (c *NNTPConnection) releaseRequestPending(req *Request) {
+func (c *NNTPConnection) releasePipelineOccupancy(req *Request) {
 	c.releaseBackgroundStat(req)
 	if req.heldPipeline && c.stats != nil {
 		c.stats.PipelineInUse.Add(-1)
@@ -899,34 +1239,205 @@ func (c *NNTPConnection) releaseRequestPending(req *Request) {
 	req.heldPipeline = false
 }
 
-func (w *attemptWriter) Write(p []byte) (int, error) {
-	if len(p) > 0 {
-		// Mark before entering a potentially blocking writer. Once decoded bytes
-		// cross this boundary, cancellation cannot safely restart the request.
-		w.req.decodedCommitted.Store(true)
-		w.req.attemptState.CompareAndSwap(attemptResponseHead, attemptCommitted)
+func (c *NNTPConnection) releaseAdmittedRequest(req *Request) {
+	req.capacityOnce.Do(func() {
+		c.releasePipelineOccupancy(req)
+		if req.heldBody {
+			<-c.bodySem
+			req.heldBody = false
+		}
+		if req.heldInflight {
+			<-c.inflightSem
+			req.heldInflight = false
+		}
+	})
+}
+
+func (c *NNTPConnection) completeFinalizedRequest(req *Request, resp Response) {
+	if req.needsDrainClear() {
+		if err := c.rb.clearDrainDeadline(c.conn); err != nil {
+			_ = c.closeTransport()
+			c.failOutstanding()
+		}
 	}
-	return w.w.Write(p)
+	req.closePayloadBody()
+	c.releaseAdmittedRequest(req)
+	deliverRequestResponse(req, c.providerID, resp)
+}
+
+func (c *NNTPConnection) waitForInflightSettlement() bool {
+	acquired := 0
+	defer func() {
+		for range acquired {
+			<-c.inflightSem
+		}
+	}()
+	for acquired < cap(c.inflightSem) {
+		select {
+		case c.inflightSem <- struct{}{}:
+			acquired++
+		case <-c.ctx.Done():
+			return false
+		}
+	}
+	return true
+}
+
+func (w *attemptWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	w.req.lifecycleMu.Lock()
+	if cause := w.req.noteCauseLocked(nil); cause != nil {
+		w.req.lifecycleMu.Unlock()
+		return 0, cause
+	}
+	w.req.writerCommitted = true
+	w.req.writerActive = true
+	w.req.responseProgress = true
+	w.req.attemptState.CompareAndSwap(attemptResponseHead, attemptCommitted)
+	w.req.lifecycleMu.Unlock()
+
+	n, err := w.w.Write(p)
+	switch {
+	case n < 0:
+		n = 0
+		if err == nil {
+			err = errors.New("nntp: caller writer returned a negative byte count")
+		}
+	case n > len(p):
+		n = len(p)
+		if err == nil {
+			err = errors.New("nntp: caller writer returned an excessive byte count")
+		}
+	case n < len(p) && err == nil:
+		err = io.ErrShortWrite
+	}
+
+	w.req.lifecycleMu.Lock()
+	w.req.writerActive = false
+	if err != nil {
+		local := &callerWriterError{cause: err}
+		if w.req.localWriterError == nil {
+			w.req.localWriterError = local
+		}
+		w.req.lifecycleMu.Unlock()
+		return n, local
+	}
+	cause := w.req.noteCauseLocked(nil)
+	if cause != nil && isStreamingCommand(w.req.Payload) {
+		w.req.drainRequired = true
+		w.req.lifecycleMu.Unlock()
+		return n, nil
+	}
+	w.req.lifecycleMu.Unlock()
+	return n, cause
+}
+
+func (req *Request) currentCause() error {
+	req.lifecycleMu.Lock()
+	defer req.lifecycleMu.Unlock()
+	return req.noteCauseLocked(nil)
+}
+
+func (req *Request) recordCause(cause error) {
+	req.lifecycleMu.Lock()
+	_ = req.noteCauseLocked(cause)
+	req.lifecycleMu.Unlock()
+}
+
+func (c *NNTPConnection) retireBeforeResponse(req *Request, cause error) {
+	req.recordCause(cause)
+	_ = c.closeTransport()
+	req.closePayloadBody()
+	resp := Response{Err: req.finalize(cause), Request: req, ProviderID: c.providerID}
+	resp.Attempts = []AttemptEvidence{buildAttemptEvidence(req, c.providerID, resp, time.Now())}
+	c.completeFinalizedRequest(req, resp)
+}
+
+func (c *NNTPConnection) writeAdmitted(bw *bufio.Writer, req *Request) bool {
+	if !req.claimTransport() {
+		c.releaseAdmittedRequest(req)
+		finishUnadmittedRequest(req, c.providerID, req.currentCause())
+		return false
+	}
+	req.startWatch(c)
+	c.reservePipelineOccupancy(req)
+
+	if _, err := bw.Write(req.Payload); err != nil {
+		c.retireBeforeResponse(req, err)
+		return true
+	}
+	if err := bw.Flush(); err != nil {
+		c.retireBeforeResponse(req, err)
+		return true
+	}
+	markRequestWritten(req)
+	if req.PostMode {
+		req.postReadyCh = make(chan error, 1)
+		req.postWriteDone = make(chan struct{})
+	}
+	c.pending <- req
+	if !req.PostMode {
+		return false
+	}
+
+	var postErr error
+	select {
+	case postErr = <-req.postReadyCh:
+	case <-c.ctx.Done():
+		_ = c.closeTransport()
+		close(req.postWriteDone)
+		return true
+	}
+	if postErr != nil {
+		close(req.postWriteDone)
+		return false
+	}
+	if cause := req.currentCause(); cause != nil {
+		_ = c.closeTransport()
+		close(req.postWriteDone)
+		return true
+	}
+	if req.PayloadBody != nil {
+		if _, err := io.Copy(bw, req.PayloadBody); err != nil {
+			req.recordCause(err)
+			_ = c.closeTransport()
+			close(req.postWriteDone)
+			return true
+		}
+	}
+	if err := bw.Flush(); err != nil {
+		req.recordCause(err)
+		_ = c.closeTransport()
+		close(req.postWriteDone)
+		return true
+	}
+	close(req.postWriteDone)
+	return false
 }
 
 func (c *NNTPConnection) Run() {
 	var unsent *Request
 	deferredNormal := c.secondReq
 	c.secondReq = nil
+	readerDone := make(chan struct{})
 	defer func() {
+		_ = c.closeTransport()
+		c.failOutstanding()
 		if unsent != nil {
-			failRequest(unsent.RespCh, ErrConnectionDied)
+			c.releaseAdmittedRequest(unsent)
+			finishUnadmittedRequest(unsent, c.providerID, ErrConnectionDied)
 		}
 		if deferredNormal != nil {
-			failRequest(deferredNormal.RespCh, ErrConnectionDied)
+			finishUnadmittedRequest(deferredNormal, c.providerID, ErrConnectionDied)
 		}
-		c.cancel()
-		_ = c.conn.Close()
-		c.failOutstanding()
+		<-readerDone
 		c.closeDone()
 	}()
 
 	go func() {
+		defer close(readerDone)
 		c.readerLoop()
 		// ensure writer exits too
 		c.cancel()
@@ -965,14 +1476,16 @@ func (c *NNTPConnection) Run() {
 			req.Ctx = context.Background()
 		}
 		if req.FreshTransport && c.createdAt.Before(req.submittedAt) {
-			failRequest(req.RespCh, errFreshTransportRequired)
+			unsent = nil
+			finishUnadmittedRequest(req, c.providerID, errFreshTransportRequired)
 			return
 		}
 
 		// Check cancellation.
 		select {
 		case <-req.Ctx.Done():
-			failRequest(req.RespCh, req.Ctx.Err())
+			unsent = nil
+			finishUnadmittedRequest(req, c.providerID, req.Ctx.Err())
 			// Connection is still good — fall through to main loop.
 			goto mainLoop
 		default:
@@ -981,8 +1494,8 @@ func (c *NNTPConnection) Run() {
 		// Acquire inflight slot.
 		select {
 		case c.inflightSem <- struct{}{}:
+			req.heldInflight = true
 		case <-c.ctx.Done():
-			failRequest(req.RespCh, c.ctx.Err())
 			return
 		}
 
@@ -994,87 +1507,27 @@ func (c *NNTPConnection) Run() {
 			case c.bodySem <- struct{}{}:
 				req.heldBody = true
 			case <-req.Ctx.Done():
-				<-c.inflightSem
-				failRequest(req.RespCh, req.Ctx.Err())
+				unsent = nil
+				c.releaseAdmittedRequest(req)
+				finishUnadmittedRequest(req, c.providerID, req.Ctx.Err())
 				goto mainLoop // connection still good
 			case <-c.ctx.Done():
-				<-c.inflightSem
-				failRequest(req.RespCh, c.ctx.Err())
 				return
 			}
 		}
 		if err := c.acquireBackgroundStat(req); err != nil {
-			<-c.inflightSem
-			if req.heldBody {
-				<-c.bodySem
-			}
-			failRequest(req.RespCh, err)
+			unsent = nil
+			c.releaseAdmittedRequest(req)
+			finishUnadmittedRequest(req, c.providerID, err)
 			goto mainLoop
 		}
 
 		dl, hasDL := req.writeDeadline()
 		setWriteDeadline(dl, hasDL)
 
-		if _, err := bw.Write(req.Payload); err != nil {
-			<-c.inflightSem
-			c.releaseBackgroundStat(req)
-			failRequest(req.RespCh, err)
-			_ = c.conn.Close()
-			c.failOutstanding()
+		unsent = nil
+		if c.writeAdmitted(bw, req) {
 			return
-		}
-		if req.PostMode {
-			// Two-phase POST: flush "POST\r\n" immediately so the server can
-			// respond with 340/440 before we send the article body.
-			if err := bw.Flush(); err != nil {
-				<-c.inflightSem
-				failRequest(req.RespCh, err)
-				_ = c.conn.Close()
-				c.failOutstanding()
-				return
-			}
-			req.postReadyCh = make(chan error, 1)
-			c.markRequestPending(req)
-			c.pending <- req
-			unsent = nil
-			// Block here — no other request can be written while we wait.
-			select {
-			case postErr := <-req.postReadyCh:
-				if postErr != nil {
-					// 440 or error: drain body to unblock the pipe-writer goroutine.
-					if req.PayloadBody != nil {
-						_, _ = io.Copy(io.Discard, req.PayloadBody)
-					}
-					goto mainLoop
-				}
-			case <-c.ctx.Done():
-				if req.PayloadBody != nil {
-					_, _ = io.Copy(io.Discard, req.PayloadBody)
-				}
-				return
-			}
-			// 340 received: send the article body.
-			if req.PayloadBody != nil {
-				if _, err := io.Copy(bw, req.PayloadBody); err != nil {
-					_ = c.conn.Close()
-					c.failOutstanding()
-					return
-				}
-			}
-		} else {
-			if req.PayloadBody != nil {
-				if _, err := io.Copy(bw, req.PayloadBody); err != nil {
-					<-c.inflightSem
-					failRequest(req.RespCh, err)
-					_ = c.conn.Close()
-					c.failOutstanding()
-					return
-				}
-			}
-			markRequestWritten(req)
-			c.markRequestPending(req)
-			c.pending <- req
-			unsent = nil
 		}
 	}
 
@@ -1239,21 +1692,14 @@ mainLoop:
 				RespCh:  kaCh,
 				Ctx:     context.Background(),
 			}
-			if _, err := bw.Write(kaReq.Payload); err != nil {
-				_ = c.conn.Close()
-				c.failOutstanding()
+			kaReq.heldInflight = true
+			if c.writeAdmitted(bw, kaReq) {
 				return
 			}
-			if err := bw.Flush(); err != nil {
-				_ = c.conn.Close()
-				c.failOutstanding()
-				return
-			}
-			c.pending <- kaReq
 			select {
 			case resp := <-kaCh:
 				if resp.Err != nil || resp.StatusCode != keepaliveExpectedCode(c.keepaliveCommand) {
-					_ = c.conn.Close()
+					_ = c.closeTransport()
 					c.failOutstanding()
 					return
 				}
@@ -1270,6 +1716,7 @@ mainLoop:
 		if req.Ctx == nil {
 			req.Ctx = context.Background()
 		}
+		req.heldInflight = true
 
 		// Reset idle timer since we got a request.
 		if idleTimer != nil {
@@ -1285,14 +1732,17 @@ mainLoop:
 		// Cancel before sending (queued-but-not-sent case)
 		select {
 		case <-req.Ctx.Done():
-			<-c.inflightSem
-			failRequest(req.RespCh, req.Ctx.Err())
+			unsent = nil
+			c.releaseAdmittedRequest(req)
+			finishUnadmittedRequest(req, c.providerID, req.Ctx.Err())
 			continue
 		default:
 		}
 		if req.FreshTransport && c.createdAt.Before(req.submittedAt) {
-			<-c.inflightSem
-			failRequest(req.RespCh, errFreshTransportRequired)
+			unsent = nil
+			c.releaseAdmittedRequest(req)
+			finishUnadmittedRequest(req, c.providerID, errFreshTransportRequired)
+			_ = c.waitForInflightSettlement()
 			return
 		}
 
@@ -1304,25 +1754,25 @@ mainLoop:
 			case c.bodySem <- struct{}{}:
 				req.heldBody = true
 			case <-req.Ctx.Done():
-				<-c.inflightSem
-				failRequest(req.RespCh, req.Ctx.Err())
+				unsent = nil
+				c.releaseAdmittedRequest(req)
+				finishUnadmittedRequest(req, c.providerID, req.Ctx.Err())
 				continue
 			case <-c.ctx.Done():
-				<-c.inflightSem
 				return
 			}
 		}
 		if err := c.acquireBackgroundStat(req); err != nil {
-			<-c.inflightSem
-			if req.heldBody {
-				<-c.bodySem
-			}
 			if errors.Is(err, errBackgroundStatWindowFull) {
+				<-c.inflightSem
+				req.heldInflight = false
 				deferredNormal = req
 				unsent = nil
 				continue
 			}
-			failRequest(req.RespCh, err)
+			unsent = nil
+			c.releaseAdmittedRequest(req)
+			finishUnadmittedRequest(req, c.providerID, err)
 			continue
 		}
 
@@ -1330,68 +1780,9 @@ mainLoop:
 		dl, hasDL := req.writeDeadline()
 		setWriteDeadline(dl, hasDL)
 
-		// pipeline write (buffered; flushed at top of loop before blocking)
-		if _, err := bw.Write(req.Payload); err != nil {
-			<-c.inflightSem
-			c.releaseBackgroundStat(req)
-			failRequest(req.RespCh, err)
-			_ = c.conn.Close()
-			c.failOutstanding()
+		unsent = nil
+		if c.writeAdmitted(bw, req) {
 			return
-		}
-		if req.PostMode {
-			// Two-phase POST: flush "POST\r\n" immediately so the server can
-			// respond with 340/440 before we send the article body. Blocking
-			// here also prevents pipelining other requests during POST.
-			if err := bw.Flush(); err != nil {
-				<-c.inflightSem
-				failRequest(req.RespCh, err)
-				_ = c.conn.Close()
-				c.failOutstanding()
-				return
-			}
-			req.postReadyCh = make(chan error, 1)
-			c.markRequestPending(req)
-			c.pending <- req
-			unsent = nil
-			select {
-			case postErr := <-req.postReadyCh:
-				if postErr != nil {
-					// 440 or error: drain body to unblock the pipe-writer goroutine.
-					if req.PayloadBody != nil {
-						_, _ = io.Copy(io.Discard, req.PayloadBody)
-					}
-					continue
-				}
-			case <-c.ctx.Done():
-				if req.PayloadBody != nil {
-					_, _ = io.Copy(io.Discard, req.PayloadBody)
-				}
-				return
-			}
-			// 340 received: send the article body.
-			if req.PayloadBody != nil {
-				if _, err := io.Copy(bw, req.PayloadBody); err != nil {
-					_ = c.conn.Close()
-					c.failOutstanding()
-					return
-				}
-			}
-		} else {
-			if req.PayloadBody != nil {
-				if _, err := io.Copy(bw, req.PayloadBody); err != nil {
-					<-c.inflightSem
-					failRequest(req.RespCh, err)
-					_ = c.conn.Close()
-					c.failOutstanding()
-					return
-				}
-			}
-			// track FIFO ordering (after writes succeed to avoid send on closed channel)
-			markRequestWritten(req)
-			c.markRequestPending(req)
-			c.pending <- req
-			unsent = nil
 		}
 	}
 }
@@ -1415,8 +1806,8 @@ func (c *NNTPConnection) readerLoop() {
 		if req.Ctx == nil {
 			req.Ctx = context.Background()
 		}
+		deferredCancellation := req.beginResponse()
 		req.responseHeadAt.Store(time.Now().UnixNano())
-		req.attemptState.CompareAndSwap(attemptPending, attemptResponseHead)
 
 		resp := Response{
 			Request: req,
@@ -1429,11 +1820,10 @@ func (c *NNTPConnection) readerLoop() {
 
 		// If the request is cancelled after send, drain only a bounded prefix of
 		// a BODY response, then retire the socket.
-		deliver := true
-		select {
-		case <-req.Ctx.Done():
-			deliver = false
-		default:
+		deliver := !deferredCancellation
+		var drainDeadlineErr error
+		if deferredCancellation && c.abandonedDrainTimeout > 0 {
+			drainDeadlineErr = c.rb.forceDrainDeadline(c.conn, time.Now().Add(c.abandonedDrainTimeout))
 		}
 
 		out := req.BodyWriter
@@ -1442,7 +1832,7 @@ func (c *NNTPConnection) readerLoop() {
 		} else if out == nil {
 			out = &resp.Body
 		}
-		if deliver && isBodyCommand(req.Payload) {
+		if deliver && isStreamingCommand(req.Payload) {
 			out = &attemptWriter{req: req, w: out}
 		}
 
@@ -1450,82 +1840,52 @@ func (c *NNTPConnection) readerLoop() {
 		// we are still draining the response.
 		outRef := &writerRef{w: out}
 
-		// Progress-aware deadline: before the first response byte we honor the
-		// attempt deadline (dispatch + TTFB bound); once bytes flow we switch to
-		// a rolling stall deadline that the wire progress keeps extending, so a
-		// healthy-but-slow body never trips it. The caller's own ctx deadline
-		// always still applies as an upper bound.
-		stall := c.stallTimeout
-		lastBytes := 0
-		lastConsumed := 0
-		var stallDeadline time.Time
-		var firstByteAt time.Time
+		clock := newResponseClock(req.responseTimeout, c.stallTimeout)
 		var drainStarted time.Time
 		drainStartConsumed := 0
-		respStart := time.Now()
-		var responseDeadline time.Time
-		if req.responseTimeout > 0 {
-			responseDeadline = respStart.Add(req.responseTimeout)
-		}
-		err := c.rb.feedUntilDoneControlled(c.conn, &decoder, outRef, func(wireBytes, consumedBytes int) (time.Time, bool, int, error) {
-			if deliver {
-				select {
-				case <-req.Ctx.Done():
-					deliver = false
-					outRef.w = io.Discard
-					drainStarted = time.Now()
-					drainStartConsumed = consumedBytes
-				default:
-				}
+		deadlineOwner, err, terminalOwner, terminalErr := c.rb.feedUntilDoneControlledOwned(c.conn, &decoder, outRef, func(wireBytes, consumedBytes int) (time.Time, bool, readDeadlineOwner, int, error) {
+			if drainDeadlineErr != nil {
+				return time.Time{}, false, readDeadlineAbandonedDrain, 0, drainDeadlineErr
 			}
-			if !deliver && isBodyCommand(req.Payload) {
+			if deliver && req.currentCause() != nil {
+				deliver = false
+				outRef.w = io.Discard
+				drainStarted = time.Now()
+				drainStartConsumed = consumedBytes
+			}
+			if !deliver && (deferredCancellation || isStreamingCommand(req.Payload)) {
 				if drainStarted.IsZero() {
 					drainStarted = time.Now()
 					drainStartConsumed = consumedBytes
 				}
 				if c.abandonedDrainTimeout > 0 && !time.Now().Before(drainStarted.Add(c.abandonedDrainTimeout)) {
-					return time.Time{}, false, 0, errAbandonedBodyDrainLimit
+					return time.Time{}, false, readDeadlineAbandonedDrain, 0, errAbandonedBodyDrainLimit
 				}
 				remaining := c.abandonedDrainBytes - (consumedBytes - drainStartConsumed)
 				if c.abandonedDrainBytes > 0 && remaining <= 0 {
-					return time.Time{}, false, 0, errAbandonedBodyDrainLimit
+					return time.Time{}, false, readDeadlineAbandonedDrain, 0, errAbandonedBodyDrainLimit
 				}
 				if c.abandonedDrainTimeout > 0 {
-					return drainStarted.Add(c.abandonedDrainTimeout), true, max(remaining, 0), nil
+					return drainStarted.Add(c.abandonedDrainTimeout), true, readDeadlineAbandonedDrain, max(remaining, 0), nil
 				}
-				return time.Time{}, false, max(remaining, 0), nil
+				return time.Time{}, false, readDeadlineAbandonedDrain, max(remaining, 0), nil
 			}
-			if wireBytes > lastBytes || consumedBytes > lastConsumed {
-				now := time.Now()
-				if firstByteAt.IsZero() {
-					firstByteAt = now
-				}
-				lastBytes = wireBytes
-				lastConsumed = consumedBytes
-				if stall > 0 {
-					dl := now.Add(stall)
-					if stallDeadline.IsZero() || !stallDeadline.After(now) || dl.Sub(stallDeadline) >= stallDeadlineQuantum {
-						stallDeadline = dl
-					}
-				}
-			}
-			parentDL, hasParent := req.Ctx.Deadline()
-			switch {
-			case lastBytes == 0 && !responseDeadline.IsZero():
-				dl, ok := minDeadline(responseDeadline, parentDL, hasParent)
-				return dl, ok, 0, nil
-			case lastBytes > 0 && stall > 0:
-				dl, ok := minDeadline(stallDeadline, parentDL, hasParent)
-				return dl, ok, 0, nil
-			default:
-				return parentDL, hasParent, 0, nil
-			}
+			return clock.control(req.Ctx, wireBytes, consumedBytes)
 		})
+		retirementOwner, retirementErr := deadlineOwner, err
+		if retirementErr == nil && terminalErr != nil {
+			retirementOwner, retirementErr = terminalOwner, terminalErr
+		}
+		if err != nil {
+			err = normalizeRequestReadError(req, deadlineOwner, err)
+		} else if terminalErr != nil {
+			req.recordDeadlineOwner(terminalOwner)
+		}
 		if err == nil && req.ValidateBody {
 			err = decoder.validateBody()
-		}
-		if err != nil && req.Ctx.Err() != nil {
-			err = req.Ctx.Err()
+			if err != nil && retirementErr == nil {
+				retirementOwner, retirementErr = readDeadlineNone, err
+			}
 		}
 		if err != nil {
 			if c.providerName != "" {
@@ -1543,24 +1903,25 @@ func (c *NNTPConnection) readerLoop() {
 
 		// Two-phase POST: coordinate with writeLoop via postReadyCh.
 		if req.PostMode {
-			if decoder.StatusCode == 340 {
-				// Signal writeLoop to send the article body, then read the
-				// final response (240/441) once the server acknowledges it.
+			if decoder.StatusCode == 340 && retirementErr == nil {
 				if req.postReadyCh != nil {
 					req.postReadyCh <- nil
 				}
+				if req.postWriteDone != nil {
+					<-req.postWriteDone
+				}
 				decoder2 := NNTPResponse{}
-				err2 := c.rb.feedUntilDone(c.conn, &decoder2, io.Discard, func(wireBytes int) (time.Time, bool) {
-					if deliver {
-						select {
-						case <-req.Ctx.Done():
-							deliver = false
-						default:
-						}
-					}
-					return req.Ctx.Deadline()
+				finalClock := newResponseClock(req.responseTimeout, c.stallTimeout)
+				owner2, err2, terminalOwner2, terminalErr2 := c.rb.feedUntilDoneControlledOwned(c.conn, &decoder2, io.Discard, func(wireBytes, consumedBytes int) (time.Time, bool, readDeadlineOwner, int, error) {
+					return finalClock.control(req.Ctx, wireBytes, consumedBytes)
 				})
+				retirementOwner, retirementErr = owner2, err2
+				if retirementErr == nil && terminalErr2 != nil {
+					retirementOwner, retirementErr = terminalOwner2, terminalErr2
+					req.recordDeadlineOwner(terminalOwner2)
+				}
 				if err2 != nil {
+					err2 = normalizeRequestReadError(req, owner2, err2)
 					if c.providerName != "" {
 						resp.Err = fmt.Errorf("%s: %w", c.providerName, err2)
 					} else {
@@ -1571,10 +1932,24 @@ func (c *NNTPConnection) readerLoop() {
 				resp.Status = decoder2.Message
 				resp.Meta = decoder2
 			} else if req.postReadyCh != nil {
-				// 440 or other rejection: tell writeLoop not to send the body.
-				req.postReadyCh <- fmt.Errorf("post rejected: %d %s", decoder.StatusCode, decoder.Message)
+				// A rejection does not consume the one-shot body. A complete 340
+				// accompanied by a terminal read error is likewise not safe to use.
+				postErr := fmt.Errorf("post rejected: %d %s", decoder.StatusCode, decoder.Message)
+				if decoder.StatusCode == 340 && retirementErr != nil {
+					postErr = normalizeRequestReadError(req, retirementOwner, retirementErr)
+					if c.providerName != "" {
+						resp.Err = fmt.Errorf("%s: %w", c.providerName, postErr)
+					} else {
+						resp.Err = postErr
+					}
+				}
+				req.postReadyCh <- postErr
+				if req.postWriteDone != nil {
+					<-req.postWriteDone
+				}
 			}
 		}
+		resp.Err = req.finalize(resp.Err)
 
 		if c.stats != nil {
 			n := int64(decoder.BytesConsumed)
@@ -1584,81 +1959,47 @@ func (c *NNTPConnection) readerLoop() {
 					c.stats.quotaExceeded.Store(true)
 				}
 			}
-			if resp.Err != nil && classifyOutcome(resp.StatusCode, resp.Err) != OutcomeCancellation {
-				c.stats.Errors.Add(1)
-			} else if decoder.StatusCode == 430 || decoder.StatusCode == 423 {
-				c.stats.Missing.Add(1)
-			} else if decoder.StatusCode < 200 || decoder.StatusCode >= 400 {
-				c.stats.Errors.Add(1)
-			} else {
+			switch classifyAttemptOutcome(req, resp.StatusCode, resp.Err) {
+			case OutcomeCancellation, outcomeLocalFailure:
+			case OutcomeSuccess:
 				// Successful transfer: feed the TTFB and throughput EWMAs that
 				// drive the adaptive attempt timeout and speed-aware dispatch.
 				// firstByteAt is unset when the whole response arrived in a
 				// single read; fall back to the read start. recordTTFB/Speed
 				// ignore non-positive and sub-floor samples respectively.
-				fb := firstByteAt
+				fb := clock.firstByte
 				if fb.IsZero() {
-					fb = respStart
+					fb = clock.started
 				}
 				if headAt := req.responseHeadAt.Load(); headAt != 0 {
 					recordTTFB(c.stats, fb.Sub(time.Unix(0, headAt)))
 				}
 				recordSpeed(c.stats, n, time.Since(fb))
+			default:
+				if decoder.StatusCode == 430 || decoder.StatusCode == 423 {
+					c.stats.Missing.Add(1)
+				} else {
+					c.stats.Errors.Add(1)
+				}
 			}
 		}
 		resp.Attempts = []AttemptEvidence{buildAttemptEvidence(req, c.providerID, resp, time.Now())}
-
-		if deliver {
-			// Best effort: don't block forever if the receiver abandoned the channel.
-			select {
-			case req.RespCh <- resp:
-			default:
-			}
-		}
-		safeClose(req.RespCh)
-
-		// release inflight slot (and the body slot, if this request took one)
-		<-c.inflightSem
-		c.releaseRequestPending(req)
-		if req.heldBody {
-			<-c.bodySem
-		}
-
-		// A BODY parse/decode/writer/drain failure can leave unread framing in
-		// either the socket or shared read buffer. Never reuse that connection.
-		if resp.Err != nil && isBodyCommand(req.Payload) {
-			_ = c.conn.Close()
-			c.failOutstanding()
-			return
-		}
-
-		// If we hit a timeout, cancellation-related network error, or protocol
-		// desync, close the connection so the pool replaces it with a fresh one.
+		outcome := classifyAttemptOutcome(req, resp.StatusCode, resp.Err)
+		completedDrain := retirementErr == nil && !deliver && req.needsDrainClear() && outcome == OutcomeCancellation
+		retire := retirementErr != nil && !completedDrain
 		if resp.Err != nil {
-			var ne net.Error
-			if errors.As(resp.Err, &ne) && ne.Timeout() {
-				_ = c.conn.Close()
-				c.failOutstanding()
-				return
-			}
-			if errors.Is(resp.Err, ErrProtocolDesync) {
-				_ = c.conn.Close()
-				c.failOutstanding()
-				return
-			}
+			var networkError net.Error
+			retire = retire || errors.As(resp.Err, &networkError) && networkError.Timeout() ||
+				errors.Is(resp.Err, ErrProtocolDesync)
 		}
-
-		// 502 "service unavailable" mid-session: close the connection so
-		// all pending requests fail fast instead of waiting in the pipeline.
-		if decoder.StatusCode == 502 {
-			_ = c.conn.Close()
+		retire = retire || resp.StatusCode == 502 || resp.StatusCode == 451 ||
+			(retirementErr != nil && retirementOwner == readDeadlineAbandonedDrain)
+		if retire {
+			_ = c.closeTransport()
 			c.failOutstanding()
-			return
 		}
-		// A 451 retry must use a fresh transport.
-		if decoder.StatusCode == 451 {
-			_ = c.conn.Close()
-			c.failOutstanding()
+		c.completeFinalizedRequest(req, resp)
+		if retire {
 			return
 		}
 	}
@@ -1668,8 +2009,14 @@ func (c *NNTPConnection) readerLoop() {
 // Any unread bytes remain buffered in c.rbuf[c.rstart:c.rend] for subsequent reads.
 func (c *NNTPConnection) readOneResponse(out io.Writer) (NNTPResponse, error) {
 	resp := NNTPResponse{}
-	if err := c.rb.feedUntilDone(c.conn, &resp, out, func(int) (time.Time, bool) { return time.Time{}, false }); err != nil {
+	_, err, _, terminalErr := c.rb.feedUntilDoneControlledOwned(c.conn, &resp, out, func(int, int) (time.Time, bool, readDeadlineOwner, int, error) {
+		return time.Time{}, false, readDeadlineNone, 0, nil
+	})
+	if err != nil {
 		return resp, err
+	}
+	if terminalErr != nil {
+		return resp, terminalErr
 	}
 	return resp, nil
 }
@@ -1935,10 +2282,9 @@ func pingProvider(ctx context.Context, factory ConnFactory, auth Auth) PingResul
 	}
 	defer func() { _ = conn.Close() }()
 
-	rb := readBuffer{buf: make([]byte, defaultReadBufSize)}
 	nc := &NNTPConnection{
 		conn: conn,
-		rb:   rb,
+		rb:   readBuffer{buf: make([]byte, defaultReadBufSize)},
 	}
 
 	// Read greeting.
@@ -2274,17 +2620,10 @@ func (c *Client) sendValidatedBody(ctx context.Context, payload []byte, bodyWrit
 // or when the command is already STAT or POST (probing would be redundant or
 // inapplicable).
 func extractProbeMsgID(payload []byte) []byte {
-	if len(payload) == 0 {
+	switch operationFromPayload(payload) {
+	case OperationBody, OperationHead, operationArticle:
+	default:
 		return nil
-	}
-	// Reject commands where probing is irrelevant or already done.
-	switch {
-	case len(payload) >= 4 && (payload[0]|0x20) == 's' && (payload[1]|0x20) == 't' &&
-		(payload[2]|0x20) == 'a' && (payload[3]|0x20) == 't':
-		return nil // STAT
-	case len(payload) >= 4 && (payload[0]|0x20) == 'p' && (payload[1]|0x20) == 'o' &&
-		(payload[2]|0x20) == 's' && (payload[3]|0x20) == 't':
-		return nil // POST
 	}
 	open := bytes.IndexByte(payload, '<')
 	if open < 0 {
@@ -2472,13 +2811,52 @@ func (c *Client) raceCandidates(
 	return false, false, lastErr
 }
 
-// minDeadline returns d, unless other is an earlier deadline (when hasOther),
-// in which case it returns other. The bool is always true (a deadline exists).
-func minDeadline(d, other time.Time, hasOther bool) (time.Time, bool) {
-	if hasOther && other.Before(d) {
-		return other, true
+type responseClock struct {
+	started, firstByte, responseDeadline, stallDeadline time.Time
+	stall                                               time.Duration
+	wire, consumed                                      int
+}
+
+func newResponseClock(responseTimeout, stall time.Duration) responseClock {
+	now := time.Now()
+	clock := responseClock{started: now, stall: stall}
+	if responseTimeout > 0 {
+		clock.responseDeadline = now.Add(responseTimeout)
 	}
-	return d, true
+	return clock
+}
+
+func (clock *responseClock) control(ctx context.Context, wire, consumed int) (time.Time, bool, readDeadlineOwner, int, error) {
+	if wire > clock.wire || consumed > clock.consumed {
+		now := time.Now()
+		if clock.firstByte.IsZero() {
+			clock.firstByte = now
+		}
+		clock.wire, clock.consumed = wire, consumed
+		if clock.stall > 0 {
+			deadline := now.Add(clock.stall)
+			quantum := min(stallDeadlineQuantum, clock.stall/2)
+			if quantum <= 0 || clock.stallDeadline.IsZero() ||
+				!clock.stallDeadline.After(now) || deadline.Sub(clock.stallDeadline) >= quantum {
+				clock.stallDeadline = deadline
+			}
+		}
+	}
+	caller, hasCaller := ctx.Deadline()
+	deadline, owner := clock.responseDeadline, readDeadlineProviderResponse
+	if wire > 0 || consumed > 0 {
+		deadline, owner = clock.stallDeadline, readDeadlineProviderStall
+	}
+	if deadline.IsZero() {
+		if hasCaller {
+			return caller, true, readDeadlineCaller, 0, nil
+		}
+		return time.Time{}, false, readDeadlineNone, 0, nil
+	}
+	if hasCaller && caller.Before(deadline) {
+		return caller, true, readDeadlineCaller, 0, nil
+	}
+	return deadline, true, owner, 0, nil
 }
 
 // writeDeadline keeps the caller's end-to-end deadline active during writes.
@@ -2519,11 +2897,7 @@ func (c *Client) tryGroup(
 		decodeFn:        c.decodeFn,
 		submittedAt:     time.Now(),
 		responseTimeout: g.attemptTimeout(),
-	}
-	failAttempt := func(cause error) Response {
-		response := Response{Err: cause, Request: req, ProviderID: g.id}
-		response.Attempts = []AttemptEvidence{buildAttemptEvidence(req, g.id, response, time.Now())}
-		return response
+		transportCause:  func() error { return c.groupCause(g) },
 	}
 
 	var hotCh chan *Request
@@ -2541,39 +2915,35 @@ func (c *Client) tryGroup(
 	default:
 		select {
 		case <-c.ctx.Done():
-			return failAttempt(c.ctx.Err()), false, true
+			req.stopBeforeTransport(c.ctx.Err())
+			return failedAttempt(req, g.id, c.ctx.Err()), false, true
 		case <-reqCtx.Done():
-			return failAttempt(reqCtx.Err()), false, ctx.Err() != nil
+			req.stopBeforeTransport(reqCtx.Err())
+			return failedAttempt(req, g.id, reqCtx.Err()), false, ctx.Err() != nil
 		case <-g.ctx.Done():
-			return failAttempt(ErrConnectionDied), false, false
+			req.stopBeforeTransport(ErrConnectionDied)
+			return failedAttempt(req, g.id, ErrConnectionDied), false, false
 		case coldCh <- req:
 		}
 	}
 
-	for {
-		select {
-		case resp, ok = <-innerCh:
-			if ok && len(resp.Attempts) == 0 && !errors.Is(resp.Err, errFreshTransportRequired) {
-				resp.Request = req
-				resp.ProviderID = g.id
-				resp.Attempts = []AttemptEvidence{buildAttemptEvidence(req, g.id, resp, time.Now())}
-			}
-			return resp, ok, false
-		case <-c.ctx.Done():
-			return failAttempt(c.ctx.Err()), false, true
-		case <-g.ctx.Done():
-			return failAttempt(ErrConnectionDied), false, false
-		case <-reqCtx.Done():
-			return failAttempt(reqCtx.Err()), false, ctx.Err() != nil
-		}
+	resp, ok, cause, done := c.awaitAttempt(reqCtx, g, req, innerCh)
+	if cause != nil {
+		return failedAttempt(req, g.id, cause), false, done
 	}
+	if ok && len(resp.Attempts) == 0 && !errors.Is(resp.Err, errFreshTransportRequired) {
+		resp.Request = req
+		resp.ProviderID = g.id
+		resp.Attempts = []AttemptEvidence{buildAttemptEvidence(req, g.id, resp, time.Now())}
+	}
+	return resp, ok, false
 }
 
 // attemptCommittedResp reports whether the response came from an attempt that
 // had already started streaming bytes (the reader committed). Such an attempt
 // must not be retried or failed over when a caller-supplied writer is in use.
 func attemptCommittedResp(resp Response) bool {
-	return resp.Request != nil && resp.Request.decodedCommitted.Load()
+	return resp.Request != nil && resp.Request.committed()
 }
 
 func buildAttemptEvidence(req *Request, providerID string, resp Response, completedAt time.Time) AttemptEvidence {
@@ -2581,7 +2951,7 @@ func buildAttemptEvidence(req *Request, providerID string, resp Response, comple
 	if cause == nil {
 		cause = toError(resp.StatusCode, resp.Status)
 	}
-	outcome := classifyOutcome(resp.StatusCode, cause)
+	outcome := classifyAttemptOutcome(req, resp.StatusCode, cause)
 	validation := BodyValidationNotApplicable
 	if operationFromPayload(req.Payload) == OperationBody {
 		if !req.ValidateBody {
@@ -2617,11 +2987,7 @@ func buildAttemptEvidence(req *Request, providerID string, resp Response, comple
 		service = completedAt.Sub(time.Unix(0, headAt))
 	}
 
-	providerResponseTimeout := false
-	var networkError net.Error
-	if headAt > 0 && req.Ctx.Err() == nil && errors.As(resp.Err, &networkError) && networkError.Timeout() {
-		providerResponseTimeout = true
-	}
+	providerResponseTimeout := headAt > 0 && req.providerDeadlineExpired(resp.Err)
 	return AttemptEvidence{
 		ProviderID:               providerID,
 		Operation:                operationFromPayload(req.Payload),

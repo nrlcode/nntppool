@@ -162,13 +162,16 @@ func (b *providerCircuitBreaker) complete(lease circuitBreakerLease, completion 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// A successful request proves the provider is usable now, including when
-	// it was admitted before another concurrent request opened the breaker.
-	if completion == circuitBreakerSuccess {
-		b.resetLocked()
+	// A completion can mutate only the breaker generation that admitted it.
+	// In particular, an old success must not reset a newer open generation.
+	if lease.generation != b.generation {
 		return
 	}
-	if lease.generation != b.generation {
+
+	// A successful request proves the provider is usable now, including when
+	// it was admitted in the current generation.
+	if completion == circuitBreakerSuccess {
+		b.resetLocked()
 		return
 	}
 
@@ -263,6 +266,8 @@ func classifyCircuitBreakerCompletion(resp Response, ok, cancelled bool) circuit
 	switch final.Outcome {
 	case OutcomeSuccess:
 		return circuitBreakerSuccess
+	case outcomeLocalFailure:
+		return circuitBreakerNeutral
 	case OutcomeTemporaryFailure:
 		if errors.Is(final.Cause, ErrCircuitBreakerOpen) {
 			return circuitBreakerNeutral

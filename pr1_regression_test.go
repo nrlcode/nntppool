@@ -23,9 +23,11 @@ type blockingWriter struct {
 	started chan struct{}
 	release chan struct{}
 	once    sync.Once
+	calls   atomic.Int32
 }
 
 func (w *blockingWriter) Write(p []byte) (int, error) {
+	w.calls.Add(1)
 	w.once.Do(func() { close(w.started) })
 	<-w.release
 	return len(p), nil
@@ -248,7 +250,8 @@ func TestPR1CancelledBodyDrainIsBounded(t *testing.T) {
 
 	for _, depth := range []int{1, 4, 10} {
 		t.Run(strings.Repeat("pipeline_", depth)+"cancel", func(t *testing.T) {
-			firstChunkWritten := make(chan struct{})
+			writerBarrier := newFNCORECancellationBarrierWriter()
+			t.Cleanup(writerBarrier.Release)
 			writtenResult := make(chan int, 1)
 			conn := mockServer(t, func(server net.Conn) {
 				_, _ = server.Write([]byte("200 regression server ready\r\n"))
@@ -258,16 +261,11 @@ func TestPR1CancelledBodyDrainIsBounded(t *testing.T) {
 				}
 
 				written := 0
-				signaled := false
 				for range depth {
 					for offset := 0; offset < len(body); {
 						end := min(offset+32*1024, len(body))
 						n, err := server.Write(body[offset:end])
 						written += n
-						if !signaled && written > 0 {
-							close(firstChunkWritten)
-							signaled = true
-						}
 						offset += n
 						if err != nil {
 							writtenResult <- written
@@ -291,23 +289,28 @@ func TestPR1CancelledBodyDrainIsBounded(t *testing.T) {
 			for index := range depth {
 				ctx, cancel := context.WithCancel(context.Background())
 				cancels = append(cancels, cancel)
+				writer := io.Writer(io.Discard)
+				if index == 0 {
+					writer = writerBarrier
+				}
 				reqCh <- &Request{
 					Ctx:        ctx,
 					Payload:    []byte("BODY <cancel-" + string(rune('a'+index)) + "@example.invalid>\r\n"),
 					RespCh:     make(chan Response, 1),
-					BodyWriter: io.Discard,
+					BodyWriter: writer,
 				}
 			}
 			go nc.Run()
 
 			select {
-			case <-firstChunkWritten:
+			case <-writerBarrier.Started():
 			case <-time.After(2 * time.Second):
-				t.Fatal("server did not begin the first BODY response")
+				t.Fatal("first BODY did not cross the controlled decoded-progress boundary")
 			}
 			for _, cancel := range cancels {
 				cancel()
 			}
+			writerBarrier.Release()
 
 			var written int
 			select {
@@ -327,6 +330,7 @@ func TestPR1CancelledPipelineDoesNotDelayNewPriorityBody(t *testing.T) {
 	largeBody := yencSinglePart(bytes.Repeat([]byte("q"), regressionBodySize), "obsolete.bin")
 	priorityBody := yencSinglePart([]byte("priority payload"), "priority.bin")
 	firstCommandsRead := make(chan struct{})
+	releaseFirstConnection := make(chan struct{})
 	var connections atomic.Int32
 	factory := func(context.Context) (net.Conn, error) {
 		connection := connections.Add(1)
@@ -342,7 +346,8 @@ func TestPR1CancelledPipelineDoesNotDelayNewPriorityBody(t *testing.T) {
 					}
 				}
 				close(firstCommandsRead)
-				_, _ = server.Write(largeBody)
+				_, _ = server.Write(largeBody[:32*1024])
+				<-releaseFirstConnection
 				return
 			}
 			if _, err := reader.ReadString('\n'); err != nil {
@@ -376,6 +381,7 @@ func TestPR1CancelledPipelineDoesNotDelayNewPriorityBody(t *testing.T) {
 	for _, cancel := range cancels {
 		cancel()
 	}
+	close(releaseFirstConnection)
 	start := time.Now()
 	body, err := client.BodyPriority(context.Background(), "priority@example.invalid")
 	if err != nil {
@@ -1103,6 +1109,10 @@ func TestPR1PipelineWaitDoesNotConsumeResponseTimeout(t *testing.T) {
 			_, _ = server.Write([]byte("200 regression server ready\r\n"))
 			reader := bufio.NewReader(server)
 			_, _ = reader.ReadString('\n')
+			// Read both commands before delaying response 1. This makes request 2
+			// successfully flushed/written and then genuinely blocked behind the
+			// first FIFO response instead of blocking inside its own Flush.
+			_, _ = reader.ReadString('\n')
 			chunk := len(response) / 8
 			for offset := 0; offset < len(response); offset += chunk {
 				end := min(offset+chunk, len(response))
@@ -1111,7 +1121,6 @@ func TestPR1PipelineWaitDoesNotConsumeResponseTimeout(t *testing.T) {
 					time.Sleep(25 * time.Millisecond)
 				}
 			}
-			_, _ = reader.ReadString('\n')
 			_, _ = server.Write(yencSinglePart([]byte("second"), "second.bin"))
 		}()
 		return client, nil
