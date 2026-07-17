@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/mnightingale/rapidyenc"
 )
@@ -400,8 +402,58 @@ func (c *Client) sendPost(ctx context.Context, payloadBody io.Reader) <-chan Res
 	return respCh
 }
 
+func (c *Client) groupCause(g *providerGroup) error {
+	if err := c.ctx.Err(); err != nil {
+		return err
+	}
+	if g.ctx.Err() != nil {
+		return ErrConnectionDied
+	}
+	return nil
+}
+
+func failedAttempt(req *Request, providerID string, cause error) Response {
+	resp := Response{Err: cause, Request: req, ProviderID: providerID}
+	resp.Attempts = []AttemptEvidence{buildAttemptEvidence(req, providerID, resp, time.Now())}
+	return resp
+}
+
+func (c *Client) awaitAttempt(ctx context.Context, g *providerGroup, req *Request, ch <-chan Response) (Response, bool, error, bool) {
+	clientDone, providerDone, requestDone := c.ctx.Done(), g.ctx.Done(), ctx.Done()
+	for {
+		select {
+		case resp, ok := <-ch:
+			return resp, ok, nil, false
+		case <-clientDone:
+			if req.stopBeforeTransport(c.ctx.Err()) {
+				return Response{}, false, c.ctx.Err(), true
+			}
+			clientDone = nil
+		case <-providerDone:
+			if req.stopBeforeTransport(ErrConnectionDied) {
+				return Response{}, false, ErrConnectionDied, false
+			}
+			providerDone = nil
+		case <-requestDone:
+			if req.stopBeforeTransport(ctx.Err()) {
+				return Response{}, false, ctx.Err(), ctx.Err() != nil
+			}
+			requestDone = nil
+		}
+	}
+}
+
 func (c *Client) doSendPost(ctx context.Context, payloadBody io.Reader, respCh chan Response) {
 	defer close(respCh)
+	var closeOnce sync.Once
+	closeBody := func() {
+		closeOnce.Do(func() {
+			if closer, ok := payloadBody.(io.Closer); ok {
+				_ = closer.Close()
+			}
+		})
+	}
+	defer closeBody()
 
 	mains := *c.mainGroups.Load()
 	n := len(mains)
@@ -433,17 +485,22 @@ func (c *Client) doSendPost(ctx context.Context, payloadBody io.Reader, respCh c
 		start = sort.SearchInts(cumWeights[:n], slot+1)
 	}
 
-	var lastErr error
+	var lastResp Response
+	haveResp := false
 	for attempt := range n {
 		idx := (start + attempt) % n
 		g := mains[idx]
 		innerCh := make(chan Response, 1)
 		req := &Request{
-			Ctx:         ctx,
-			Payload:     []byte("POST\r\n"),
-			RespCh:      innerCh,
-			PayloadBody: payloadBody,
-			PostMode:    true,
+			Ctx:             ctx,
+			Payload:         []byte("POST\r\n"),
+			RespCh:          innerCh,
+			PayloadBody:     payloadBody,
+			closePayload:    closeBody,
+			PostMode:        true,
+			submittedAt:     time.Now(),
+			responseTimeout: g.attemptTimeout(),
+			transportCause:  func() error { return c.groupCause(g) },
 		}
 
 		// Try hot channel first (non-blocking), then cold channel.
@@ -452,10 +509,12 @@ func (c *Client) doSendPost(ctx context.Context, payloadBody io.Reader, respCh c
 		default:
 			select {
 			case <-c.ctx.Done():
-				respCh <- Response{Err: c.ctx.Err()}
+				req.stopBeforeTransport(c.ctx.Err())
+				respCh <- failedAttempt(req, g.id, c.ctx.Err())
 				return
 			case <-ctx.Done():
-				respCh <- Response{Err: ctx.Err()}
+				req.stopBeforeTransport(ctx.Err())
+				respCh <- failedAttempt(req, g.id, ctx.Err())
 				return
 			case <-g.ctx.Done():
 				continue
@@ -463,21 +522,29 @@ func (c *Client) doSendPost(ctx context.Context, payloadBody io.Reader, respCh c
 			}
 		}
 
-		resp, ok := <-innerCh
+		resp, ok, cause, done := c.awaitAttempt(ctx, g, req, innerCh)
+		if cause != nil {
+			resp = failedAttempt(req, g.id, cause)
+			if done {
+				respCh <- resp
+				return
+			}
+		}
 		if !ok {
+			resp = failedAttempt(req, g.id, ErrConnectionDied)
+		}
+		if req.stoppedPretransport() {
+			lastResp, haveResp = resp, true
 			continue
 		}
-		if resp.Err != nil {
-			lastErr = resp.Err
-			continue
-		}
-		// Deliver whatever status we got (240, 440, 441, etc.).
+		// Once transport owns POST, its exact response is terminal. Reusing the
+		// one-shot body on another provider would duplicate or corrupt an article.
 		respCh <- resp
 		return
 	}
 
-	if lastErr != nil {
-		respCh <- Response{Err: fmt.Errorf("nntp: post failed: %w", lastErr)}
+	if haveResp {
+		respCh <- lastResp
 	} else {
 		respCh <- Response{Err: errors.New("nntp: post failed: all providers exhausted")}
 	}

@@ -22,6 +22,8 @@ const (
 	OutcomeInconclusive        OutcomeKind = "inconclusive"
 )
 
+const outcomeLocalFailure OutcomeKind = "local_failure"
+
 // Operation identifies the NNTP command represented by attempt evidence.
 type Operation string
 
@@ -32,6 +34,8 @@ const (
 	OperationHead    Operation = "HEAD"
 	OperationPost    Operation = "POST"
 )
+
+const operationArticle Operation = "ARTICLE"
 
 // BodyValidationStatus records whether a BODY attempt crossed the complete
 // transport validation boundary.
@@ -126,20 +130,46 @@ func (e *TransportError) Unwrap() error {
 }
 
 func operationFromPayload(payload []byte) Operation {
-	for _, candidate := range []struct {
-		prefix string
-		op     Operation
-	}{
-		{"BODY ", OperationBody},
-		{"STAT ", OperationStat},
-		{"HEAD ", OperationHead},
-		{"POST", OperationPost},
-	} {
-		if len(payload) >= len(candidate.prefix) && string(payload[:len(candidate.prefix)]) == candidate.prefix {
-			return candidate.op
+	end := 0
+	for end < len(payload) {
+		switch payload[end] {
+		case ' ', '\t', '\r', '\n':
+			goto parsed
 		}
+		end++
+	}
+parsed:
+	if end == 0 {
+		return OperationUnknown
+	}
+	switch {
+	case equalASCIIFold(payload[:end], "BODY"):
+		return OperationBody
+	case equalASCIIFold(payload[:end], "ARTICLE"):
+		return operationArticle
+	case equalASCIIFold(payload[:end], "STAT"):
+		return OperationStat
+	case equalASCIIFold(payload[:end], "HEAD"):
+		return OperationHead
+	case equalASCIIFold(payload[:end], "POST"):
+		return OperationPost
 	}
 	return OperationUnknown
+}
+
+func equalASCIIFold(value []byte, expected string) bool {
+	if len(value) != len(expected) {
+		return false
+	}
+	for i, char := range value {
+		if char >= 'a' && char <= 'z' {
+			char -= 'a' - 'A'
+		}
+		if char != expected[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func classifyOutcome(code int, err error) OutcomeKind {
@@ -170,6 +200,20 @@ func classifyOutcome(code int, err error) OutcomeKind {
 	default:
 		return OutcomeInconclusive
 	}
+}
+
+func classifyAttemptOutcome(req *Request, code int, err error) OutcomeKind {
+	var writerError *callerWriterError
+	if errors.As(err, &writerError) {
+		return outcomeLocalFailure
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		if req != nil && req.deadlineCauseIsCaller() {
+			return OutcomeCancellation
+		}
+		return OutcomeTransportFailure
+	}
+	return classifyOutcome(code, err)
 }
 
 func cloneAttempts(attempts []AttemptEvidence) []AttemptEvidence {
