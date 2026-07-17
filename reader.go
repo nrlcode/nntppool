@@ -186,8 +186,8 @@ func (r *NNTPResponse) detectFormat(line []byte) {
 	if r.strictDecodeErrors {
 		if bytes.HasPrefix(uuLine, []byte("begin ")) || isStrictUUDataLine(uuLine) {
 			r.Format = rapidyenc.FormatUU
-			return
 		}
+		return
 	}
 
 	// UUEncode detection: 60 or 61 chars, starts with 'M'
@@ -298,6 +298,9 @@ func strictUUDataShape(line []byte) (decoded, encodedLength int, ok bool) {
 	if len(line) < 2 {
 		return 0, 0, false
 	}
+	if line[0] < '!' || line[0] > 'M' {
+		return 0, 0, false
+	}
 	decoded = decodeUUChar(line[0])
 	if decoded <= 0 || decoded > 45 {
 		return 0, 0, false
@@ -333,7 +336,7 @@ func (r *NNTPResponse) processUULine(wireLine []byte, out io.Writer) error {
 		return nil
 	}
 	if len(line) == 1 && (line[0] == ' ' || line[0] == '`') {
-		if !r.uuHasBegin || !r.uuSeenData || r.uuNeedEnd || r.uuComplete {
+		if !r.uuHasBegin || r.uuNeedEnd || r.uuComplete {
 			return fmt.Errorf("%w: invalid UU zero line", ErrBodyCorrupt)
 		}
 		r.uuNeedEnd = true
@@ -571,7 +574,7 @@ func (r *NNTPResponse) validateBody() error {
 		return fmt.Errorf("%w: content is not a recognized encoding", errBodyEncodingUnknown)
 	case rapidyenc.FormatUU:
 		if r.uuHasBegin {
-			if !r.uuComplete || r.uuNeedEnd || !r.uuSeenData {
+			if !r.uuComplete || r.uuNeedEnd {
 				return fmt.Errorf("%w: truncated UU wrapper", ErrBodyCorrupt)
 			}
 			return nil
