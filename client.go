@@ -147,7 +147,12 @@ func (c *Client) BodyTargeted(ctx context.Context, messageID string, opts Target
 	if !ok {
 		return nil, newTransportError(resp.Attempts, ErrConnectionDied)
 	}
-	return c.finishBody(messageID, nil, oneResponse(resp))
+	body, err := c.finishBody(messageID, nil, oneResponse(resp))
+	if body != nil {
+		body.Bytes = body.byteBuf
+		body.byteBuf = nil
+	}
+	return body, err
 }
 
 func oneResponse(resp Response) <-chan Response {

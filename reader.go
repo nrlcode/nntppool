@@ -35,19 +35,27 @@ type NNTPResponse struct {
 	StatusCode    int
 	CRC           uint32
 
-	eof          bool
-	body         bool
-	hasPart      bool
-	hasBegin     bool
-	hasEnd       bool
-	hasCrc       bool
-	hasPartCRC   bool
-	hasFileCRC   bool
-	hasEmptyline bool // for article requests has the empty line separating headers and body been seen
-	partCRC      uint32
-	fileCRC      uint32
-	onMeta       func(YEncMeta)
-	headerErr    error
+	eof            bool
+	body           bool
+	hasPart        bool
+	hasBegin       bool
+	hasEnd         bool
+	hasCrc         bool
+	hasPartCRC     bool
+	hasFileCRC     bool
+	hasEndPart     bool
+	hasEmptyline   bool // for article requests has the empty line separating headers and body been seen
+	partCRC        uint32
+	fileCRC        uint32
+	endPart        int64
+	uuHasBegin     bool
+	uuSeenData     bool
+	uuShortSeen    bool
+	uuNeedEnd      bool
+	uuComplete     bool
+	sawYEncControl bool
+	onMeta         func(YEncMeta)
+	headerErr      error
 	// Raw Send retains v4's decoder-error behavior. Strict high-level BODY
 	// requests set this flag and propagate native decoder failures as corruption.
 	strictDecodeErrors bool
@@ -123,7 +131,9 @@ func (r *NNTPResponse) decode(buf []byte, out io.Writer) (read int, err error) {
 
 			switch r.Format {
 			case rapidyenc.FormatUnknown:
-				r.Lines = append(r.Lines, string(line))
+				if !r.strictDecodeErrors {
+					r.Lines = append(r.Lines, string(line))
+				}
 			case rapidyenc.FormatYenc:
 				r.processYencHeader(line)
 				if r.body {
@@ -140,6 +150,11 @@ func (r *NNTPResponse) decode(buf []byte, out io.Writer) (read int, err error) {
 					// =ypart was encountered, switch to body decoding
 				}
 			case rapidyenc.FormatUU:
+				if r.strictDecodeErrors {
+					if err := r.processUULine(line, out); err != nil {
+						return read, err
+					}
+				}
 			}
 		}
 	}
@@ -161,6 +176,18 @@ func (r *NNTPResponse) detectFormat(line []byte) {
 	if bytes.HasPrefix(line, []byte("=ybegin ")) {
 		r.Format = rapidyenc.FormatYenc
 		return
+	}
+	if r.strictDecodeErrors && (bytes.HasPrefix(line, []byte("=ypart ")) || bytes.HasPrefix(line, []byte("=yend "))) {
+		r.sawYEncControl = true
+		return
+	}
+
+	uuLine := unstuffUULine(line)
+	if r.strictDecodeErrors {
+		if bytes.HasPrefix(uuLine, []byte("begin ")) || isStrictUUDataLine(uuLine) {
+			r.Format = rapidyenc.FormatUU
+			return
+		}
 	}
 
 	// UUEncode detection: 60 or 61 chars, starts with 'M'
@@ -230,9 +257,130 @@ func (r *NNTPResponse) detectFormat(line []byte) {
 
 		// Probably UU
 		r.Format = rapidyenc.FormatUU
-		r.body = true
 		return
 	}
+}
+
+func unstuffUULine(line []byte) []byte {
+	if bytes.HasPrefix(line, []byte("..")) {
+		return line[1:]
+	}
+	return line
+}
+
+func validUUBegin(line []byte) bool {
+	fields := bytes.Fields(line)
+	if len(fields) < 3 || !bytes.Equal(fields[0], []byte("begin")) || (len(fields[1]) != 3 && len(fields[1]) != 4) {
+		return false
+	}
+	for _, char := range fields[1] {
+		if char < '0' || char > '7' {
+			return false
+		}
+	}
+	return len(fields[2]) > 0
+}
+
+func uuEncodedLengths(decoded int) (minimum, canonical int) {
+	return (4*decoded + 2) / 3, 4 * ((decoded + 2) / 3)
+}
+
+func isUUAlphabet(data []byte) bool {
+	for _, char := range data {
+		if (char < ' ' || char > '_') && char != '`' {
+			return false
+		}
+	}
+	return true
+}
+
+func strictUUDataShape(line []byte) (decoded, encodedLength int, ok bool) {
+	if len(line) < 2 {
+		return 0, 0, false
+	}
+	decoded = decodeUUChar(line[0])
+	if decoded <= 0 || decoded > 45 {
+		return 0, 0, false
+	}
+	minimum, canonical := uuEncodedLengths(decoded)
+	encodedLength = len(line) - 1
+	if encodedLength < minimum || encodedLength > canonical || !isUUAlphabet(line[1:]) {
+		return 0, 0, false
+	}
+	return decoded, encodedLength, true
+}
+
+func isStrictUUDataLine(line []byte) bool {
+	_, _, ok := strictUUDataShape(line)
+	return ok
+}
+
+func (r *NNTPResponse) processUULine(wireLine []byte, out io.Writer) error {
+	line := unstuffUULine(wireLine)
+	if bytes.HasPrefix(line, []byte("begin ")) {
+		if r.uuHasBegin || r.uuSeenData || r.uuNeedEnd || r.uuComplete || !validUUBegin(line) {
+			return fmt.Errorf("%w: invalid UU begin line", ErrBodyCorrupt)
+		}
+		r.uuHasBegin = true
+		return nil
+	}
+	if bytes.Equal(line, []byte("end")) {
+		if !r.uuHasBegin || !r.uuNeedEnd || r.uuComplete {
+			return fmt.Errorf("%w: invalid UU end line", ErrBodyCorrupt)
+		}
+		r.uuNeedEnd = false
+		r.uuComplete = true
+		return nil
+	}
+	if len(line) == 1 && (line[0] == ' ' || line[0] == '`') {
+		if !r.uuHasBegin || !r.uuSeenData || r.uuNeedEnd || r.uuComplete {
+			return fmt.Errorf("%w: invalid UU zero line", ErrBodyCorrupt)
+		}
+		r.uuNeedEnd = true
+		return nil
+	}
+	if r.uuNeedEnd || r.uuComplete || r.uuShortSeen {
+		return fmt.Errorf("%w: invalid UU line order", ErrBodyCorrupt)
+	}
+
+	decodedLength, encodedLength, ok := strictUUDataShape(line)
+	if !ok {
+		return fmt.Errorf("%w: malformed UU data line", ErrBodyCorrupt)
+	}
+	var encoded [60]byte
+	copy(encoded[:], line[1:1+encodedLength])
+	var decoded [45]byte
+	decodedOffset := 0
+	for encodedOffset := 0; encodedOffset < encodedLength; encodedOffset += 4 {
+		var values [4]byte
+		for i := range values {
+			if encodedOffset+i < encodedLength {
+				values[i] = byte(decodeUUChar(encoded[encodedOffset+i]))
+			}
+		}
+		triplet := [3]byte{
+			values[0]<<2 | values[1]>>4,
+			values[1]<<4 | values[2]>>2,
+			values[2]<<6 | values[3],
+		}
+		decodedOffset += copy(decoded[decodedOffset:], triplet[:min(3, decodedLength-decodedOffset)])
+	}
+	if decodedOffset != decodedLength {
+		return fmt.Errorf("%w: truncated UU data line", ErrBodyCorrupt)
+	}
+	written, err := out.Write(decoded[:decodedLength])
+	if err != nil {
+		return err
+	}
+	if written != decodedLength {
+		return io.ErrShortWrite
+	}
+	r.BytesDecoded += decodedLength
+	r.uuSeenData = true
+	if decodedLength < 45 {
+		r.uuShortSeen = true
+	}
+	return nil
 }
 
 func allInASCIIRange(b []byte, lo, hi byte) bool {
@@ -364,6 +512,13 @@ func (r *NNTPResponse) processYencHeader(line []byte) {
 	} else if bytes.HasPrefix(line, []byte("=yend ")) {
 		r.hasEnd = true
 		line = line[len("=yend"):]
+		if bytes.Contains(line, []byte(" part=")) {
+			if r.endPart, err = extractInt(line, []byte(" part=")); err != nil || r.endPart <= 0 {
+				r.headerErr = fmt.Errorf("invalid =yend part")
+			} else {
+				r.hasEndPart = true
+			}
+		}
 		if bytes.Contains(line, []byte(" pcrc32=")) {
 			crc, crcErr := extractCRC(line, []byte(" pcrc32="))
 			if crcErr != nil {
@@ -403,9 +558,33 @@ func (r *NNTPResponse) processYencHeader(line []byte) {
 // accepted or selected as a provider fallback winner.
 func (r *NNTPResponse) validateBody() error {
 	if r.StatusCode != nntpBody {
+		if r.StatusCode >= 200 && r.StatusCode < 400 {
+			return fmt.Errorf("%w: BODY returned status %d", ErrBodyCorrupt, r.StatusCode)
+		}
 		return nil
 	}
-	if r.Format != rapidyenc.FormatYenc || !r.hasBegin {
+	switch r.Format {
+	case rapidyenc.FormatUnknown:
+		if r.sawYEncControl {
+			return fmt.Errorf("%w: yEnc control line without =ybegin", ErrBodyCorrupt)
+		}
+		return fmt.Errorf("%w: content is not a recognized encoding", errBodyEncodingUnknown)
+	case rapidyenc.FormatUU:
+		if r.uuHasBegin {
+			if !r.uuComplete || r.uuNeedEnd || !r.uuSeenData {
+				return fmt.Errorf("%w: truncated UU wrapper", ErrBodyCorrupt)
+			}
+			return nil
+		}
+		if !r.uuSeenData {
+			return fmt.Errorf("%w: missing UU data", ErrBodyCorrupt)
+		}
+		return nil
+	case rapidyenc.FormatYenc:
+	default:
+		return fmt.Errorf("%w: unsupported body format", errBodyEncodingUnknown)
+	}
+	if !r.hasBegin {
 		return fmt.Errorf("%w: missing valid =ybegin", ErrBodyCorrupt)
 	}
 	if r.headerErr != nil {
@@ -426,6 +605,9 @@ func (r *NNTPResponse) validateBody() error {
 	if r.YEnc.Part > 0 {
 		if !r.hasPart {
 			return fmt.Errorf("%w: multipart body missing =ypart", ErrBodyCorrupt)
+		}
+		if !r.hasEndPart || r.endPart != r.YEnc.Part {
+			return fmt.Errorf("%w: multipart trailer part does not match", ErrBodyCorrupt)
 		}
 		if r.YEnc.Total <= 0 || r.YEnc.Part > r.YEnc.Total {
 			return fmt.Errorf("%w: part exceeds total", ErrBodyCorrupt)

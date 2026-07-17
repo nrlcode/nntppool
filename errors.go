@@ -165,6 +165,15 @@ parsed:
 	return OperationUnknown
 }
 
+func isArticleOperation(payload []byte) bool {
+	switch operationFromPayload(payload) {
+	case OperationBody, OperationStat, OperationHead, operationArticle:
+		return true
+	default:
+		return false
+	}
+}
+
 func equalASCIIFold(value []byte, expected string) bool {
 	if len(value) != len(expected) {
 		return false
@@ -188,6 +197,8 @@ func classifyOutcome(code int, err error) OutcomeKind {
 		return OutcomeCancellation
 	case errors.Is(err, ErrBodyCorrupt), errors.Is(err, ErrCRCMismatch):
 		return OutcomeCorruptBody
+	case errors.Is(err, errBodyEncodingUnknown):
+		return OutcomeInconclusive
 	case errors.Is(err, ErrCircuitBreakerOpen):
 		return OutcomeTemporaryFailure
 	case errors.Is(err, ErrServiceUnavailable), errors.Is(err, ErrAuthRequired),
@@ -317,8 +328,11 @@ func responseError(resp Response) error {
 
 func cancellationResponse(attempts []AttemptEvidence, cause error) Response {
 	providerID := ""
-	if len(attempts) > 0 {
-		providerID = attempts[len(attempts)-1].ProviderID
+	for i := len(attempts) - 1; i >= 0; i-- {
+		if attempts[i].Outcome == OutcomeCancellation {
+			providerID = attempts[i].ProviderID
+			break
+		}
 	}
 	err := &TransportError{
 		Kind:       OutcomeCancellation,
@@ -367,6 +381,7 @@ var (
 	ErrServiceUnavailable  = &Error{Code: 502, Message: "service unavailable"}
 	ErrCRCMismatch         = errors.New("nntp: yEnc CRC mismatch")
 	ErrBodyCorrupt         = errors.New("nntp: corrupt article body")
+	errBodyEncodingUnknown = errors.New("nntp: unknown article body encoding")
 	ErrProtocolDesync      = errors.New("nntp: protocol desync: expected status line, got binary data")
 	ErrQuotaExceeded       = errors.New("nntp: download quota exceeded")
 	// ErrInvalidProviderConfiguration identifies a local provider address,

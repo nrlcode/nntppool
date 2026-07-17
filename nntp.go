@@ -159,6 +159,40 @@ func (e *greetingError) Is(target error) bool {
 	}
 }
 
+func (e *greetingError) Unwrap() error {
+	return &Error{Code: e.StatusCode, Message: e.Message}
+}
+
+func (e *greetingError) setupResponseCode() int {
+	return e.StatusCode
+}
+
+type setupResponseError struct {
+	cause      error
+	statusCode int
+}
+
+func (e *setupResponseError) Error() string {
+	if e == nil || e.cause == nil {
+		return "<nil>"
+	}
+	return e.cause.Error()
+}
+
+func (e *setupResponseError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func (e *setupResponseError) setupResponseCode() int {
+	if e == nil {
+		return 0
+	}
+	return e.statusCode
+}
+
 type Request struct {
 	Ctx context.Context
 
@@ -226,9 +260,11 @@ type Request struct {
 
 	// submittedAt, writtenAt, and responseHeadAt delimit the three transport
 	// timing components exposed in AttemptEvidence.
-	submittedAt    time.Time
-	writtenAt      atomic.Int64
-	responseHeadAt atomic.Int64
+	submittedAt      time.Time
+	writtenAt        atomic.Int64
+	responseHeadAt   atomic.Int64
+	writtenTime      time.Time
+	responseHeadTime time.Time
 
 	// heldBody is set by writeLoop when this (body-bearing) request acquired a
 	// bodySem slot, so readerLoop releases exactly the slots that were taken.
@@ -440,7 +476,10 @@ func authResponseError(stage string, resp NNTPResponse) error {
 	if category == nil {
 		category = &Error{Code: resp.StatusCode, Message: resp.Message}
 	}
-	return withErrorClassification(cause, category)
+	return &setupResponseError{
+		cause:      withErrorClassification(cause, category),
+		statusCode: resp.StatusCode,
+	}
 }
 
 func NewNNTPConnection(ctx context.Context, addr string, tlsConfig *tls.Config, inflightLimit int, reqCh <-chan *Request, auth Auth, userAgent string) (*NNTPConnection, error) {
@@ -1185,8 +1224,11 @@ func (e *callerWriterError) Unwrap() error {
 }
 
 func markRequestWritten(req *Request) {
-	now := time.Now().UnixNano()
-	req.writtenAt.Store(now)
+	now := time.Now()
+	req.writtenAt.Store(now.UnixNano())
+	req.lifecycleMu.Lock()
+	req.writtenTime = now
+	req.lifecycleMu.Unlock()
 	req.markPending()
 }
 
@@ -1338,6 +1380,12 @@ func (req *Request) currentCause() error {
 	req.lifecycleMu.Lock()
 	defer req.lifecycleMu.Unlock()
 	return req.noteCauseLocked(nil)
+}
+
+func (req *Request) timingBoundaries() (written, responseHead time.Time) {
+	req.lifecycleMu.Lock()
+	defer req.lifecycleMu.Unlock()
+	return req.writtenTime, req.responseHeadTime
 }
 
 func (req *Request) recordCause(cause error) {
@@ -1807,7 +1855,11 @@ func (c *NNTPConnection) readerLoop() {
 			req.Ctx = context.Background()
 		}
 		deferredCancellation := req.beginResponse()
-		req.responseHeadAt.Store(time.Now().UnixNano())
+		responseHeadTime := time.Now()
+		req.responseHeadAt.Store(responseHeadTime.UnixNano())
+		req.lifecycleMu.Lock()
+		req.responseHeadTime = responseHeadTime
+		req.lifecycleMu.Unlock()
 
 		resp := Response{
 			Request: req,
@@ -1883,7 +1935,7 @@ func (c *NNTPConnection) readerLoop() {
 		}
 		if err == nil && req.ValidateBody {
 			err = decoder.validateBody()
-			if err != nil && retirementErr == nil {
+			if err != nil && retirementErr == nil && !errors.Is(err, errBodyEncodingUnknown) {
 				retirementOwner, retirementErr = readDeadlineNone, err
 			}
 		}
@@ -1971,7 +2023,10 @@ func (c *NNTPConnection) readerLoop() {
 				if fb.IsZero() {
 					fb = clock.started
 				}
-				if headAt := req.responseHeadAt.Load(); headAt != 0 {
+				_, responseHeadTime := req.timingBoundaries()
+				if !responseHeadTime.IsZero() {
+					recordTTFB(c.stats, fb.Sub(responseHeadTime))
+				} else if headAt := req.responseHeadAt.Load(); headAt != 0 {
 					recordTTFB(c.stats, fb.Sub(time.Unix(0, headAt)))
 				}
 				recordSpeed(c.stats, n, time.Since(fb))
@@ -1992,7 +2047,8 @@ func (c *NNTPConnection) readerLoop() {
 			retire = retire || errors.As(resp.Err, &networkError) && networkError.Timeout() ||
 				errors.Is(resp.Err, ErrProtocolDesync)
 		}
-		retire = retire || resp.StatusCode == 502 || resp.StatusCode == 451 ||
+		retire = retire || resp.StatusCode == 502 ||
+			(resp.StatusCode == 451 && (req.PostMode || isArticleOperation(req.Payload))) ||
 			(retirementErr != nil && retirementOwner == readDeadlineAbandonedDrain)
 		if retire {
 			_ = c.closeTransport()
@@ -2619,6 +2675,15 @@ func (c *Client) sendValidatedBody(ctx context.Context, payload []byte, bodyWrit
 	return respCh
 }
 
+func (c *Client) requestCancellation(ctx context.Context) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	return c.ctx.Err()
+}
+
 // extractProbeMsgID returns the "<id@host>" message-ID from a BODY, HEAD, or
 // ARTICLE payload, or nil when the payload has no message-ID (GROUP, DATE, …)
 // or when the command is already STAT or POST (probing would be redundant or
@@ -2665,11 +2730,17 @@ func (c *Client) raceCandidates(
 	attempts *[]AttemptEvidence,
 	respCh chan<- Response,
 ) (delivered, cancelled bool, lastErr error) {
+	if err := c.requestCancellation(ctx); err != nil {
+		return false, true, err
+	}
 	// Filter to live candidates. Every configured provider remains independently
 	// eligible even when multiple accounts share one endpoint: co-location is
 	// not evidence that retention, authorization, or article availability agree.
 	live := make([]*providerGroup, 0, len(candidates))
 	for _, g := range candidates {
+		if err := c.requestCancellation(ctx); err != nil {
+			return false, true, err
+		}
 		if g.isQuotaExceeded() {
 			lastErr = fmt.Errorf("%s: %w", safeIdentityText(g.name), ErrQuotaExceeded)
 			*attempts = append(*attempts, buildEligibilityEvidence(payload, g.id, lastErr, validateBody))
@@ -2708,6 +2779,9 @@ func (c *Client) raceCandidates(
 		if resp.StatusCode == 430 || resp.StatusCode == 423 {
 			c.nextIdx.Add(1)
 			return false, false, lastErr
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+			return false, false, fmt.Errorf("%s: %w", safeIdentityText(g.name), toError(resp.StatusCode, resp.Status))
 		}
 		resp.Attempts = cloneAttempts(*attempts)
 		respCh <- resp
@@ -2941,12 +3015,60 @@ func attemptCommittedResp(resp Response) bool {
 	return resp.Request != nil && resp.Request.committed()
 }
 
+type setupResponseCoder interface {
+	setupResponseCode() int
+}
+
+func attemptPhaseDurations(submitted, written, responseHead, completed time.Time) (poolQueue, headWait, service time.Duration) {
+	if !submitted.IsZero() {
+		if completed.Before(submitted) {
+			completed = submitted
+		}
+		if written.IsZero() {
+			return completed.Sub(submitted), 0, 0
+		}
+		if written.Before(submitted) {
+			written = submitted
+		} else if written.After(completed) {
+			written = completed
+		}
+		poolQueue = written.Sub(submitted)
+		if responseHead.IsZero() {
+			return poolQueue, completed.Sub(written), 0
+		}
+		if responseHead.Before(written) {
+			responseHead = written
+		} else if responseHead.After(completed) {
+			responseHead = completed
+		}
+		return poolQueue, responseHead.Sub(written), completed.Sub(responseHead)
+	}
+
+	if !written.IsZero() {
+		if responseHead.IsZero() {
+			return 0, max(completed.Sub(written), 0), 0
+		}
+		headWait = max(responseHead.Sub(written), 0)
+	}
+	if !responseHead.IsZero() {
+		service = max(completed.Sub(responseHead), 0)
+	}
+	return 0, headWait, service
+}
+
 func buildAttemptEvidence(req *Request, providerID string, resp Response, completedAt time.Time) AttemptEvidence {
 	cause := resp.Err
 	if cause == nil {
 		cause = toError(resp.StatusCode, resp.Status)
 	}
-	outcome := classifyAttemptOutcome(req, resp.StatusCode, cause)
+	responseCode := resp.StatusCode
+	if responseCode == 0 && cause != nil {
+		var setupErr setupResponseCoder
+		if errors.As(cause, &setupErr) {
+			responseCode = setupErr.setupResponseCode()
+		}
+	}
+	outcome := classifyAttemptOutcome(req, responseCode, cause)
 	validation := BodyValidationNotApplicable
 	if operationFromPayload(req.Payload) == OperationBody {
 		if !req.ValidateBody {
@@ -2965,29 +3087,23 @@ func buildAttemptEvidence(req *Request, providerID string, resp Response, comple
 		}
 	}
 
-	var poolQueue, headWait, service time.Duration
+	writtenTime, responseHeadTime := req.timingBoundaries()
 	writtenAt := req.writtenAt.Load()
 	headAt := req.responseHeadAt.Load()
-	if !req.submittedAt.IsZero() && writtenAt > 0 {
-		poolQueue = time.Unix(0, writtenAt).Sub(req.submittedAt)
-	} else if !req.submittedAt.IsZero() {
-		poolQueue = completedAt.Sub(req.submittedAt)
+	if writtenTime.IsZero() && writtenAt > 0 {
+		writtenTime = time.Unix(0, writtenAt)
 	}
-	if writtenAt > 0 && headAt > 0 {
-		headWait = time.Duration(headAt - writtenAt)
-	} else if writtenAt > 0 {
-		headWait = completedAt.Sub(time.Unix(0, writtenAt))
+	if responseHeadTime.IsZero() && headAt > 0 {
+		responseHeadTime = time.Unix(0, headAt)
 	}
-	if headAt > 0 {
-		service = completedAt.Sub(time.Unix(0, headAt))
-	}
+	poolQueue, headWait, service := attemptPhaseDurations(req.submittedAt, writtenTime, responseHeadTime, completedAt)
 
 	providerResponseTimeout := headAt > 0 && req.providerDeadlineExpired(resp.Err)
 	return AttemptEvidence{
 		ProviderID:               providerID,
 		Operation:                operationFromPayload(req.Payload),
 		Outcome:                  outcome,
-		ResponseCode:             resp.StatusCode,
+		ResponseCode:             responseCode,
 		BodyValidation:           validation,
 		Cause:                    cause,
 		ProviderResponseTimeout:  providerResponseTimeout,
@@ -3129,7 +3245,7 @@ func (c *Client) tryGroupResilient(
 		if errors.Is(resp.Err, errFreshTransportRequired) {
 			continue
 		}
-		if !temporaryRetried && resp.Err == nil && resp.StatusCode == 451 {
+		if !temporaryRetried && resp.Err == nil && resp.StatusCode == 451 && isArticleOperation(payload) {
 			temporaryRetried = true
 			delay := temporaryRetryMinDelay + time.Duration(rand.Int64N(int64(temporaryRetryJitter)+1))
 			select {
@@ -3210,6 +3326,11 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 		idx := (start + attempt) % n
 		g := mains[idx]
 		if g.isQuotaExceeded() {
+			if err := c.requestCancellation(ctx); err != nil {
+				attempts = append(attempts, buildEligibilityEvidence(payload, g.id, err, validateBody))
+				respCh <- cancellationResponse(attempts, err)
+				return
+			}
 			lastErr = fmt.Errorf("%s: %w", safeIdentityText(g.name), ErrQuotaExceeded)
 			attempts = append(attempts, buildEligibilityEvidence(payload, g.id, lastErr, validateBody))
 			continue
@@ -3281,6 +3402,11 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			}
 			continue
 		}
+		if resp.StatusCode == 451 && !isArticleOperation(payload) {
+			resp.Attempts = cloneAttempts(attempts)
+			respCh <- resp
+			return
+		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 400 {
 			lastErr = fmt.Errorf("%s: %w", safeIdentityText(g.name), toError(resp.StatusCode, resp.Status))
 			continue
@@ -3314,8 +3440,17 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 		}
 	} else {
 		for i := range backups {
+			if err := c.requestCancellation(ctx); err != nil {
+				respCh <- cancellationResponse(attempts, err)
+				return
+			}
 			g := backups[i]
 			if g.isQuotaExceeded() {
+				if err := c.requestCancellation(ctx); err != nil {
+					attempts = append(attempts, buildEligibilityEvidence(payload, g.id, err, validateBody))
+					respCh <- cancellationResponse(attempts, err)
+					return
+				}
 				lastErr = fmt.Errorf("%s: %w", safeIdentityText(g.name), ErrQuotaExceeded)
 				attempts = append(attempts, buildEligibilityEvidence(payload, g.id, lastErr, validateBody))
 				continue
@@ -3351,6 +3486,10 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 				continue
 			}
 			resp.Attempts = cloneAttempts(attempts)
+			if resp.StatusCode == 451 && !isArticleOperation(payload) {
+				respCh <- resp
+				return
+			}
 			if resp.StatusCode == 430 || resp.StatusCode == 423 {
 				lastResp = resp
 				hasResp = true
@@ -3366,6 +3505,10 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 	}
 
 	// 3. All providers exhausted — deliver the last 430, the last error, or a fallback.
+	if err := c.requestCancellation(ctx); err != nil {
+		respCh <- cancellationResponse(attempts, err)
+		return
+	}
 	if lastErr != nil {
 		respCh <- Response{
 			Err:      newTransportError(attempts, lastErr),
