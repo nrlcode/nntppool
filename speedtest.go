@@ -174,25 +174,26 @@ func (c *Client) SpeedTest(ctx context.Context, opts SpeedTestOptions) (*SpeedTe
 	// Compute per-provider deltas.
 	startProvMap := make(map[string]ProviderStats, len(startStats.Providers))
 	for _, ps := range startStats.Providers {
-		startProvMap[ps.Name] = ps
+		startProvMap[ps.ProviderID] = ps
 	}
 
 	var resultProviders []ProviderStats
 	var totalMissing, totalErrors int64
 	for _, ps := range endStats.Providers {
-		if targetGroup != nil && ps.Name != opts.ProviderName {
+		if targetGroup != nil && ps.ProviderID != targetGroup.id {
 			continue
 		}
-		sp := startProvMap[ps.Name]
+		sp := startProvMap[ps.ProviderID]
 		delta := ProviderStats{
 			Name:              ps.Name,
+			ProviderID:        ps.ProviderID,
 			Missing:           ps.Missing - sp.Missing,
 			Errors:            ps.Errors - sp.Errors,
 			ActiveConnections: ps.ActiveConnections,
 			MaxConnections:    ps.MaxConnections,
 			Ping:              ps.Ping,
 		}
-		provWire := providerWireBytes(endStats, ps.Name) - providerWireBytes(startStats, ps.Name)
+		provWire := providerWireBytes(endStats, ps.ProviderID) - providerWireBytes(startStats, ps.ProviderID)
 		if secs := elapsed.Seconds(); secs > 0 {
 			delta.AvgSpeed = float64(provWire) / secs
 		}
@@ -256,16 +257,13 @@ func (c *Client) sendToGroup(ctx context.Context, g *providerGroup, payload []by
 	return outerCh
 }
 
-// findGroup searches mainGroups and backupGroups by resolved name or stable ID.
+// findGroup resolves a stable ID or operational name through the registry.
 func (c *Client) findGroup(name string) *providerGroup {
-	for _, gs := range []*[]*providerGroup{c.mainGroups.Load(), c.backupGroups.Load()} {
-		for _, g := range *gs {
-			if g.name == name || g.id == name {
-				return g
-			}
-		}
+	registration, exists := c.registrationForToken(name)
+	if !exists {
+		return nil
 	}
-	return nil
+	return registration.group
 }
 
 // loadSpeedTestSegments parses an NZB from opts.NZBReader or fetches from opts.NZBURL.
@@ -315,10 +313,10 @@ func totalWireBytes(s ClientStats) int64 {
 	return s.BytesConsumed
 }
 
-// providerWireBytes returns the raw BytesConsumed for a named provider from a stats snapshot.
-func providerWireBytes(s ClientStats, name string) int64 {
+// providerWireBytes returns raw BytesConsumed for a stable provider ID.
+func providerWireBytes(s ClientStats, providerID string) int64 {
 	for _, ps := range s.Providers {
-		if ps.Name == name {
+		if ps.ProviderID == providerID {
 			return ps.BytesConsumed
 		}
 	}

@@ -60,7 +60,13 @@ func (e *CircuitBreakerError) Error() string {
 	if e == nil {
 		return "<nil>"
 	}
-	return fmt.Sprintf("%v: provider %s is %s until %s", ErrCircuitBreakerOpen, e.ProviderID, e.State, e.RetryAt.Format(time.RFC3339Nano))
+	return fmt.Sprintf(
+		"%v: provider %s is %s until %s",
+		ErrCircuitBreakerOpen,
+		safeIdentityText(e.ProviderID),
+		e.State,
+		e.RetryAt.Format(time.RFC3339Nano),
+	)
 }
 
 func (e *CircuitBreakerError) Unwrap() error {

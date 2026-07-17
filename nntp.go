@@ -2237,6 +2237,12 @@ type Client struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	registry   atomic.Pointer[providerRegistry]
+	registryMu sync.Mutex
+	closed     bool
+
+	// Package tests written before the registry correction inspect these
+	// mirrors directly. Production code reads registry instead.
 	mainGroups   atomic.Pointer[[]*providerGroup]
 	backupGroups atomic.Pointer[[]*providerGroup]
 	nextIdx      atomic.Uint64 // round-robin counter for mainGroups
@@ -2247,7 +2253,8 @@ type Client struct {
 	breakerOn    bool
 	breakerClock circuitBreakerClock
 
-	providerIdx atomic.Int64 // monotonic counter for unnamed providers
+	nextGenerated           uint64
+	nextLifecycleGeneration uint64
 	// decodeFn is copied to each request when non-nil. It remains unexported so
 	// production callers cannot replace the transport decoder.
 	decodeFn func(dst, src []byte, state *rapidyenc.State) (nDst, nSrc int, end rapidyenc.End, err error)
@@ -2350,16 +2357,31 @@ func resolveProviderName(p Provider, index int) string {
 	return fmt.Sprintf("provider-%d", index)
 }
 
-func resolveProviderID(p Provider, index int) string {
-	if p.ID != "" {
-		return p.ID
+// pingResolvedProvider performs the optional startup probe without publishing
+// a group or touching the Client WaitGroup.
+func (c *Client) pingResolvedProvider(ctx context.Context, spec resolvedProvider) PingResult {
+	if spec.provider.SkipPing {
+		return PingResult{}
 	}
-	return resolveProviderName(p, index)
+	factory := spec.provider.Factory
+	if factory == nil {
+		host := spec.provider.Host
+		tlsCfg := spec.provider.TLSConfig
+		keepAlive := spec.provider.KeepAlive
+		factory = func(ctx context.Context) (net.Conn, error) {
+			return newNetConn(ctx, host, tlsCfg, keepAlive)
+		}
+	}
+	pingCtx, pingCancel := context.WithTimeout(ctx, defaultHandshakeTimeout)
+	result := pingProvider(pingCtx, factory, spec.provider.Auth)
+	pingCancel()
+	return result
 }
 
-// startProviderGroup creates a providerGroup, pings the provider, and launches
-// connection slot goroutines. The caller is responsible for storing the group.
-func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
+// startProviderGroup creates a providerGroup and launches its connection slots.
+// Any optional startup ping must already have completed.
+func (c *Client) startProviderGroup(spec resolvedProvider, ping PingResult) *providerGroup {
+	p := spec.provider
 	inflight := p.Inflight
 	if inflight <= 0 {
 		inflight = 1
@@ -2391,13 +2413,13 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 		}
 	}
 
-	name := resolveProviderName(p, index)
+	name := spec.name
 	gate := newConnGate(p.Connections, p.ThrottleRestore)
 	gctx, gcancel := context.WithCancel(c.ctx)
 
 	g := &providerGroup{
 		name:        name,
-		id:          resolveProviderID(p, index),
+		id:          spec.id,
 		host:        p.Host,
 		maxConns:    p.Connections,
 		ctx:         gctx,
@@ -2415,6 +2437,10 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 	g.stats.pipelineLimit = statInflight * p.Connections
 	g.stats.backgroundStatLimit = backgroundStatInflight * p.Connections
 	g.stats.priorityHeadroom = priorityHeadroom * p.Connections
+	g.stats.Ping = ping
+	if ping.Err == nil && ping.RTT > 0 {
+		g.stats.ttfbEWMA.Store(int64(ping.RTT))
+	}
 	if p.QuotaBytes > 0 {
 		if p.QuotaUsed > 0 {
 			g.stats.quotaUsed.Store(p.QuotaUsed)
@@ -2428,18 +2454,6 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 			} else {
 				g.quotaResetAt.Store(time.Now().Add(p.QuotaPeriod).UnixNano())
 			}
-		}
-	}
-
-	// Ping with a short timeout so we don't block forever.
-	if !p.SkipPing {
-		pingCtx, pingCancel := context.WithTimeout(c.ctx, defaultHandshakeTimeout)
-		g.stats.Ping = pingProvider(pingCtx, factory, p.Auth)
-		pingCancel()
-		// Seed the TTFB EWMA from the measured RTT so the adaptive attempt
-		// timeout has a sensible starting point before any request completes.
-		if g.stats.Ping.Err == nil && g.stats.Ping.RTT > 0 {
-			g.stats.ttfbEWMA.Store(int64(g.stats.Ping.RTT))
 		}
 	}
 
@@ -2475,7 +2489,7 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 
 	for range p.Connections {
 		c.wg.Add(1)
-		go runConnSlot(gctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, factory, inflight, statInflight, backgroundStatInflight, p.Auth, p.UserAgent, p.IdleTimeout, stall, drainBytes, drainTimeout, kaInterval, kaCmd, gate, &g.stats, name, g.id, &c.wg)
+		go runConnSlot(gctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, factory, inflight, statInflight, backgroundStatInflight, p.Auth, p.UserAgent, p.IdleTimeout, stall, drainBytes, drainTimeout, kaInterval, kaCmd, gate, &g.stats, safeIdentityText(name), g.id, &c.wg)
 	}
 
 	return g
@@ -2498,26 +2512,11 @@ func NewClient(ctx context.Context, providers []Provider, opts ...ClientOption) 
 		return nil, fmt.Errorf("nntp: at least one non-backup provider is required")
 	}
 
-	// Validation only — no TCP connections are created here.
-	seen := make(map[string]struct{}, len(providers))
-	seenIDs := make(map[string]struct{}, len(providers))
-	for i, p := range providers {
-		if p.Connections <= 0 {
-			return nil, fmt.Errorf("nntp: provider connections must be > 0")
-		}
-		if p.Factory == nil && p.Host == "" {
-			return nil, fmt.Errorf("nntp: provider must have Host or Factory")
-		}
-		name := resolveProviderName(p, i)
-		if _, dup := seen[name]; dup {
-			return nil, fmt.Errorf("nntp: provider %q already exists", name)
-		}
-		seen[name] = struct{}{}
-		id := resolveProviderID(p, i)
-		if _, dup := seenIDs[id]; dup {
-			return nil, fmt.Errorf("nntp: provider ID %q already exists", id)
-		}
-		seenIDs[id] = struct{}{}
+	// Resolve and reserve the complete identity namespace before any provider
+	// factory can dial.
+	resolved, owners, err := resolveInitialProviders(providers)
+	if err != nil {
+		return nil, err
 	}
 
 	if ctx == nil {
@@ -2531,30 +2530,34 @@ func NewClient(ctx context.Context, providers []Provider, opts ...ClientOption) 
 	}
 
 	c := &Client{
-		ctx:          ctx,
-		cancel:       cancel,
-		dispatch:     cfg.dispatch,
-		statProbe:    !cfg.statProbeOff,
-		speedAware:   !cfg.speedAwareOff,
-		breakerOn:    cfg.circuitBreakerEnabled,
-		breakerClock: cfg.circuitBreakerClock,
-		startTime:    time.Now(),
+		ctx:           ctx,
+		cancel:        cancel,
+		dispatch:      cfg.dispatch,
+		statProbe:     !cfg.statProbeOff,
+		speedAware:    !cfg.speedAwareOff,
+		breakerOn:     cfg.circuitBreakerEnabled,
+		breakerClock:  cfg.circuitBreakerClock,
+		nextGenerated: 1,
+		startTime:     time.Now(),
 	}
-	// Initialize empty slices.
-	c.mainGroups.Store(&[]*providerGroup{})
-	c.backupGroups.Store(&[]*providerGroup{})
+	registry := newProviderRegistry()
+	registry.ownerByToken = owners
 
-	var mainGs, backupGs []*providerGroup
-	for pi, p := range providers {
-		g := c.startProviderGroup(p, pi)
-		if p.Backup {
-			backupGs = append(backupGs, g)
-		} else {
-			mainGs = append(mainGs, g)
+	for _, spec := range resolved {
+		c.registryMu.Lock()
+		generation := c.nextProviderGenerationLocked()
+		c.registryMu.Unlock()
+		group := c.startProviderGroup(spec, c.pingResolvedProvider(c.ctx, spec))
+		registry.byID[spec.id] = providerRegistration{
+			spec:       spec,
+			group:      group,
+			generation: generation,
 		}
+		registry.orderedIDs = append(registry.orderedIDs, spec.id)
 	}
-	c.mainGroups.Store(&mainGs)
-	c.backupGroups.Store(&backupGs)
+	c.registryMu.Lock()
+	c.publishRegistryLocked(registry)
+	c.registryMu.Unlock()
 
 	return c, nil
 }
@@ -2565,9 +2568,10 @@ func NewClient(ctx context.Context, providers []Provider, opts ...ClientOption) 
 // reqCh is unnecessary and avoids a race with stale-snapshot senders.
 func (c *Client) Close() error {
 	c.cancel()
-	for _, gs := range []*[]*providerGroup{c.mainGroups.Load(), c.backupGroups.Load()} {
-		for _, g := range *gs {
-			g.gate.stop()
+	registry := c.closeRegistry()
+	for _, groups := range [...][]*providerGroup{registry.mains, registry.backups} {
+		for _, group := range groups {
+			group.gate.stop()
 		}
 	}
 	c.wg.Wait()
@@ -2667,7 +2671,7 @@ func (c *Client) raceCandidates(
 	live := make([]*providerGroup, 0, len(candidates))
 	for _, g := range candidates {
 		if g.isQuotaExceeded() {
-			lastErr = fmt.Errorf("%s: %w", g.name, ErrQuotaExceeded)
+			lastErr = fmt.Errorf("%s: %w", safeIdentityText(g.name), ErrQuotaExceeded)
 			*attempts = append(*attempts, buildEligibilityEvidence(payload, g.id, lastErr, validateBody))
 			continue
 		}
@@ -2698,11 +2702,8 @@ func (c *Client) raceCandidates(
 			return false, false, resp.Err
 		}
 		if resp.StatusCode == 502 {
-			_ = c.RemoveProvider(g.name)
-			if g.p.ReconnectDelay > 0 {
-				c.scheduleReconnect(g)
-			}
-			return false, false, fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
+			c.retireUnavailableProvider(g)
+			return false, false, fmt.Errorf("%s: %w", safeIdentityText(g.name), ErrServiceUnavailable)
 		}
 		if resp.StatusCode == 430 || resp.StatusCode == 423 {
 			c.nextIdx.Add(1)
@@ -2746,17 +2747,14 @@ func (c *Client) raceCandidates(
 		g := pr.g
 		switch pr.resp.StatusCode {
 		case 502:
-			_ = c.RemoveProvider(g.name)
-			if g.p.ReconnectDelay > 0 {
-				c.scheduleReconnect(g)
-			}
-			lastErr = fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
+			c.retireUnavailableProvider(g)
+			lastErr = fmt.Errorf("%s: %w", safeIdentityText(g.name), ErrServiceUnavailable)
 		case 430, 423:
 			c.nextIdx.Add(1)
 		case 223:
 			winners = append(winners, g)
 		default:
-			lastErr = fmt.Errorf("%s: %w", g.name, toError(pr.resp.StatusCode, pr.resp.Status))
+			lastErr = fmt.Errorf("%s: %w", safeIdentityText(g.name), toError(pr.resp.StatusCode, pr.resp.Status))
 		}
 	}
 
@@ -2793,15 +2791,12 @@ func (c *Client) raceCandidates(
 			continue
 		}
 		if resp.StatusCode == 502 {
-			_ = c.RemoveProvider(winner.name)
-			if winner.p.ReconnectDelay > 0 {
-				c.scheduleReconnect(winner)
-			}
-			lastErr = fmt.Errorf("%s: %w", winner.name, ErrServiceUnavailable)
+			c.retireUnavailableProvider(winner)
+			lastErr = fmt.Errorf("%s: %w", safeIdentityText(winner.name), ErrServiceUnavailable)
 			continue
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-			lastErr = fmt.Errorf("%s: %w", winner.name, toError(resp.StatusCode, resp.Status))
+			lastErr = fmt.Errorf("%s: %w", safeIdentityText(winner.name), toError(resp.StatusCode, resp.Status))
 			continue
 		}
 		resp.Attempts = cloneAttempts(*attempts)
@@ -3177,7 +3172,8 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 	post430 := false
 
 	// 1. Try all main providers.
-	mains := *c.mainGroups.Load()
+	registry := c.registry.Load()
+	mains := registry.mains
 	n := len(mains)
 	if n == 0 {
 		respCh <- Response{Err: errors.New("nntp: no main providers")}
@@ -3214,7 +3210,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 		idx := (start + attempt) % n
 		g := mains[idx]
 		if g.isQuotaExceeded() {
-			lastErr = fmt.Errorf("%s: %w", g.name, ErrQuotaExceeded)
+			lastErr = fmt.Errorf("%s: %w", safeIdentityText(g.name), ErrQuotaExceeded)
 			attempts = append(attempts, buildEligibilityEvidence(payload, g.id, lastErr, validateBody))
 			continue
 		}
@@ -3247,11 +3243,8 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 		if resp.StatusCode == 502 {
 			// Provider returned "service unavailable" — remove it from the
 			// pool immediately so no further requests are routed to it.
-			_ = c.RemoveProvider(g.name)
-			if g.p.ReconnectDelay > 0 {
-				c.scheduleReconnect(g)
-			}
-			lastErr = fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
+			c.retireUnavailableProvider(g)
+			lastErr = fmt.Errorf("%s: %w", safeIdentityText(g.name), ErrServiceUnavailable)
 			continue
 		}
 		if resp.StatusCode == 430 || resp.StatusCode == 423 {
@@ -3289,7 +3282,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			continue
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-			lastErr = fmt.Errorf("%s: %w", g.name, toError(resp.StatusCode, resp.Status))
+			lastErr = fmt.Errorf("%s: %w", safeIdentityText(g.name), toError(resp.StatusCode, resp.Status))
 			continue
 		}
 		// Success.
@@ -3299,7 +3292,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 	}
 
 	// 2. All main providers returned 430 (or died) — try backup providers.
-	backups := *c.backupGroups.Load()
+	backups := registry.backups
 	if raceable && post430 {
 		delivered, cancelled, raceErr := c.raceCandidates(
 			ctx, backups, statPayload, payload, bodyWriter, onMeta,
@@ -3323,7 +3316,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 		for i := range backups {
 			g := backups[i]
 			if g.isQuotaExceeded() {
-				lastErr = fmt.Errorf("%s: %w", g.name, ErrQuotaExceeded)
+				lastErr = fmt.Errorf("%s: %w", safeIdentityText(g.name), ErrQuotaExceeded)
 				attempts = append(attempts, buildEligibilityEvidence(payload, g.id, lastErr, validateBody))
 				continue
 			}
@@ -3353,11 +3346,8 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 				continue
 			}
 			if resp.StatusCode == 502 {
-				_ = c.RemoveProvider(g.name)
-				if g.p.ReconnectDelay > 0 {
-					c.scheduleReconnect(g)
-				}
-				lastErr = fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
+				c.retireUnavailableProvider(g)
+				lastErr = fmt.Errorf("%s: %w", safeIdentityText(g.name), ErrServiceUnavailable)
 				continue
 			}
 			resp.Attempts = cloneAttempts(attempts)
@@ -3367,7 +3357,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 				continue
 			}
 			if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-				lastErr = fmt.Errorf("%s: %w", g.name, toError(resp.StatusCode, resp.Status))
+				lastErr = fmt.Errorf("%s: %w", safeIdentityText(g.name), toError(resp.StatusCode, resp.Status))
 				continue
 			}
 			respCh <- resp
@@ -3391,7 +3381,8 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 
 // NumProviders returns the number of configured providers (main + backup).
 func (c *Client) NumProviders() int {
-	return len(*c.mainGroups.Load()) + len(*c.backupGroups.Load())
+	registry := c.registry.Load()
+	return len(registry.mains) + len(registry.backups)
 }
 
 // Stats returns a snapshot of per-provider and aggregate metrics.
@@ -3401,8 +3392,9 @@ func (c *Client) Stats() ClientStats {
 	var cs ClientStats
 	cs.Elapsed = elapsed
 	var totalBytes int64
-	for _, groups := range [...]*[]*providerGroup{c.mainGroups.Load(), c.backupGroups.Load()} {
-		for _, g := range *groups {
+	registry := c.registry.Load()
+	for _, groups := range [...][]*providerGroup{registry.mains, registry.backups} {
+		for _, g := range groups {
 			consumed := g.stats.BytesConsumed.Load()
 			totalBytes += consumed
 			maxSlots, running := g.gate.snapshot()
@@ -3451,85 +3443,21 @@ func (c *Client) Stats() ClientStats {
 // AddProvider validates, pings, and registers a new provider at runtime.
 // Ping failures are recorded in the group's stats but do not cause an error return.
 func (c *Client) AddProvider(p Provider) error {
-	if p.Connections <= 0 {
-		return fmt.Errorf("nntp: provider connections must be > 0")
+	return c.addProvider(p)
+}
+
+// RemoveProvider stops and removes a provider by stable ID or operational name.
+// Goroutines wind down asynchronously; Client.Close still waits for all via c.wg.
+func (c *Client) RemoveProvider(name string) error {
+	group, exists := c.removeProvider(name)
+	if !exists {
+		return fmt.Errorf("nntp: provider %q not found", name)
 	}
-	if p.Factory == nil && p.Host == "" {
-		return fmt.Errorf("nntp: provider must have Host or Factory")
-	}
-
-	idx := int(c.providerIdx.Add(1))
-	name := resolveProviderName(p, idx)
-	id := resolveProviderID(p, idx)
-
-	// Check for duplicate name.
-	for _, gs := range [...]*[]*providerGroup{c.mainGroups.Load(), c.backupGroups.Load()} {
-		for _, g := range *gs {
-			if g.name == name || g.id == id {
-				return fmt.Errorf("nntp: provider %q already exists", name)
-			}
-		}
-	}
-
-	g := c.startProviderGroup(p, idx)
-
-	// Copy-on-write append.
-	if p.Backup {
-		old := c.backupGroups.Load()
-		updated := make([]*providerGroup, len(*old)+1)
-		copy(updated, *old)
-		updated[len(*old)] = g
-		c.backupGroups.Store(&updated)
-	} else {
-		old := c.mainGroups.Load()
-		updated := make([]*providerGroup, len(*old)+1)
-		copy(updated, *old)
-		updated[len(*old)] = g
-		c.mainGroups.Store(&updated)
+	if group != nil {
+		group.cancel()
+		group.gate.stop()
 	}
 	return nil
-}
-
-// RemoveProvider stops and removes a provider by name.
-// Goroutines wind down asynchronously; Client.Close still waits for all via c.wg.
-func (c *Client) scheduleReconnect(g *providerGroup) {
-	go func() {
-		select {
-		case <-c.ctx.Done():
-			return
-		case <-time.After(g.p.ReconnectDelay):
-		}
-		_ = c.AddProvider(g.p) // no-op if client closed or duplicate
-	}()
-}
-
-func (c *Client) RemoveProvider(name string) error {
-	for _, pair := range [...]struct {
-		ptr *atomic.Pointer[[]*providerGroup]
-	}{
-		{&c.mainGroups},
-		{&c.backupGroups},
-	} {
-		old := pair.ptr.Load()
-		for i, g := range *old {
-			if g.name != name {
-				continue
-			}
-			// Found it — cancel context and stop gate. Context cancellation
-			// is sufficient; runConnSlot goroutines exit via ctx.Done() and
-			// tryGroup detects removal via g.ctx.Done().
-			g.cancel()
-			g.gate.stop()
-
-			// Copy-on-write removal.
-			updated := make([]*providerGroup, 0, len(*old)-1)
-			updated = append(updated, (*old)[:i]...)
-			updated = append(updated, (*old)[i+1:]...)
-			pair.ptr.Store(&updated)
-			return nil
-		}
-	}
-	return fmt.Errorf("nntp: provider %q not found", name)
 }
 
 // ResetProviderQuota resets the download quota for the named provider without
@@ -3539,23 +3467,17 @@ func (c *Client) RemoveProvider(name string) error {
 //
 // Returns an error if no provider with that name is registered.
 func (c *Client) ResetProviderQuota(name string) error {
-	for _, ptr := range [...]*atomic.Pointer[[]*providerGroup]{
-		&c.mainGroups,
-		&c.backupGroups,
-	} {
-		for _, g := range *ptr.Load() {
-			if g.name != name {
-				continue
-			}
-			g.stats.quotaUsed.Store(0)
-			g.stats.quotaExceeded.Store(false)
-			if g.quotaPeriod > 0 {
-				g.quotaResetAt.Store(time.Now().Add(g.quotaPeriod).UnixNano())
-			} else {
-				g.quotaResetAt.Store(0)
-			}
-			return nil
-		}
+	registration, exists := c.registrationForToken(name)
+	if !exists || registration.group == nil {
+		return fmt.Errorf("nntp: provider %q not found", name)
 	}
-	return fmt.Errorf("nntp: provider %q not found", name)
+	group := registration.group
+	group.stats.quotaUsed.Store(0)
+	group.stats.quotaExceeded.Store(false)
+	if group.quotaPeriod > 0 {
+		group.quotaResetAt.Store(time.Now().Add(group.quotaPeriod).UnixNano())
+	} else {
+		group.quotaResetAt.Store(0)
+	}
+	return nil
 }
