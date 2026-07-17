@@ -629,8 +629,10 @@ func TestFNCOREPendingCancelledPostNeverReadsNonClosableBody(t *testing.T) {
 				t.Fatal("STAT and POST did not become FIFO-pending")
 			}
 			// The server has read both complete command lines from net.Pipe, which
-			// is the external proof that POST crossed the flush boundary. Do not
-			// depend on an internal timestamp being published by the implementation.
+			// proves the flush boundary. Wait until the reader has removed the
+			// earlier request and POST is the sole pending FIFO response before
+			// cancellation; this excludes a writing-to-pending scheduler race.
+			waitFNCOREChannelDepth(t, connection.pending, 1, "FIFO-pending POST")
 			cancelPost()
 			releaseServerResponses()
 			if response := awaitFNCOREPhaseResponse(t, earlier.RespCh, "earlier pending-POST STAT"); response.Err != nil || response.StatusCode != 223 {
