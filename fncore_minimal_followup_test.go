@@ -36,6 +36,11 @@ type fncoreFollowupConn struct {
 	writeNeedle []byte
 	writeSeen   chan struct{}
 	writeOnce   sync.Once
+
+	readCalls    atomic.Int32
+	observeRead  atomic.Int32
+	readObserved chan struct{}
+	readOnce     sync.Once
 }
 
 func newFNCOREFollowupConn(blockClose bool, reads ...fncoreFollowupRead) *fncoreFollowupConn {
@@ -46,6 +51,7 @@ func newFNCOREFollowupConn(blockClose bool, reads ...fncoreFollowupRead) *fncore
 		closeRelease: make(chan struct{}),
 		blockClose:   blockClose,
 		writeSeen:    make(chan struct{}),
+		readObserved: make(chan struct{}),
 	}
 	for _, result := range reads {
 		c.reads <- result
@@ -59,7 +65,11 @@ func (c *fncoreFollowupConn) Read(p []byte) (int, error) {
 		if len(result.data) > len(p) {
 			return 0, io.ErrShortBuffer
 		}
-		return copy(p, result.data), result.err
+		n := copy(p, result.data)
+		if call := c.readCalls.Add(1); call == c.observeRead.Load() {
+			c.readOnce.Do(func() { close(c.readObserved) })
+		}
+		return n, result.err
 	case <-c.closed:
 		return 0, net.ErrClosed
 	}
@@ -89,6 +99,10 @@ func (c *fncoreFollowupConn) Close() error {
 
 func (c *fncoreFollowupConn) releaseClose() {
 	c.releaseOnce.Do(func() { close(c.closeRelease) })
+}
+
+func (c *fncoreFollowupConn) observeReadCall(call int32) {
+	c.observeRead.Store(call)
 }
 
 func (*fncoreFollowupConn) LocalAddr() net.Addr              { return nil }
@@ -370,5 +384,237 @@ func TestFNCOREBadKeepalivePhysicallyClosesTransportOnce(t *testing.T) {
 	}
 	if got := conn.closeCalls.Load(); got != 1 {
 		t.Fatalf("physical Close calls after bad keepalive = %d, want exactly one", got)
+	}
+}
+
+type fncoreBlockingPostCloseBody struct {
+	data         []byte
+	offset       int
+	reads        atomic.Int32
+	closeEntered chan struct{}
+	closeRelease chan struct{}
+	enteredOnce  sync.Once
+	releaseOnce  sync.Once
+}
+
+func newFNCOREBlockingPostCloseBody(data []byte) *fncoreBlockingPostCloseBody {
+	return &fncoreBlockingPostCloseBody{
+		data:         data,
+		closeEntered: make(chan struct{}),
+		closeRelease: make(chan struct{}),
+	}
+}
+
+func (b *fncoreBlockingPostCloseBody) Read(p []byte) (int, error) {
+	b.reads.Add(1)
+	if b.offset == len(b.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, b.data[b.offset:])
+	b.offset += n
+	return n, nil
+}
+
+func (b *fncoreBlockingPostCloseBody) Close() error {
+	b.enteredOnce.Do(func() { close(b.closeEntered) })
+	<-b.closeRelease
+	return nil
+}
+
+func (b *fncoreBlockingPostCloseBody) releaseClose() {
+	b.releaseOnce.Do(func() { close(b.closeRelease) })
+}
+
+func assertFNCOREPostCloseStillOwnsResponse(
+	t *testing.T,
+	connection *NNTPConnection,
+	responseCh <-chan Response,
+	label string,
+) {
+	t.Helper()
+	select {
+	case response := <-responseCh:
+		t.Fatalf("%s response published while PayloadBody.Close was blocked: %+v", label, response)
+	default:
+	}
+	if got := len(connection.bodySem); got != 1 {
+		t.Fatalf("%s BODY capacity while PayloadBody.Close was blocked = %d, want 1", label, got)
+	}
+}
+
+func TestFNCOREPostFinalReadDoesNotWaitForPayloadBodyClose(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		final fncoreFollowupRead
+	}{
+		{name: "240", final: fncoreFollowupRead{data: []byte("240 article posted\r\n")}},
+		{name: "EOF", final: fncoreFollowupRead{err: io.EOF}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reads := []fncoreFollowupRead{
+				{data: []byte("200 POST close-order server ready\r\n")},
+				{data: []byte("340 send article\r\n")},
+				test.final,
+			}
+			if test.name == "240" {
+				reads = append(reads, fncoreFollowupRead{data: []byte("223 1 <reuse@example.invalid> exists\r\n")})
+			}
+			conn := newFNCOREFollowupConn(false, reads...)
+			conn.observeReadCall(3)
+			reqCh := make(chan *Request, 2)
+			connection := fncoreFollowupConnection(t, conn, 1, reqCh)
+			body := newFNCOREBlockingPostCloseBody([]byte("article\r\n.\r\n"))
+			t.Cleanup(body.releaseClose)
+			post := &Request{
+				Ctx:         context.Background(),
+				Payload:     []byte("POST\r\n"),
+				PayloadBody: body,
+				PostMode:    true,
+				RespCh:      make(chan Response, 1),
+				submittedAt: time.Now(),
+			}
+			go connection.Run()
+			reqCh <- post
+
+			select {
+			case <-body.closeEntered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("clean POST did not reach blocking PayloadBody.Close")
+			}
+			select {
+			case <-conn.readObserved:
+			case <-time.After(500 * time.Millisecond):
+				t.Fatal("POST final response read waited for PayloadBody.Close")
+			}
+			if test.name == "EOF" {
+				select {
+				case <-conn.closeEntered:
+				case <-time.After(500 * time.Millisecond):
+					t.Fatal("POST final EOF did not begin transport retirement while PayloadBody.Close was blocked")
+				}
+			} else {
+				select {
+				case <-conn.closeEntered:
+					t.Fatal("successful POST retired its reusable transport")
+				default:
+				}
+			}
+			assertFNCOREPostCloseStillOwnsResponse(t, connection, post.RespCh, test.name+" POST")
+
+			body.releaseClose()
+			response := awaitFNCOREPhaseResponse(t, post.RespCh, test.name+" POST after body close")
+			if test.name == "240" {
+				if response.Err != nil || response.StatusCode != 240 || len(response.Attempts) != 1 ||
+					response.Attempts[0].Outcome != OutcomeSuccess {
+					t.Fatalf("successful POST response = %+v", response)
+				}
+				reuse := &Request{
+					Ctx:         context.Background(),
+					Payload:     []byte("STAT <reuse@example.invalid>\r\n"),
+					RespCh:      make(chan Response, 1),
+					submittedAt: time.Now(),
+				}
+				reqCh <- reuse
+				if reused := awaitFNCOREPhaseResponse(t, reuse.RespCh, "POST transport reuse"); reused.Err != nil || reused.StatusCode != 223 {
+					t.Fatalf("POST transport reuse response = %+v", reused)
+				}
+				if got := conn.closeCalls.Load(); got != 0 {
+					t.Fatalf("physical Close calls before successful reuse shutdown = %d, want zero", got)
+				}
+				if err := connection.Close(); err != nil {
+					t.Fatalf("successful POST connection Close() error = %v", err)
+				}
+			} else {
+				if !errors.Is(response.Err, io.EOF) || len(response.Attempts) != 1 ||
+					response.Attempts[0].Outcome != OutcomeTransportFailure {
+					t.Fatalf("POST final EOF response = %+v", response)
+				}
+				select {
+				case <-connection.Done():
+				case <-time.After(5 * time.Second):
+					t.Fatal("POST final EOF did not retire the connection")
+				}
+			}
+			if got := conn.closeCalls.Load(); got != 1 {
+				t.Fatalf("physical Close calls after %s POST settlement = %d, want one", test.name, got)
+			}
+		})
+	}
+}
+
+func TestFNCOREPostInterim340WithEOFClosesWithoutReadingBody(t *testing.T) {
+	conn := newFNCOREFollowupConn(false,
+		fncoreFollowupRead{data: []byte("200 interim EOF server ready\r\n")},
+		fncoreFollowupRead{data: []byte("340 send article\r\n"), err: io.EOF},
+	)
+	conn.observeReadCall(2)
+	conn.writeNeedle = []byte("STAT <collateral@example.invalid>")
+	reqCh := make(chan *Request, 2)
+	connection := fncoreFollowupConnection(t, conn, 1, reqCh)
+	body := newFNCOREBlockingPostCloseBody(nil)
+	t.Cleanup(body.releaseClose)
+	post := &Request{
+		Ctx:         context.Background(),
+		Payload:     []byte("POST\r\n"),
+		PayloadBody: body,
+		PostMode:    true,
+		RespCh:      make(chan Response, 1),
+		submittedAt: time.Now(),
+	}
+	go connection.Run()
+	reqCh <- post
+
+	select {
+	case <-body.closeEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("interim 340+EOF did not reach blocking PayloadBody.Close")
+	}
+	select {
+	case <-conn.readObserved:
+	default:
+		t.Fatal("interim 340+EOF read was not completed before PayloadBody.Close")
+	}
+	if got := body.reads.Load(); got != 0 {
+		t.Fatalf("interim 340+EOF body Read calls = %d, want zero", got)
+	}
+	select {
+	case <-conn.closeEntered:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("interim 340+EOF did not begin transport retirement while PayloadBody.Close was blocked")
+	}
+	assertFNCOREPostCloseStillOwnsResponse(t, connection, post.RespCh, "interim 340+EOF POST")
+
+	body.releaseClose()
+	response := awaitFNCOREPhaseResponse(t, post.RespCh, "interim 340+EOF POST after body close")
+	if !errors.Is(response.Err, io.EOF) || response.StatusCode != 340 || len(response.Attempts) != 1 ||
+		response.Attempts[0].Operation != OperationPost ||
+		response.Attempts[0].Outcome != OutcomeTransportFailure ||
+		!errors.Is(response.Attempts[0].Cause, io.EOF) {
+		t.Fatalf("interim 340+EOF response = %+v", response)
+	}
+	if got := body.reads.Load(); got != 0 {
+		t.Fatalf("interim 340+EOF body Read calls after settlement = %d, want zero", got)
+	}
+	collateral := &Request{
+		Ctx:         context.Background(),
+		Payload:     []byte("STAT <collateral@example.invalid>\r\n"),
+		RespCh:      make(chan Response, 1),
+		submittedAt: time.Now(),
+	}
+	reqCh <- collateral
+	select {
+	case <-connection.Done():
+	case <-conn.writeSeen:
+		t.Fatal("interim 340+EOF transport accepted collateral work")
+	case <-time.After(5 * time.Second):
+		t.Fatal("interim 340+EOF connection did not settle")
+	}
+	select {
+	case <-conn.writeSeen:
+		t.Fatal("interim 340+EOF transport wrote collateral after retirement")
+	default:
+	}
+	if got := conn.closeCalls.Load(); got != 1 {
+		t.Fatalf("physical Close calls after interim 340+EOF = %d, want one", got)
 	}
 }
