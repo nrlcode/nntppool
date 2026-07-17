@@ -15,7 +15,11 @@ import (
 func awaitFNCOREPhaseResponse(t *testing.T, responseCh <-chan Response, label string) Response {
 	t.Helper()
 	select {
-	case response := <-responseCh:
+	case response, ok := <-responseCh:
+		if !ok {
+			t.Fatalf("%s response channel closed without a response", label)
+			return Response{}
+		}
 		return response
 	case <-time.After(5 * time.Second):
 		t.Fatalf("timeout waiting for %s response", label)

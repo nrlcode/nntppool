@@ -632,31 +632,65 @@ func TestFNCOREPendingCancelledPostNeverReadsNonClosableBody(t *testing.T) {
 			// is the external proof that POST crossed the flush boundary. Do not
 			// depend on an internal timestamp being published by the implementation.
 			cancelPost()
-			select {
-			case <-body.started:
-				body.Release()
-				t.Fatal("non-closable POST body was read before its FIFO response arrived")
-			default:
-			}
 			releaseServerResponses()
 			if response := awaitFNCOREPhaseResponse(t, earlier.RespCh, "earlier pending-POST STAT"); response.Err != nil || response.StatusCode != 223 {
 				t.Fatalf("earlier pending-POST response = %+v", response)
 			}
 
 			var response Response
+			responseReceived := false
+			responseClosed := false
+			serverSettled := false
 			readAfterCancellation := false
+			responseEvents := (<-chan Response)(post.RespCh)
+			bodyEvents := (<-chan struct{})(body.started)
+			serverEvents := (<-chan error)(serverDone)
+			settlementTimer := time.NewTimer(2 * time.Second)
+			defer settlementTimer.Stop()
+			for (!responseReceived && !responseClosed) || !serverSettled {
+				select {
+				case <-bodyEvents:
+					readAfterCancellation = true
+					bodyEvents = nil
+					body.Release()
+				case next, ok := <-responseEvents:
+					if !ok {
+						responseClosed = true
+					} else {
+						response = next
+						responseReceived = true
+					}
+					responseEvents = nil
+				case <-serverEvents:
+					serverSettled = true
+					serverEvents = nil
+				case <-settlementTimer.C:
+					select {
+					case <-body.started:
+						readAfterCancellation = true
+					default:
+					}
+					body.Release()
+					if readAfterCancellation {
+						t.Fatalf("canceled FIFO-pending POST began body Read after %s", status.name)
+					}
+					t.Fatal("canceled FIFO-pending POST request/server settlement timed out")
+				}
+			}
+			// A response channel or server result may win the select immediately
+			// after Read begins. Sample the monotonic body event once more before
+			// evaluating response settlement so that violation always has priority.
 			select {
-			case response = <-post.RespCh:
 			case <-body.started:
 				readAfterCancellation = true
 				body.Release()
-				response = awaitFNCOREPhaseResponse(t, post.RespCh, "released canceled pending POST")
-			case <-time.After(750 * time.Millisecond):
-				body.Release()
-				t.Fatal("canceled FIFO-pending POST did not settle without reading its non-closable body")
+			default:
 			}
 			if readAfterCancellation {
 				t.Fatalf("canceled FIFO-pending POST began body Read after %s", status.name)
+			}
+			if responseClosed {
+				t.Fatal("canceled FIFO-pending POST response channel closed without a response")
 			}
 			if !errors.Is(response.Err, context.Canceled) || len(response.Attempts) != 1 ||
 				response.Attempts[0].Outcome != OutcomeCancellation {
@@ -940,6 +974,7 @@ func requireFNCOREPretransportPostClosesPipe(
 ) Response {
 	t.Helper()
 	pipeReader, pipeWriter := io.Pipe()
+	t.Cleanup(func() { _ = pipeReader.Close() })
 	producerDone := make(chan error, 1)
 	go func() {
 		_, err := pipeWriter.Write(bytes.Repeat([]byte("encoded article data"), 1024))
