@@ -496,8 +496,12 @@ func (c *fncoreFailDrainDeadlineClearConn) SetReadDeadline(deadline time.Time) e
 		return errFNCOREDrainDeadlineClear
 	}
 	if !deadline.IsZero() {
+		if err := c.Conn.SetReadDeadline(deadline); err != nil {
+			return err
+		}
 		c.armed.Store(true)
 		c.armedOnce.Do(func() { close(c.armedSet) })
+		return nil
 	}
 	return c.Conn.SetReadDeadline(deadline)
 }
