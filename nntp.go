@@ -555,7 +555,7 @@ func (req *Request) noteCauseLocked(cause error) error {
 
 func (req *Request) stopBeforeTransport(cause error) bool {
 	req.lifecycleMu.Lock()
-	req.noteCauseLocked(cause)
+	_ = req.noteCauseLocked(cause)
 	if req.phase != requestQueued {
 		req.lifecycleMu.Unlock()
 		return false
@@ -571,7 +571,7 @@ func (req *Request) stopBeforeTransport(cause error) bool {
 func (req *Request) claimTransport() bool {
 	req.lifecycleMu.Lock()
 	if req.Ctx != nil && req.Ctx.Err() != nil {
-		req.noteCauseLocked(req.Ctx.Err())
+		_ = req.noteCauseLocked(req.Ctx.Err())
 	}
 	if req.phase != requestQueued || req.lifecycleCause != nil {
 		if req.phase == requestQueued {
@@ -630,7 +630,7 @@ func (req *Request) startWatch(c *NNTPConnection) {
 
 func (req *Request) cancelOwned(c *NNTPConnection, cause error) {
 	req.lifecycleMu.Lock()
-	req.noteCauseLocked(cause)
+	_ = req.noteCauseLocked(cause)
 	retire := false
 	forceDrain := false
 	switch req.phase {
@@ -710,7 +710,7 @@ func (req *Request) finalize(cause error) error {
 		return final
 	}
 	providerTimeout := req.providerDeadlineExpiredLocked(cause)
-	req.noteCauseLocked(nil)
+	_ = req.noteCauseLocked(nil)
 	switch {
 	case req.localWriterError != nil:
 		req.finalCause = req.localWriterError
@@ -1342,7 +1342,7 @@ func (req *Request) currentCause() error {
 
 func (req *Request) recordCause(cause error) {
 	req.lifecycleMu.Lock()
-	req.noteCauseLocked(cause)
+	_ = req.noteCauseLocked(cause)
 	req.lifecycleMu.Unlock()
 }
 
@@ -1915,7 +1915,6 @@ func (c *NNTPConnection) readerLoop() {
 				owner2, err2, terminalOwner2, terminalErr2 := c.rb.feedUntilDoneControlledOwned(c.conn, &decoder2, io.Discard, func(wireBytes, consumedBytes int) (time.Time, bool, readDeadlineOwner, int, error) {
 					return finalClock.control(req.Ctx, wireBytes, consumedBytes)
 				})
-				deadlineOwner, err = owner2, err2
 				retirementOwner, retirementErr = owner2, err2
 				if retirementErr == nil && terminalErr2 != nil {
 					retirementOwner, retirementErr = terminalOwner2, terminalErr2
@@ -1923,7 +1922,6 @@ func (c *NNTPConnection) readerLoop() {
 				}
 				if err2 != nil {
 					err2 = normalizeRequestReadError(req, owner2, err2)
-					err = err2
 					if c.providerName != "" {
 						resp.Err = fmt.Errorf("%s: %w", c.providerName, err2)
 					} else {
