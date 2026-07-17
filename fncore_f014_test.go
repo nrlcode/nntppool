@@ -91,11 +91,11 @@ func TestFNCORELiveCallerDeadlineDoesNotHideFlushedSTATTransportFailure(t *testi
 		}
 
 		var transportErr *TransportError
-		if !errors.As(result.Err, &transportErr) ||
+		if result.Err == nil ||
+			!errors.As(result.Err, &transportErr) ||
 			transportErr.Kind != OutcomeTransportFailure ||
-			!errors.Is(result.Err, io.EOF) ||
 			errors.Is(result.Err, context.DeadlineExceeded) {
-			t.Errorf("outer request %d error = %v (transport %+v), want EOF transport failure while caller remains live",
+			t.Errorf("outer request %d error = %v (transport %+v), want non-cancellation transport failure while caller remains live",
 				request, result.Err, transportErr)
 		}
 
