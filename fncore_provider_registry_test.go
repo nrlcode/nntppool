@@ -295,82 +295,166 @@ func TestFNCORECHG002ReconnectPreservesGeneratedIdentityAndOrder(t *testing.T) {
 	}
 }
 
-func TestFNCORECHG002ConcurrentAddAndRemoveCannotLosePublication(t *testing.T) {
-	var dials atomic.Int64
-	client, err := NewClient(context.Background(), []Provider{
-		{
-			ID:          "keep-id",
-			Host:        "keep.example:119",
-			Factory:     fncoreCHG002FailingFactory(&dials),
-			Connections: 1,
-			SkipPing:    true,
-		},
-		{
-			ID:          "remove-id",
-			Host:        "remove.example:119",
-			Factory:     fncoreCHG002FailingFactory(&dials),
-			Connections: 1,
-			SkipPing:    true,
-		},
-	})
+func TestFNCORECHG002ConcurrentAddsReserveIdentityBeforeDial(t *testing.T) {
+	var baseDials, addedDials atomic.Int64
+	client, err := NewClient(context.Background(), []Provider{{
+		ID:          "base-id",
+		Host:        "base.example:119",
+		Factory:     fncoreCHG002FailingFactory(&baseDials),
+		Connections: 1,
+		SkipPing:    true,
+	}})
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)
 	}
 	defer func() { _ = client.Close() }()
 
-	removed := client.findGroup("remove-id")
-	if removed == nil {
-		t.Fatal("remove target not registered")
-	}
-	removed.gate.mu.Lock()
-	gateLocked := true
+	start := make(chan struct{})
 	defer func() {
-		if gateLocked {
-			removed.gate.mu.Unlock()
+		select {
+		case <-start:
+		default:
+			close(start)
 		}
 	}()
-
-	removeDone := make(chan error, 1)
-	go func() {
-		removeDone <- client.RemoveProvider("remove.example:119")
-	}()
-
-	select {
-	case <-removed.ctx.Done():
-		// RemoveProvider loaded the old snapshot and is blocked in gate.stop.
-	case <-time.After(time.Second):
-		t.Fatal("RemoveProvider did not reach the deterministic publication barrier")
-	}
-
-	if err := client.AddProvider(Provider{
-		ID:          "added-id",
-		Host:        "added.example:119",
-		Factory:     fncoreCHG002FailingFactory(&dials),
-		Connections: 1,
-		SkipPing:    true,
-	}); err != nil {
-		t.Fatalf("concurrent AddProvider() error = %v", err)
-	}
-	if got := client.NumProviders(); got != 3 {
-		t.Fatalf("NumProviders() before releasing remove = %d, want 3", got)
-	}
-
-	removed.gate.mu.Unlock()
-	gateLocked = false
-	select {
-	case err := <-removeDone:
-		if err != nil {
-			t.Fatalf("RemoveProvider() error = %v", err)
+	enteredPing := make(chan struct{}, 2)
+	releasePing := make(chan struct{})
+	defer func() {
+		select {
+		case <-releasePing:
+		default:
+			close(releasePing)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("RemoveProvider did not finish after releasing barrier")
+	}()
+	pingFactory := func(ctx context.Context) (net.Conn, error) {
+		addedDials.Add(1)
+		enteredPing <- struct{}{}
+		select {
+		case <-releasePing:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return fncoreCHG002StatusFactory("111 20260716120000")(ctx)
 	}
 
+	results := make(chan error, 2)
+	started := make(chan struct{}, 2)
+	add := func(host string) {
+		started <- struct{}{}
+		<-start
+		results <- client.AddProvider(Provider{
+			ID:          "shared-canonical-id",
+			Host:        host,
+			Factory:     pingFactory,
+			Connections: 1,
+		})
+	}
+	go add("concurrent-a.example:119")
+	go add("concurrent-b.example:119")
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("concurrent AddProvider goroutine did not start")
+		}
+	}
+	close(start)
+
+	select {
+	case <-enteredPing:
+	case <-time.After(time.Second):
+		t.Fatal("neither concurrent AddProvider reached its ping")
+	}
+
+	// Give the competing call a bounded chance to either observe the reserved
+	// identity or expose the exact-parent pre-publication race. A correct
+	// implementation may instead serialize the complete mutation.
+	observation := time.NewTimer(50 * time.Millisecond)
+	var earlyResults []error
+	select {
+	case <-enteredPing:
+	case err := <-results:
+		earlyResults = append(earlyResults, err)
+	case <-observation.C:
+	}
+	if !observation.Stop() {
+		select {
+		case <-observation.C:
+		default:
+		}
+	}
+	close(releasePing)
+
+	var succeeded, failed int
+	for _, err := range earlyResults {
+		if err == nil {
+			succeeded++
+		} else {
+			failed++
+		}
+	}
+	for range 2 - len(earlyResults) {
+		select {
+		case err := <-results:
+			if err == nil {
+				succeeded++
+			} else {
+				failed++
+			}
+		case <-time.After(time.Second):
+			t.Fatal("concurrent AddProvider did not return")
+		}
+	}
+	if succeeded != 1 || failed != 1 {
+		t.Fatalf("concurrent AddProvider results = %d success, %d failure; want 1 and 1", succeeded, failed)
+	}
+	if got := addedDials.Load(); got != 1 {
+		t.Fatalf("concurrent same-ID ping dials = %d, want 1", got)
+	}
 	if got := client.NumProviders(); got != 2 {
-		t.Fatalf("NumProviders() after concurrent add/remove = %d, want 2", got)
+		t.Fatalf("NumProviders() = %d, want base plus one added owner", got)
 	}
-	if client.findGroup("keep-id") == nil || client.findGroup("added-id") == nil {
-		t.Fatalf("concurrent publication lost a live provider: %+v", client.Stats().Providers)
+}
+
+func TestFNCORECHG002ExplicitRemovalCancelsPendingReconnect(t *testing.T) {
+	const reconnectDelay = 20 * time.Millisecond
+	client, err := NewClient(context.Background(), []Provider{
+		{
+			Factory:        fncoreCHG002StatusFactory("502 service unavailable"),
+			Connections:    1,
+			SkipPing:       true,
+			ReconnectDelay: reconnectDelay,
+		},
+		{
+			ID:          "fallback-id",
+			Host:        "fallback.example:119",
+			Factory:     fncoreCHG002StatusFactory("223 1 <cancel-reconnect@test>"),
+			Connections: 1,
+			SkipPing:    true,
+		},
+	}, WithDispatchStrategy(DispatchFIFO), WithStatProbe(false))
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	response := <-client.Send(ctx, []byte("STAT <cancel-reconnect@test>\r\n"), io.Discard)
+	if response.Err != nil || response.StatusCode != 223 {
+		t.Fatalf("fallback response = %+v, want second provider success", response)
+	}
+
+	if err := client.RemoveProvider("provider-0"); err != nil {
+		t.Fatalf("RemoveProvider(pending canonical ID) error = %v", err)
+	}
+
+	timer := time.NewTimer(5 * reconnectDelay)
+	defer timer.Stop()
+	<-timer.C
+	stats := client.Stats()
+	if len(stats.Providers) != 1 || stats.Providers[0].ProviderID != "fallback-id" {
+		t.Fatalf("explicitly removed provider returned after reconnect delay: %+v", stats.Providers)
 	}
 }
 
