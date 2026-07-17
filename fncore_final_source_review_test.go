@@ -628,13 +628,9 @@ func TestFNCOREPendingCancelledPostNeverReadsNonClosableBody(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("STAT and POST did not become FIFO-pending")
 			}
-			deadline := time.Now().Add(5 * time.Second)
-			for post.writtenAt.Load() == 0 {
-				if time.Now().After(deadline) {
-					t.Fatal("POST was not fully flushed before cancellation")
-				}
-				runtime.Gosched()
-			}
+			// The server has read both complete command lines from net.Pipe, which
+			// is the external proof that POST crossed the flush boundary. Do not
+			// depend on an internal timestamp being published by the implementation.
 			cancelPost()
 			select {
 			case <-body.started:
