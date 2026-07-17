@@ -455,7 +455,7 @@ func (c *Client) doSendPost(ctx context.Context, payloadBody io.Reader, respCh c
 	}
 	defer closeBody()
 
-	mains := *c.mainGroups.Load()
+	mains := c.registry.Load().mains
 	n := len(mains)
 	if n == 0 {
 		respCh <- Response{Err: errors.New("nntp: no main providers")}

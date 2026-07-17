@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 )
 
@@ -112,12 +113,19 @@ func withErrorClassification(cause, category error) error {
 	return &classifiedError{cause: cause, category: category}
 }
 
+// safeIdentityText preserves ordinary identity text while rendering control
+// characters and delimiters visibly at error/log text boundaries.
+func safeIdentityText(identity string) string {
+	quoted := strconv.QuoteToGraphic(identity)
+	return quoted[1 : len(quoted)-1]
+}
+
 func (e *TransportError) Error() string {
 	if e == nil {
 		return "<nil>"
 	}
 	if e.ProviderID != "" {
-		return fmt.Sprintf("nntp: %s from %s: %v", e.Kind, e.ProviderID, e.Cause)
+		return fmt.Sprintf("nntp: %s from %s: %v", e.Kind, safeIdentityText(e.ProviderID), e.Cause)
 	}
 	return fmt.Sprintf("nntp: %s: %v", e.Kind, e.Cause)
 }
