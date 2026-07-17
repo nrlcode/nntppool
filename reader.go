@@ -302,9 +302,6 @@ func strictUUDataShape(line []byte) (decoded, encodedLength int, ok bool) {
 		return 0, 0, false
 	}
 	decoded = decodeUUChar(line[0])
-	if decoded <= 0 || decoded > 45 {
-		return 0, 0, false
-	}
 	minimum, canonical := uuEncodedLengths(decoded)
 	encodedLength = len(line) - 1
 	if encodedLength < minimum || encodedLength > canonical || !isUUAlphabet(line[1:]) {
