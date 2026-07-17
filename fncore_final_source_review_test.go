@@ -538,6 +538,41 @@ func (b *fncoreBlockingNonClosableBody) Release() {
 	b.releaseOnce.Do(func() { close(b.release) })
 }
 
+// fncorePostResponseReadBarrierConn blocks the second transport Read after it
+// is armed. The first read consumes the deliberately released earlier FIFO
+// response; the second is therefore the POST response read whose status the
+// server is still withholding.
+type fncorePostResponseReadBarrierConn struct {
+	net.Conn
+	armed       atomic.Bool
+	reads       atomic.Int32
+	entered     chan struct{}
+	release     chan struct{}
+	enteredOnce sync.Once
+	releaseOnce sync.Once
+}
+
+func newFNCOREPostResponseReadBarrierConn(conn net.Conn) *fncorePostResponseReadBarrierConn {
+	return &fncorePostResponseReadBarrierConn{
+		Conn:    conn,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (c *fncorePostResponseReadBarrierConn) Read(p []byte) (int, error) {
+	if c.armed.Load() && c.reads.Add(1) == 2 {
+		c.enteredOnce.Do(func() { close(c.entered) })
+		<-c.release
+	}
+	return c.Conn.Read(p)
+}
+
+func (c *fncorePostResponseReadBarrierConn) Arm() { c.armed.Store(true) }
+func (c *fncorePostResponseReadBarrierConn) Release() {
+	c.releaseOnce.Do(func() { close(c.release) })
+}
+
 func TestFNCOREPendingCancelledPostNeverReadsNonClosableBody(t *testing.T) {
 	for _, status := range []struct {
 		name string
@@ -548,11 +583,17 @@ func TestFNCOREPendingCancelledPostNeverReadsNonClosableBody(t *testing.T) {
 	} {
 		t.Run(status.name, func(t *testing.T) {
 			clientConn, serverConn := net.Pipe()
+			controlled := newFNCOREPostResponseReadBarrierConn(clientConn)
 			commandsSeen := make(chan struct{})
-			releaseResponses := make(chan struct{})
-			var releaseResponsesOnce sync.Once
-			releaseServerResponses := func() { releaseResponsesOnce.Do(func() { close(releaseResponses) }) }
-			t.Cleanup(releaseServerResponses)
+			releaseEarlier := make(chan struct{})
+			releasePostStatus := make(chan struct{})
+			var releaseEarlierOnce sync.Once
+			var releasePostStatusOnce sync.Once
+			releaseEarlierResponse := func() { releaseEarlierOnce.Do(func() { close(releaseEarlier) }) }
+			releasePOSTResponse := func() { releasePostStatusOnce.Do(func() { close(releasePostStatus) }) }
+			t.Cleanup(releaseEarlierResponse)
+			t.Cleanup(releasePOSTResponse)
+			t.Cleanup(controlled.Release)
 			serverDone := make(chan error, 1)
 			go func() {
 				defer func() { _ = serverConn.Close() }()
@@ -570,11 +611,12 @@ func TestFNCOREPendingCancelledPostNeverReadsNonClosableBody(t *testing.T) {
 					return
 				}
 				close(commandsSeen)
-				<-releaseResponses
+				<-releaseEarlier
 				if _, err := serverConn.Write([]byte("223 1 <earlier-post@example.invalid> exists\r\n")); err != nil {
 					serverDone <- err
 					return
 				}
+				<-releasePostStatus
 				if _, err := serverConn.Write([]byte(status.line)); err != nil {
 					serverDone <- err
 					return
@@ -592,7 +634,7 @@ func TestFNCOREPendingCancelledPostNeverReadsNonClosableBody(t *testing.T) {
 
 			reqCh := make(chan *Request, 2)
 			connection, err := newNNTPConnectionFromConn(
-				context.Background(), clientConn, 2, reqCh, nil, Auth{}, "", nil, nil,
+				context.Background(), controlled, 2, reqCh, nil, Auth{}, "", nil, nil,
 			)
 			if err != nil {
 				t.Fatalf("newNNTPConnectionFromConn() error = %v", err)
@@ -600,10 +642,13 @@ func TestFNCOREPendingCancelledPostNeverReadsNonClosableBody(t *testing.T) {
 			body := newFNCOREBlockingNonClosableBody()
 			t.Cleanup(func() {
 				body.Release()
-				releaseServerResponses()
+				releaseEarlierResponse()
+				releasePOSTResponse()
+				controlled.Release()
 				_ = serverConn.Close()
 				_ = connection.Close()
 			})
+			controlled.Arm()
 			earlier := &Request{
 				Ctx:         context.Background(),
 				Payload:     []byte("STAT <earlier-post@example.invalid>\r\n"),
@@ -628,21 +673,25 @@ func TestFNCOREPendingCancelledPostNeverReadsNonClosableBody(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("STAT and POST did not become FIFO-pending")
 			}
-			// The server has read both complete command lines from net.Pipe, which
-			// proves the flush boundary. Wait until the reader has removed the
-			// earlier request and POST is the sole pending FIFO response before
-			// cancellation; this excludes a writing-to-pending scheduler race.
-			waitFNCOREChannelDepth(t, connection.pending, 1, "FIFO-pending POST")
-			cancelPost()
-			releaseServerResponses()
+			releaseEarlierResponse()
 			if response := awaitFNCOREPhaseResponse(t, earlier.RespCh, "earlier pending-POST STAT"); response.Err != nil || response.StatusCode != 223 {
 				t.Fatalf("earlier pending-POST response = %+v", response)
 			}
+			select {
+			case <-controlled.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("client reader did not enter the withheld POST-response read")
+			}
+			cancelPost()
+			releasePOSTResponse()
+			controlled.Release()
 
 			var response Response
 			responseReceived := false
 			responseClosed := false
 			serverSettled := false
+			var serverResult error
+			serverResultReceived := false
 			readAfterCancellation := false
 			responseEvents := (<-chan Response)(post.RespCh)
 			bodyEvents := (<-chan struct{})(body.started)
@@ -663,7 +712,11 @@ func TestFNCOREPendingCancelledPostNeverReadsNonClosableBody(t *testing.T) {
 						responseReceived = true
 					}
 					responseEvents = nil
-				case <-serverEvents:
+				case result, ok := <-serverEvents:
+					if ok {
+						serverResult = result
+						serverResultReceived = true
+					}
 					serverSettled = true
 					serverEvents = nil
 				case <-settlementTimer.C:
@@ -694,6 +747,12 @@ func TestFNCOREPendingCancelledPostNeverReadsNonClosableBody(t *testing.T) {
 			if responseClosed {
 				t.Fatal("canceled FIFO-pending POST response channel closed without a response")
 			}
+			if !serverResultReceived {
+				t.Fatal("pending POST server result channel closed without a result")
+			}
+			if serverResult == nil {
+				t.Fatal("pending POST server observed unexpected body data")
+			}
 			if !errors.Is(response.Err, context.Canceled) || len(response.Attempts) != 1 ||
 				response.Attempts[0].Outcome != OutcomeCancellation {
 				t.Fatalf("canceled pending POST response = %+v", response)
@@ -702,11 +761,6 @@ func TestFNCOREPendingCancelledPostNeverReadsNonClosableBody(t *testing.T) {
 			case <-body.started:
 				t.Fatalf("canceled FIFO-pending POST read non-closable body after settling for %s", status.name)
 			default:
-			}
-			select {
-			case <-serverDone:
-			case <-time.After(5 * time.Second):
-				t.Fatal("pending POST server fixture did not unwind")
 			}
 		})
 	}
