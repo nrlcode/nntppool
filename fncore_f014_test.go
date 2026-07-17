@@ -118,12 +118,14 @@ func TestFNCORELiveCallerDeadlineDoesNotHideFlushedSTATTransportFailure(t *testi
 
 		stats := providerBreakerStats(t, client, provider.ID)
 		wantState := CircuitBreakerClosed
+		wantFailures := request
 		if request == providerBreakerFailureThreshold {
 			wantState = CircuitBreakerOpen
+			wantFailures = 0
 		}
-		if stats.State != wantState || stats.QualifyingFailures != request {
+		if stats.State != wantState || stats.QualifyingFailures != wantFailures {
 			t.Errorf("outer request %d breaker = %+v, want state %v with %d qualifying failures",
-				request, stats, wantState, request)
+				request, stats, wantState, wantFailures)
 		}
 		cancel()
 	}
