@@ -484,6 +484,8 @@ var errFNCOREDrainDeadlineClear = errors.New("deterministic drain deadline clear
 type fncoreFailDrainDeadlineClearConn struct {
 	net.Conn
 	armed       atomic.Bool
+	armedSet    chan struct{}
+	armedOnce   sync.Once
 	clearFailed chan struct{}
 	clearOnce   sync.Once
 }
@@ -495,6 +497,7 @@ func (c *fncoreFailDrainDeadlineClearConn) SetReadDeadline(deadline time.Time) e
 	}
 	if !deadline.IsZero() {
 		c.armed.Store(true)
+		c.armedOnce.Do(func() { close(c.armedSet) })
 	}
 	return c.Conn.SetReadDeadline(deadline)
 }
@@ -506,6 +509,7 @@ func TestFNCOREFailedDrainDeadlineClearRetiresTransport(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	controlled := &fncoreFailDrainDeadlineClearConn{
 		Conn:        clientConn,
+		armedSet:    make(chan struct{}),
 		clearFailed: make(chan struct{}),
 	}
 	releaseTail := make(chan struct{})
@@ -568,6 +572,11 @@ func TestFNCOREFailedDrainDeadlineClearRetiresTransport(t *testing.T) {
 		t.Fatal("BODY did not cross the decoded progress boundary")
 	}
 	cancel()
+	select {
+	case <-controlled.armedSet:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancellation drain did not install its bounded read deadline")
+	}
 	releaseResponseTail()
 	result := awaitFNCOREPhaseResponse(t, request.RespCh, "bounded drain with failed deadline clear")
 	if !errors.Is(result.Err, context.Canceled) || result.StatusCode != 222 ||
