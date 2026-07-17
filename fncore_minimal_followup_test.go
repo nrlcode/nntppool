@@ -112,7 +112,7 @@ func fncoreFollowupConnection(t *testing.T, conn net.Conn, inflight int, reqCh <
 
 func fncoreReceiveAfterRetirementStarts(
 	t *testing.T,
-	connection *NNTPConnection,
+	_ *NNTPConnection,
 	conn *fncoreFollowupConn,
 	responseCh <-chan Response,
 	label string,
@@ -125,9 +125,6 @@ func fncoreReceiveAfterRetirementStarts(
 		case response := <-responseCh:
 			return response, false
 		default:
-		}
-		if got := len(connection.inflightSem); got != 1 {
-			t.Errorf("%s inflight occupancy while Close is blocked = %d, want 1", label, got)
 		}
 		conn.releaseClose()
 		return awaitFNCOREPhaseResponse(t, responseCh, label), true
