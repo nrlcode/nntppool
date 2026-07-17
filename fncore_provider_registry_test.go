@@ -505,3 +505,132 @@ func TestFNCORECHG002IdentityErrorsEscapeControlCharacters(t *testing.T) {
 		})
 	}
 }
+
+func TestFNCORECHG002RemovedLifecycleCannotReconnectReusedID(t *testing.T) {
+	const (
+		providerID              = "reused-id"
+		oldReconnectDelay       = 500 * time.Millisecond
+		replacementDelay        = 5 * time.Second
+		earlyObservationWindow  = 2 * time.Second
+		earlyObservationPolling = 5 * time.Millisecond
+	)
+
+	client, err := NewClient(context.Background(), []Provider{
+		{
+			ID:             providerID,
+			Host:           "old-lifecycle.example:119",
+			Factory:        fncoreCHG002StatusFactory("502 service unavailable"),
+			Connections:    1,
+			SkipPing:       true,
+			ReconnectDelay: oldReconnectDelay,
+		},
+		{
+			ID:          "stable-fallback-id",
+			Host:        "stable-fallback.example:119",
+			Factory:     fncoreCHG002StatusFactory("223 1 <stale-reconnect@test>"),
+			Connections: 1,
+			SkipPing:    true,
+			Backup:      true,
+		},
+	}, WithDispatchStrategy(DispatchFIFO), WithStatProbe(false))
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*earlyObservationWindow)
+	defer cancel()
+	requireFallback := func(stage string) {
+		t.Helper()
+		response := <-client.Send(ctx, []byte("STAT <stale-reconnect@test>\r\n"), io.Discard)
+		if response.Err != nil || response.StatusCode != 223 {
+			t.Fatalf("%s response = %+v, want fallback success", stage, response)
+		}
+		if got := client.NumProviders(); got != 1 {
+			t.Fatalf("NumProviders() after %s 502 = %d, want stable fallback only", stage, got)
+		}
+	}
+
+	requireFallback("old lifecycle")
+	if err := client.RemoveProvider(providerID); err != nil {
+		t.Fatalf("RemoveProvider(%q) error = %v", providerID, err)
+	}
+
+	var replacementDials atomic.Int64
+	earlyReconnect := make(chan int64, 1)
+	replacementFactory := func(context.Context) (net.Conn, error) {
+		call := replacementDials.Add(1)
+		if call >= 3 {
+			select {
+			case earlyReconnect <- call:
+			default:
+			}
+		}
+
+		clientConn, serverConn := net.Pipe()
+		go func() {
+			defer func() { _ = serverConn.Close() }()
+			if _, err := io.WriteString(serverConn, "200 test server ready\r\n"); err != nil {
+				return
+			}
+			command, err := bufio.NewReader(serverConn).ReadString('\n')
+			if err != nil {
+				return
+			}
+			status := "502 service unavailable"
+			if strings.HasPrefix(command, "DATE") {
+				status = "111 20260716120000"
+			}
+			_, _ = io.WriteString(serverConn, status+"\r\n")
+		}()
+		return clientConn, nil
+	}
+
+	err = client.AddProvider(Provider{
+		ID:             providerID,
+		Host:           "replacement-lifecycle.example:119",
+		Factory:        replacementFactory,
+		Connections:    1,
+		ReconnectDelay: replacementDelay,
+	})
+	if err != nil {
+		t.Fatalf("AddProvider(replacement %q) error = %v", providerID, err)
+	}
+	if got := replacementDials.Load(); got != 1 {
+		t.Fatalf("replacement startup dial count = %d, want 1", got)
+	}
+
+	requireFallback("replacement lifecycle")
+	if got := replacementDials.Load(); got != 2 {
+		t.Fatalf("replacement dial count after its 502 = %d, want startup ping plus command", got)
+	}
+
+	window := time.NewTimer(earlyObservationWindow)
+	defer window.Stop()
+	poll := time.NewTicker(earlyObservationPolling)
+	defer poll.Stop()
+	var earlyDial int64
+	for {
+		select {
+		case earlyDial = <-earlyReconnect:
+		case <-poll.C:
+			if got := client.NumProviders(); got != 1 {
+				t.Fatalf(
+					"NumProviders() before replacement reconnect delay = %d, want stable fallback only (early replacement dial %d)",
+					got,
+					earlyDial,
+				)
+			}
+		case <-window.C:
+			if got := replacementDials.Load(); got != 2 {
+				t.Fatalf("replacement dial count before its reconnect delay = %d, want 2", got)
+			}
+			if got := client.NumProviders(); got != 1 {
+				t.Fatalf("NumProviders() before replacement reconnect delay = %d, want stable fallback only", got)
+			}
+			return
+		case <-ctx.Done():
+			t.Fatalf("timed out while observing stale reconnect window: %v", ctx.Err())
+		}
+	}
+}
