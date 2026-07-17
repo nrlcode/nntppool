@@ -250,7 +250,8 @@ func TestPR1CancelledBodyDrainIsBounded(t *testing.T) {
 
 	for _, depth := range []int{1, 4, 10} {
 		t.Run(strings.Repeat("pipeline_", depth)+"cancel", func(t *testing.T) {
-			firstChunkWritten := make(chan struct{})
+			writerBarrier := newFNCORECancellationBarrierWriter()
+			t.Cleanup(writerBarrier.Release)
 			writtenResult := make(chan int, 1)
 			conn := mockServer(t, func(server net.Conn) {
 				_, _ = server.Write([]byte("200 regression server ready\r\n"))
@@ -260,16 +261,11 @@ func TestPR1CancelledBodyDrainIsBounded(t *testing.T) {
 				}
 
 				written := 0
-				signaled := false
 				for range depth {
 					for offset := 0; offset < len(body); {
 						end := min(offset+32*1024, len(body))
 						n, err := server.Write(body[offset:end])
 						written += n
-						if !signaled && written > 0 {
-							close(firstChunkWritten)
-							signaled = true
-						}
 						offset += n
 						if err != nil {
 							writtenResult <- written
@@ -293,23 +289,28 @@ func TestPR1CancelledBodyDrainIsBounded(t *testing.T) {
 			for index := range depth {
 				ctx, cancel := context.WithCancel(context.Background())
 				cancels = append(cancels, cancel)
+				writer := io.Writer(io.Discard)
+				if index == 0 {
+					writer = writerBarrier
+				}
 				reqCh <- &Request{
 					Ctx:        ctx,
 					Payload:    []byte("BODY <cancel-" + string(rune('a'+index)) + "@example.invalid>\r\n"),
 					RespCh:     make(chan Response, 1),
-					BodyWriter: io.Discard,
+					BodyWriter: writer,
 				}
 			}
 			go nc.Run()
 
 			select {
-			case <-firstChunkWritten:
+			case <-writerBarrier.Started():
 			case <-time.After(2 * time.Second):
-				t.Fatal("server did not begin the first BODY response")
+				t.Fatal("first BODY did not cross the controlled decoded-progress boundary")
 			}
 			for _, cancel := range cancels {
 				cancel()
 			}
+			writerBarrier.Release()
 
 			var written int
 			select {
