@@ -335,6 +335,7 @@ func TestFNCOREPipelinedLocalWriterFailureLetsCollateralRetry(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("local writer failure did not settle")
 	}
+	// The helper performs the assertions; its typed diagnostic return is intentionally unused.
 	_ = requireFNCORELocalWriterError(t, bodyErr, writerErr)
 	var stat StatManyResult
 	select {
