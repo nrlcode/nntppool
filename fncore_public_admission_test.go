@@ -479,3 +479,101 @@ func TestFNCOREPostTransportFailuresOpenBreaker(t *testing.T) {
 		t.Errorf("open breaker allowed a fourth connection: connections = %d", got)
 	}
 }
+
+func TestFNCOREHalfOpenTargetedSpeedTestUsesFreshTransport(t *testing.T) {
+	clock := newBreakerFakeClock()
+	server, provider := breakerProvider(fncoreAdmissionProviderID, "half-open-speed.invalid:119", fncoreAdmissionResponse)
+	client := newBreakerClient(t, clock, provider)
+
+	if _, err := client.Stat(fncoreAdmissionContext(t), "warm-socket@example.invalid"); err != nil {
+		t.Fatalf("warm provider socket: %v", err)
+	}
+	if got := server.connections.Load(); got != 1 {
+		t.Fatalf("warm provider connections = %d, want 1", got)
+	}
+	fncoreRecordBreakerCompletions(t, client, fncoreAdmissionProviderID, providerBreakerFailureThreshold, circuitBreakerFailure)
+	clock.Advance(providerBreakerCooldowns[0] + time.Nanosecond)
+
+	result, err := client.SpeedTest(fncoreAdmissionContext(t), SpeedTestOptions{
+		NZBReader:    testNZBReader("half-open-speed@example.invalid"),
+		ProviderName: fncoreAdmissionProviderID,
+	})
+	if err != nil {
+		t.Fatalf("half-open targeted SpeedTest: %v", err)
+	}
+	if result.SegmentsDone != 1 {
+		t.Errorf("SpeedTest segments done = %d, want 1", result.SegmentsDone)
+	}
+	if got := server.commandCount("BODY"); got != 1 {
+		t.Errorf("half-open targeted SpeedTest BODY attempts = %d, want exactly 1", got)
+	}
+	if got := server.connections.Load(); got != 2 {
+		t.Errorf("half-open targeted SpeedTest connections = %d, want fresh second transport", got)
+	}
+	fncoreRequireClosedResetBreaker(t, client, fncoreAdmissionProviderID)
+}
+
+func TestFNCOREPostSkipsBreakerRejectedProviderBeforeOwnership(t *testing.T) {
+	first := &fncorePostProvider{}
+	second := &fncorePostProvider{}
+	client := fncoreAdmissionClient(t,
+		fncorePostProviderConfig(fncoreAdmissionProviderID, "post-open-first.invalid:119", first),
+		fncorePostProviderConfig("fncore-other", "post-healthy-second.invalid:119", second),
+	)
+	fncoreRecordBreakerCompletions(t, client, fncoreAdmissionProviderID, providerBreakerFailureThreshold, circuitBreakerFailure)
+	before := providerBreakerStats(t, client, fncoreAdmissionProviderID)
+
+	if err := fncorePost(t, fncoreAdmissionContext(t), client); err != nil {
+		t.Fatalf("POST after first-provider breaker rejection: %v", err)
+	}
+	if got := first.connections.Load(); got != 0 {
+		t.Errorf("breaker-rejected first provider connections = %d, want 0", got)
+	}
+	if got := first.posts.Load(); got != 0 {
+		t.Errorf("breaker-rejected first provider POST attempts = %d, want 0", got)
+	}
+	if got := second.connections.Load(); got != 1 {
+		t.Errorf("healthy second provider connections = %d, want 1", got)
+	}
+	if got := second.posts.Load(); got != 1 {
+		t.Errorf("healthy second provider POST attempts = %d, want exactly 1", got)
+	}
+	if after := providerBreakerStats(t, client, fncoreAdmissionProviderID); after != before {
+		t.Errorf("pretransport POST rejection changed first breaker: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestFNCOREAdmissionDeadlineEvidenceRemainsCancellation(t *testing.T) {
+	server, provider := breakerProvider(fncoreAdmissionProviderID, "deadline-evidence.invalid:119", fncoreAdmissionResponse)
+	client := fncoreAdmissionClient(t, provider)
+	fncoreRecordBreakerCompletions(t, client, fncoreAdmissionProviderID, providerBreakerFailureThreshold, circuitBreakerFailure)
+	before := providerBreakerStats(t, client, fncoreAdmissionProviderID)
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	_, err := client.BodyTargeted(ctx, "deadline-evidence@example.invalid", TargetedBodyOptions{Provider: fncoreAdmissionProviderID})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expired admission error = %v, want context deadline", err)
+	}
+	var transportErr *TransportError
+	if !errors.As(err, &transportErr) {
+		t.Fatalf("expired admission error type = %T, want *TransportError", err)
+	}
+	if transportErr.Kind != OutcomeCancellation || len(transportErr.Attempts) != 1 {
+		t.Fatalf("expired admission evidence = %+v, want one cancellation attempt", transportErr)
+	}
+	attempt := transportErr.Attempts[0]
+	if attempt.ProviderID != fncoreAdmissionProviderID || attempt.Operation != OperationBody ||
+		attempt.Outcome != OutcomeCancellation || !errors.Is(attempt.Cause, context.DeadlineExceeded) {
+		t.Errorf("expired admission attempt = %+v, want caller-deadline BODY cancellation", attempt)
+	}
+	if got := server.connections.Load(); got != 0 {
+		t.Errorf("expired admission provider connections = %d, want 0", got)
+	}
+	if got := server.commandCount("BODY"); got != 0 {
+		t.Errorf("expired admission BODY commands = %d, want 0", got)
+	}
+	if after := providerBreakerStats(t, client, fncoreAdmissionProviderID); after != before {
+		t.Errorf("expired admission changed breaker: before=%+v after=%+v", before, after)
+	}
+}
