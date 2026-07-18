@@ -451,3 +451,59 @@ func TestFNCORECHG004FIFOSaturationWaitsWithoutBackupOverflow(t *testing.T) {
 		t.Errorf("backup connections after regular-tier recovery = %d, want zero", got)
 	}
 }
+
+func TestFNCORECHG004StoppedGateRejectsReservedRequestBeforeWire(t *testing.T) {
+	provider := newFNCOREAdmissionFIFOProvider("fncore-admission-stopped-handoff")
+	defer provider.unblock()
+
+	client := fncoreAdmissionFIFOClient(t,
+		provider.provider(1, 1, 1, 0, 1, false),
+	)
+	group := client.registry.Load().mains[0]
+	payload := []byte("BODY <stopped-handoff@example.invalid>\r\n")
+	lease, rejection, status := client.beginProviderAttempt(
+		context.Background(), group, payload, false, true, true, true,
+	)
+	if status != providerAdmissionGranted {
+		t.Fatalf("initial reservation status = %v, response = %+v; want granted", status, rejection)
+	}
+
+	// Model the gate side of provider removal after selection but before the
+	// admitted runner hands the request to transport.
+	group.gate.stop()
+	type attemptResult struct {
+		resp      Response
+		ok        bool
+		cancelled bool
+	}
+	result := make(chan attemptResult, 1)
+	go func() {
+		resp, ok, cancelled := client.tryGroupResilientAdmitted(
+			context.Background(), group, payload, nil, nil, false, true, false, lease,
+		)
+		result <- attemptResult{resp: resp, ok: ok, cancelled: cancelled}
+	}()
+
+	select {
+	case command := <-provider.commands:
+		provider.unblock()
+		<-result
+		t.Fatalf("stopped reservation reached wire as %q", command)
+	case got := <-result:
+		if got.ok || got.cancelled || got.resp.Err != nil {
+			t.Fatalf("stopped reservation result = %+v, want neutral pretransport rejection", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stopped reservation neither rejected nor reached the wire")
+	}
+
+	if got := provider.connections.Load(); got != 0 {
+		t.Errorf("stopped reservation connections = %d, want zero", got)
+	}
+	group.gate.mu.Lock()
+	pipeline, body := group.gate.reservedPipeline, group.gate.reservedBody
+	group.gate.mu.Unlock()
+	if pipeline != 0 || body != 0 {
+		t.Errorf("stopped reservation retained capacity: pipeline=%d body=%d", pipeline, body)
+	}
+}
