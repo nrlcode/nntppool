@@ -105,6 +105,14 @@ func speedEWMABytesPerSec(stats *providerStats) float64 {
 	return math.Float64frombits(stats.speedEWMA.Load())
 }
 
+// ProviderQuotaState is the mutable quota state carried between two Client
+// generations for the same stable provider identity. Limits and periods remain
+// properties of the destination Provider configuration.
+type ProviderQuotaState struct {
+	Used    int64
+	ResetAt time.Time
+}
+
 // ProviderStats is a public snapshot of one provider's metrics.
 type ProviderStats struct {
 	Name                string
