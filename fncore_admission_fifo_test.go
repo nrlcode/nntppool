@@ -21,6 +21,25 @@ type fncoreAdmissionFIFOProvider struct {
 	connections atomic.Int32
 }
 
+type fncoreAdmissionObservedContext struct {
+	context.Context
+	observed chan struct{}
+	once     sync.Once
+}
+
+func (c *fncoreAdmissionObservedContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.observed) })
+	return c.Context.Done()
+}
+
+func newFNCOREAdmissionObservedContext() (*fncoreAdmissionObservedContext, context.CancelFunc) {
+	parent, cancel := context.WithCancel(context.Background())
+	return &fncoreAdmissionObservedContext{
+		Context:  parent,
+		observed: make(chan struct{}),
+	}, cancel
+}
+
 func newFNCOREAdmissionFIFOProvider(id string) *fncoreAdmissionFIFOProvider {
 	return &fncoreAdmissionFIFOProvider{
 		id:       id,
@@ -375,12 +394,16 @@ func TestFNCORECHG004FIFOSaturationWaitsWithoutBackupOverflow(t *testing.T) {
 	defer second.unblock()
 	defer backup.unblock()
 
+	firstConfig := first.provider(1, 1, 1, 0, 1, false)
+	firstConfig.AttemptTimeout = time.Hour
+	secondConfig := second.provider(1, 1, 1, 0, 1, false)
+	secondConfig.AttemptTimeout = time.Hour
 	client := fncoreAdmissionFIFOClient(t,
-		first.provider(1, 1, 1, 0, 1, false),
-		second.provider(1, 1, 1, 0, 1, false),
+		firstConfig,
+		secondConfig,
 		backup.provider(1, 1, 1, 0, 1, true),
 	)
-	heldCtx, heldCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	heldCtx, heldCancel := context.WithCancel(context.Background())
 	defer heldCancel()
 	heldResults := make(chan error, 2)
 
@@ -395,18 +418,25 @@ func TestFNCORECHG004FIFOSaturationWaitsWithoutBackupOverflow(t *testing.T) {
 	}()
 	fncoreAdmissionFIFOWaitCommand(t, second, "BODY <saturate-second@example.invalid>")
 
-	waitCtx, cancelWait := context.WithCancel(context.Background())
-	waitResult := make(chan error, 1)
-	waitStarted := make(chan struct{})
+	releaseCtx, cancelRelease := newFNCOREAdmissionObservedContext()
+	defer cancelRelease()
+	releaseResult := make(chan BodyResult, 1)
 	go func() {
-		close(waitStarted)
-		_, err := client.Body(waitCtx, "wait-for-regular@example.invalid")
-		waitResult <- err
+		body, err := client.Body(releaseCtx, "wait-for-release@example.invalid")
+		releaseResult <- BodyResult{Body: body, Err: err}
 	}()
-	<-waitStarted
 	select {
-	case err := <-waitResult:
-		t.Fatalf("regular-tier saturated request returned before capacity/cancellation: %v", err)
+	case <-releaseCtx.observed:
+	case result := <-releaseResult:
+		t.Fatalf("regular-tier saturated request returned before capacity release: %+v", result)
+	case command := <-backup.commands:
+		t.Fatalf("regular-tier occupancy promoted failure-only backup: %q", command)
+	case <-time.After(2 * time.Second):
+		t.Fatal("regular-tier saturated request did not reach capacity wait")
+	}
+	select {
+	case result := <-releaseResult:
+		t.Fatalf("regular-tier saturated request returned before capacity release: %+v", result)
 	case command := <-backup.commands:
 		t.Fatalf("regular-tier occupancy promoted failure-only backup: %q", command)
 	case <-time.After(100 * time.Millisecond):
@@ -415,9 +445,24 @@ func TestFNCORECHG004FIFOSaturationWaitsWithoutBackupOverflow(t *testing.T) {
 		t.Fatalf("backup connections during regular-tier saturation = %d, want zero", got)
 	}
 
+	cancelCtx, cancelWait := newFNCOREAdmissionObservedContext()
+	cancelResult := make(chan error, 1)
+	go func() {
+		_, err := client.Body(cancelCtx, "wait-for-cancellation@example.invalid")
+		cancelResult <- err
+	}()
+	select {
+	case <-cancelCtx.observed:
+	case err := <-cancelResult:
+		t.Fatalf("cancellable saturated request returned before cancellation: %v", err)
+	case command := <-backup.commands:
+		t.Fatalf("cancellable saturated request promoted failure-only backup: %q", command)
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancellable saturated request did not reach capacity wait")
+	}
 	cancelWait()
 	select {
-	case err := <-waitResult:
+	case err := <-cancelResult:
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("saturated admission error = %v, want context cancellation", err)
 		}
@@ -429,19 +474,23 @@ func TestFNCORECHG004FIFOSaturationWaitsWithoutBackupOverflow(t *testing.T) {
 	}
 
 	first.unblock()
+	select {
+	case result := <-releaseResult:
+		if result.Err != nil {
+			t.Fatalf("waiting request after capacity release error = %v", result.Err)
+		}
+		if result.Body == nil || result.Body.ProviderID != first.id {
+			t.Fatalf("waiting request after capacity release = %+v, want earliest primary %q", result.Body, first.id)
+		}
+	case command := <-backup.commands:
+		t.Fatalf("capacity release promoted waiting request to backup: %q", command)
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiting request did not rescan after capacity release")
+	}
 	second.unblock()
 	backup.unblock()
 	fncoreAdmissionFIFOAwaitErrors(t, heldResults, 2)
 
-	recoveryCtx, cancelRecovery := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancelRecovery()
-	recovery, err := client.Body(recoveryCtx, "recovered-capacity@example.invalid")
-	if err != nil {
-		t.Fatalf("request after saturation release error = %v", err)
-	}
-	if recovery.ProviderID != first.id {
-		t.Errorf("request after saturation release provider = %q, want earliest primary %q", recovery.ProviderID, first.id)
-	}
 	for _, stats := range client.Stats().Providers {
 		if stats.PipelineInUse != 0 || stats.BackgroundStatInUse != 0 {
 			t.Errorf("provider %q retained admission occupancy after recovery: pipeline=%d background=%d", stats.ProviderID, stats.PipelineInUse, stats.BackgroundStatInUse)
@@ -494,8 +543,8 @@ func TestFNCORECHG004StoppedGateRejectsReservedRequestBeforeWire(t *testing.T) {
 		}
 		t.Fatalf("stopped reservation reached wire as %q", command)
 	case got := <-result:
-		if got.cancelled {
-			t.Fatalf("stopped reservation result = %+v, want non-cancellation pretransport rejection", got)
+		if got.ok || got.cancelled {
+			t.Fatalf("stopped reservation result = %+v, want ok=false, cancelled=false pretransport rejection", got)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("stopped reservation neither rejected nor reached the wire")
