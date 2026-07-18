@@ -543,12 +543,13 @@ func TestFNCORECHG004ReservationHandoffRevalidatesThrottleAndStop(t *testing.T) 
 			t.Fatalf("stale second handoff = %v, want saturated", got)
 		}
 
+		second.release()
 		gate.mu.Lock()
 		pipeline, body := gate.reservedPipeline, gate.reservedBody
 		gate.mu.Unlock()
 		if pipeline != 1 || body != 1 {
 			first.release()
-			t.Fatalf("capacity after stale handoff = pipeline %d, body %d; want handed reservation only", pipeline, body)
+			t.Fatalf("capacity after stale release = pipeline %d, body %d; want handed reservation only", pipeline, body)
 		}
 		second.release()
 		gate.mu.Lock()
