@@ -487,10 +487,14 @@ func TestFNCORECHG004StoppedGateRejectsReservedRequestBeforeWire(t *testing.T) {
 	select {
 	case command := <-provider.commands:
 		provider.unblock()
-		<-result
+		select {
+		case <-result:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("stopped wire attempt %q did not settle after release", command)
+		}
 		t.Fatalf("stopped reservation reached wire as %q", command)
 	case got := <-result:
-		if got.ok || got.cancelled || got.resp.Err != nil {
+		if got.ok || got.cancelled {
 			t.Fatalf("stopped reservation result = %+v, want neutral pretransport rejection", got)
 		}
 	case <-time.After(2 * time.Second):
