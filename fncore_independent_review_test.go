@@ -200,7 +200,7 @@ func TestFNCOREHeadBodyCancellationDrainsWithinBudgetAndReusesSocket(t *testing.
 		Payload:      []byte("BODY <bounded-drain@example.invalid>\r\n"),
 		RespCh:       make(chan Response, 1),
 		BodyWriter:   writer,
-		ValidateBody: true,
+		validateBody: true,
 		submittedAt:  time.Now(),
 	}
 	go connection.Run()

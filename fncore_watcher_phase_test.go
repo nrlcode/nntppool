@@ -359,7 +359,7 @@ func TestFNCORELaterPipelinedCancellationPreservesEarlierResponseAndReuse(t *tes
 		Payload:      []byte("BODY <first@example.invalid>\r\n"),
 		RespCh:       make(chan Response, 1),
 		BodyWriter:   &streamed,
-		ValidateBody: true,
+		validateBody: true,
 		submittedAt:  time.Now(),
 	}
 	laterCtx, cancelLater := context.WithCancel(context.Background())

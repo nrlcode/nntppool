@@ -448,6 +448,64 @@ func (c *Client) awaitAttempt(ctx context.Context, g *providerGroup, req *Reques
 	}
 }
 
+func (c *Client) tryPostGroup(
+	ctx context.Context,
+	g *providerGroup,
+	payloadBody io.Reader,
+	closeBody func(),
+	freshTransport bool,
+) (resp Response, ok, cancelled, transportOwned bool) {
+	for {
+		innerCh := make(chan Response, 1)
+		req := &Request{
+			Ctx:             ctx,
+			Payload:         []byte("POST\r\n"),
+			RespCh:          innerCh,
+			PayloadBody:     payloadBody,
+			closePayload:    closeBody,
+			PostMode:        true,
+			freshTransport:  freshTransport,
+			submittedAt:     time.Now(),
+			responseTimeout: g.attemptTimeout(),
+			transportCause:  func() error { return c.groupCause(g) },
+		}
+
+		// Try hot channel first (non-blocking), then cold channel.
+		select {
+		case g.hotReqCh <- req:
+		default:
+			select {
+			case <-c.ctx.Done():
+				req.stopBeforeTransport(c.ctx.Err())
+				return failedAttempt(req, g.id, c.ctx.Err()), false, true, false
+			case <-ctx.Done():
+				req.stopBeforeTransport(ctx.Err())
+				return failedAttempt(req, g.id, ctx.Err()), false, true, false
+			case <-g.ctx.Done():
+				req.stopBeforeTransport(ErrConnectionDied)
+				return failedAttempt(req, g.id, ErrConnectionDied), false, false, false
+			case g.reqCh <- req:
+			}
+		}
+
+		var cause error
+		resp, ok, cause, cancelled = c.awaitAttempt(ctx, g, req, innerCh)
+		if cause != nil {
+			resp = failedAttempt(req, g.id, cause)
+		}
+		if !ok && cause == nil {
+			resp = failedAttempt(req, g.id, ErrConnectionDied)
+		}
+		transportOwned = !req.stoppedPretransport()
+		if !transportOwned && errors.Is(resp.Err, errFreshTransportRequired) {
+			// A half-open probe must use a transport created for this logical
+			// attempt. The one-shot body is still untouched before handoff.
+			continue
+		}
+		return resp, ok, cancelled, transportOwned
+	}
+}
+
 func (c *Client) doSendPost(ctx context.Context, payloadBody io.Reader, respCh chan Response) {
 	defer close(respCh)
 	var closeOnce sync.Once
@@ -495,50 +553,36 @@ func (c *Client) doSendPost(ctx context.Context, payloadBody io.Reader, respCh c
 	for attempt := range n {
 		idx := (start + attempt) % n
 		g := mains[idx]
-		innerCh := make(chan Response, 1)
-		req := &Request{
-			Ctx:             ctx,
-			Payload:         []byte("POST\r\n"),
-			RespCh:          innerCh,
-			PayloadBody:     payloadBody,
-			closePayload:    closeBody,
-			PostMode:        true,
-			submittedAt:     time.Now(),
-			responseTimeout: g.attemptTimeout(),
-			transportCause:  func() error { return c.groupCause(g) },
+		lease, rejection, status := c.beginProviderAttempt(
+			ctx, g, []byte("POST\r\n"), false, false, false, false,
+		)
+		switch status {
+		case providerAdmissionRejected:
+			lastResp, haveResp = rejection, true
+			continue
+		case providerAdmissionUnavailable:
+			lastResp, haveResp = rejection, true
+			continue
+		case providerAdmissionCancelled:
+			respCh <- rejection
+			return
+		case providerAdmissionSaturated:
+			continue
+		}
+		if lease.handoff() != requestHandoffGranted {
+			lease.complete(Response{}, false, false)
+			continue
 		}
 
-		// Try hot channel first (non-blocking), then cold channel.
-		select {
-		case g.hotReqCh <- req:
-		default:
-			select {
-			case <-c.ctx.Done():
-				req.stopBeforeTransport(c.ctx.Err())
-				respCh <- failedAttempt(req, g.id, c.ctx.Err())
-				return
-			case <-ctx.Done():
-				req.stopBeforeTransport(ctx.Err())
-				respCh <- failedAttempt(req, g.id, ctx.Err())
-				return
-			case <-g.ctx.Done():
-				continue
-			case g.reqCh <- req:
-			}
+		resp, ok, cancelled, transportOwned := c.tryPostGroup(
+			ctx, g, payloadBody, closeBody, lease.breaker.probe,
+		)
+		lease.complete(resp, ok, cancelled)
+		if cancelled {
+			respCh <- resp
+			return
 		}
-
-		resp, ok, cause, done := c.awaitAttempt(ctx, g, req, innerCh)
-		if cause != nil {
-			resp = failedAttempt(req, g.id, cause)
-			if done {
-				respCh <- resp
-				return
-			}
-		}
-		if !ok {
-			resp = failedAttempt(req, g.id, ErrConnectionDied)
-		}
-		if req.stoppedPretransport() {
+		if !transportOwned {
 			lastResp, haveResp = resp, true
 			continue
 		}
