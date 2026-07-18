@@ -4069,6 +4069,67 @@ func (c *Client) Stats() ClientStats {
 	return cs
 }
 
+// RestoreProviderQuotas installs settled quota state on an unpublished Client.
+// Keys must be canonical Provider IDs, not operational names. The caller must
+// exclude request and quota-reset concurrency until the candidate is published.
+// Every entry is validated before any state changes.
+func (c *Client) RestoreProviderQuotas(byID map[string]ProviderQuotaState) error {
+	if len(byID) == 0 {
+		return nil
+	}
+
+	type update struct {
+		group   *providerGroup
+		used    int64
+		resetAt int64
+	}
+
+	c.registryMu.Lock()
+	defer c.registryMu.Unlock()
+	if c.closed {
+		return context.Canceled
+	}
+	if err := c.ctx.Err(); err != nil {
+		return err
+	}
+
+	registry := c.registry.Load()
+	updates := make([]update, 0, len(byID))
+	for providerID, state := range byID {
+		registration, exists := registry.byID[providerID]
+		if !exists {
+			return fmt.Errorf("nntp: provider %q not found", providerID)
+		}
+		if registration.group == nil {
+			return fmt.Errorf("nntp: provider %q is not active", providerID)
+		}
+		if state.Used < 0 {
+			return fmt.Errorf("nntp: provider %q has negative quota usage", providerID)
+		}
+
+		group := registration.group
+		var resetAt int64
+		if group.quotaPeriod > 0 {
+			if !state.ResetAt.IsZero() {
+				resetAt = state.ResetAt.UnixNano()
+			}
+			if group.stats.quotaBytes > 0 && resetAt == 0 {
+				return fmt.Errorf("nntp: provider %q has a periodic quota but zero reset deadline", providerID)
+			}
+		}
+		updates = append(updates, update{group: group, used: state.Used, resetAt: resetAt})
+	}
+
+	for _, update := range updates {
+		update.group.quotaResetAt.Store(update.resetAt)
+		update.group.stats.quotaUsed.Store(update.used)
+		update.group.stats.quotaExceeded.Store(
+			update.group.stats.quotaBytes > 0 && update.used >= update.group.stats.quotaBytes,
+		)
+	}
+	return nil
+}
+
 // AddProvider validates, pings, and registers a new provider at runtime.
 // Ping failures are recorded in the group's stats but do not cause an error return.
 func (c *Client) AddProvider(p Provider) error {

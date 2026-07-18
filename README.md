@@ -507,7 +507,7 @@ for _, p := range stats.Providers {
 
 // Save state before shutdown
 for _, p := range stats.Providers {
-    saveQuotaState(p.Name, p.QuotaUsed, p.QuotaResetAt)
+    saveQuotaState(p.ProviderID, p.QuotaUsed, p.QuotaResetAt)
 }
 ```
 
