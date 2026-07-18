@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -596,4 +597,81 @@ func TestFNCORECHG004ReservationHandoffRevalidatesThrottleAndStop(t *testing.T) 
 			t.Fatalf("stopped gate retained capacity: pipeline=%d body=%d", pipeline, body)
 		}
 	})
+}
+
+func TestFNCORECHG004ProviderRemovalStopsGateBeforeCancellation(t *testing.T) {
+	provider := newFNCOREAdmissionFIFOProvider("fncore-admission-removal-order")
+	defer provider.unblock()
+	client := fncoreAdmissionFIFOClient(t,
+		provider.provider(1, 1, 1, 0, 1, false),
+	)
+	group := client.registry.Load().mains[0]
+	payload := []byte("BODY <removal-order@example.invalid>\r\n")
+	lease, rejection, status := client.beginProviderAttempt(
+		context.Background(), group, payload, false, true, true, true,
+	)
+	if status != providerAdmissionGranted {
+		t.Fatalf("initial reservation status = %v, response = %+v; want granted", status, rejection)
+	}
+
+	// Hold the gate lock so removal can publish the registry change but cannot
+	// yet linearize gate.stop. Cancellation must remain unpublished until that
+	// stop boundary wins the same lock used by reservation handoff.
+	group.gate.mu.Lock()
+	removeDone := make(chan error, 1)
+	go func() { removeDone <- client.RemoveProvider(provider.id) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for client.findGroup(provider.id) != nil && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if client.findGroup(provider.id) != nil {
+		group.gate.mu.Unlock()
+		select {
+		case <-removeDone:
+		case <-time.After(2 * time.Second):
+		}
+		lease.complete(Response{}, false, false)
+		t.Fatal("provider removal did not publish its registry change")
+	}
+	cancelledBeforeStop := group.ctx.Err() != nil
+	group.gate.mu.Unlock()
+	select {
+	case err := <-removeDone:
+		if err != nil {
+			lease.complete(Response{}, false, false)
+			t.Fatalf("RemoveProvider() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		lease.complete(Response{}, false, false)
+		t.Fatal("RemoveProvider() did not settle after gate release")
+	}
+	if cancelledBeforeStop {
+		lease.complete(Response{}, false, false)
+		t.Fatal("provider context was cancelled before gate.stop linearized")
+	}
+	if group.ctx.Err() == nil {
+		lease.complete(Response{}, false, false)
+		t.Fatal("provider context remained live after removal completed")
+	}
+	if got := lease.handoff(); got != requestHandoffUnavailable {
+		lease.complete(Response{}, false, false)
+		t.Fatalf("removed-provider handoff = %v, want unavailable", got)
+	}
+	lease.complete(Response{}, false, false)
+
+	if got := provider.connections.Load(); got != 0 {
+		t.Errorf("removed-provider connections = %d, want 0", got)
+	}
+	select {
+	case command := <-provider.commands:
+		t.Errorf("removed-provider reservation reached wire as %q", command)
+	default:
+	}
+	group.gate.mu.Lock()
+	stopped := group.gate.stopped
+	pipeline, body := group.gate.reservedPipeline, group.gate.reservedBody
+	group.gate.mu.Unlock()
+	if !stopped || pipeline != 0 || body != 0 {
+		t.Errorf("removed gate state = stopped %t, pipeline %d, body %d; want stopped and empty", stopped, pipeline, body)
+	}
 }

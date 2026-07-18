@@ -577,3 +577,57 @@ func TestFNCOREAdmissionDeadlineEvidenceRemainsCancellation(t *testing.T) {
 		t.Errorf("expired admission changed breaker: before=%+v after=%+v", before, after)
 	}
 }
+
+func TestFNCOREClientDeadlineEvidenceRemainsCancellation(t *testing.T) {
+	server, provider := breakerProvider(fncoreAdmissionProviderID, "client-deadline-evidence.invalid:119", fncoreAdmissionResponse)
+	clientCtx, cancelClient := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancelClient()
+	client, err := NewClient(
+		clientCtx,
+		[]Provider{provider},
+		WithDispatchStrategy(DispatchFIFO),
+		WithStatProbe(false),
+		WithSpeedAwareDispatch(false),
+		WithProviderCircuitBreaker(true),
+		withCircuitBreakerClock(newBreakerFakeClock()),
+	)
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	before := providerBreakerStats(t, client, fncoreAdmissionProviderID)
+	select {
+	case <-clientCtx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("client parent deadline did not expire")
+	}
+	if !errors.Is(clientCtx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("client context error = %v, want context deadline", clientCtx.Err())
+	}
+
+	_, err = client.BodyTargeted(context.Background(), "client-deadline-evidence@example.invalid", TargetedBodyOptions{Provider: fncoreAdmissionProviderID})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("client-deadline admission error = %v, want context deadline", err)
+	}
+	var transportErr *TransportError
+	if !errors.As(err, &transportErr) {
+		t.Fatalf("client-deadline admission error type = %T, want *TransportError", err)
+	}
+	if transportErr.Kind != OutcomeCancellation || len(transportErr.Attempts) != 1 {
+		t.Fatalf("client-deadline admission evidence = %+v, want one cancellation attempt", transportErr)
+	}
+	attempt := transportErr.Attempts[0]
+	if attempt.ProviderID != fncoreAdmissionProviderID || attempt.Operation != OperationBody ||
+		attempt.Outcome != OutcomeCancellation || !errors.Is(attempt.Cause, context.DeadlineExceeded) {
+		t.Errorf("client-deadline admission attempt = %+v, want client-deadline BODY cancellation", attempt)
+	}
+	if got := server.connections.Load(); got != 0 {
+		t.Errorf("client-deadline provider connections = %d, want 0", got)
+	}
+	if got := server.commandCount("BODY"); got != 0 {
+		t.Errorf("client-deadline BODY commands = %d, want 0", got)
+	}
+	if after := providerBreakerStats(t, client, fncoreAdmissionProviderID); after != before {
+		t.Errorf("client-deadline admission changed breaker: before=%+v after=%+v", before, after)
+	}
+}
