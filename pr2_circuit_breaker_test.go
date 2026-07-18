@@ -903,7 +903,9 @@ func TestPR2RealTransportLifecycleFeedsBreakerAccounting(t *testing.T) {
 					case <-ctx.Done():
 						return
 					}
-					_, _ = io.WriteString(server, "222 0 <fixture@example.invalid> body follows\r\nmalformed body\r\n.\r\n")
+					// Keep this as recognized corruption. Plain unrecognized content is
+					// intentionally inconclusive under the UU/unknown encoding contract.
+					_, _ = io.WriteString(server, "222 0 <fixture@example.invalid> body follows\r\n=ybegin line=128 size=1 name=malformed.bin\r\nx\r\n.\r\n")
 					return
 				}
 				for {

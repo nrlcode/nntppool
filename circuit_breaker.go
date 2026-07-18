@@ -278,6 +278,10 @@ func classifyCircuitBreakerCompletion(resp Response, ok, cancelled bool) circuit
 		if errors.Is(final.Cause, ErrCircuitBreakerOpen) {
 			return circuitBreakerNeutral
 		}
+		if final.ResponseCode == 451 && resp.Request != nil && len(resp.Request.Payload) > 0 &&
+			!resp.Request.PostMode && !isArticleOperation(resp.Request.Payload) {
+			return circuitBreakerNeutral
+		}
 		return circuitBreakerFailure
 	case OutcomeTransportFailure:
 		if final.ProviderResponseTimeout {
