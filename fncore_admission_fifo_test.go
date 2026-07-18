@@ -613,6 +613,18 @@ func TestFNCORECHG004ProviderRemovalStopsGateBeforeCancellation(t *testing.T) {
 		t.Fatalf("initial reservation status = %v, response = %+v; want granted", status, rejection)
 	}
 
+	registeredAtStop := make(chan bool, 1)
+	group.gate.mu.Lock()
+	originalNotify := group.gate.capacityNotify
+	var observeStop sync.Once
+	group.gate.capacityNotify = func() {
+		observeStop.Do(func() { registeredAtStop <- client.findGroup(provider.id) == group })
+		if originalNotify != nil {
+			originalNotify()
+		}
+	}
+	group.gate.mu.Unlock()
+
 	// Observe the existing cancellation boundary directly. The wrapper adds no
 	// production hook and records the gate state at the exact cancellation call.
 	originalCancel := group.cancel
@@ -627,6 +639,16 @@ func TestFNCORECHG004ProviderRemovalStopsGateBeforeCancellation(t *testing.T) {
 	if err := client.RemoveProvider(provider.id); err != nil {
 		lease.complete(Response{}, false, false)
 		t.Fatalf("RemoveProvider() error = %v", err)
+	}
+	select {
+	case registered := <-registeredAtStop:
+		if !registered {
+			lease.complete(Response{}, false, false)
+			t.Fatal("provider was unpublished before gate.stop linearized")
+		}
+	case <-time.After(2 * time.Second):
+		lease.complete(Response{}, false, false)
+		t.Fatal("provider removal did not notify gate stop")
 	}
 	select {
 	case stopped := <-stoppedAtCancel:
@@ -662,5 +684,49 @@ func TestFNCORECHG004ProviderRemovalStopsGateBeforeCancellation(t *testing.T) {
 	group.gate.mu.Unlock()
 	if !stopped || pipeline != 0 || body != 0 {
 		t.Errorf("removed gate state = stopped %t, pipeline %d, body %d; want stopped and empty", stopped, pipeline, body)
+	}
+}
+
+func TestFNCORECHG004ProviderDeactivationStopsGateBeforeUnpublish(t *testing.T) {
+	provider := newFNCOREAdmissionFIFOProvider("fncore-admission-deactivation-order")
+	defer provider.unblock()
+	client := fncoreAdmissionFIFOClient(t,
+		provider.provider(1, 1, 1, 0, 1, false),
+	)
+	group := client.registry.Load().mains[0]
+
+	registeredAtStop := make(chan bool, 1)
+	group.gate.mu.Lock()
+	originalNotify := group.gate.capacityNotify
+	group.gate.capacityNotify = func() {
+		registeredAtStop <- client.findGroup(provider.id) == group
+		if originalNotify != nil {
+			originalNotify()
+		}
+	}
+	group.gate.mu.Unlock()
+
+	if _, changed := client.deactivateProvider(group, false); !changed {
+		t.Fatal("deactivateProvider() did not remove the live provider")
+	}
+	select {
+	case registered := <-registeredAtStop:
+		if !registered {
+			t.Fatal("provider was unpublished before deactivation stopped its gate")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("provider deactivation did not notify gate stop")
+	}
+	if client.findGroup(provider.id) != nil {
+		t.Error("deactivated provider remained registered")
+	}
+	if group.ctx.Err() == nil {
+		t.Error("deactivated provider context remained live")
+	}
+	group.gate.mu.Lock()
+	stopped := group.gate.stopped
+	group.gate.mu.Unlock()
+	if !stopped {
+		t.Error("deactivated provider gate remained live")
 	}
 }
