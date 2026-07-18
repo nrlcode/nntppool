@@ -1,7 +1,6 @@
 package nntppool
 
 import (
-	"context"
 	"errors"
 	"testing"
 	"time"
@@ -56,18 +55,27 @@ func fncoreCHG005RequireStatesEqual(t *testing.T, got, want map[string]ProviderQ
 	}
 }
 
+func fncoreCHG005ServerSnapshot(server *regressionProvider) (commands int, connections int32) {
+	server.mu.Lock()
+	commands = len(server.commands)
+	server.mu.Unlock()
+	return commands, server.connections.Load()
+}
+
 func TestFNCORECHG005QuotaRestoreUsesCanonicalIDsAndExactState(t *testing.T) {
 	future := time.Unix(1_900_000_000, 123)
 	expired := time.Unix(1_600_000_000, 456)
 	_, lifetime := fncoreCHG005Provider("quota-lifetime", "new-lifetime.invalid:119", 100, 3, 0, time.Time{})
 	_, periodicB := fncoreCHG005Provider("quota-b", "new-b.invalid:119", 100, 4, time.Hour, future)
 	_, periodicA := fncoreCHG005Provider("quota-a", "new-a.invalid:119", 200, 5, time.Hour, future)
-	candidate := newRegressionClient(t, lifetime, periodicB, periodicA)
+	_, clearExceeded := fncoreCHG005Provider("quota-clear", "new-clear.invalid:119", 100, 100, time.Hour, future)
+	candidate := newRegressionClient(t, lifetime, periodicB, periodicA, clearExceeded)
 
 	states := map[string]ProviderQuotaState{
 		"quota-a":        {Used: 250, ResetAt: future},
 		"quota-b":        {Used: 50, ResetAt: expired},
 		"quota-lifetime": {Used: 75, ResetAt: future},
+		"quota-clear":    {Used: 25, ResetAt: future},
 	}
 	if err := candidate.RestoreProviderQuotas(states); err != nil {
 		t.Fatalf("RestoreProviderQuotas() error = %v", err)
@@ -82,6 +90,10 @@ func TestFNCORECHG005QuotaRestoreUsesCanonicalIDsAndExactState(t *testing.T) {
 		t.Fatal("restored usage below the candidate limit is marked exceeded")
 	}
 	fncoreCHG005RequireState(t, candidate, "quota-lifetime", ProviderQuotaState{Used: 75})
+	clear := fncoreCHG005RequireState(t, candidate, "quota-clear", states["quota-clear"])
+	if clear.QuotaExceeded || candidate.findGroup("quota-clear").stats.quotaExceeded.Load() {
+		t.Fatal("restored usage below the candidate limit did not clear exceeded eligibility")
+	}
 
 	if alias := candidate.findGroup("quota-a").name; alias == "quota-a" {
 		t.Fatal("fixture operational name unexpectedly equals its canonical ID")
@@ -94,7 +106,8 @@ func TestFNCORECHG005QuotaRestoreValidationIsAllOrNothing(t *testing.T) {
 		t.Helper()
 		_, first := fncoreCHG005Provider("quota-first", "first.invalid:119", 100, 7, time.Hour, future)
 		_, second := fncoreCHG005Provider("quota-second", "second.invalid:119", 100, 8, time.Hour, future)
-		return newRegressionClient(t, first, second)
+		_, third := fncoreCHG005Provider("quota-third", "third.invalid:119", 100, 9, time.Hour, future)
+		return newRegressionClient(t, first, second, third)
 	}
 
 	tests := []struct {
@@ -102,20 +115,24 @@ func TestFNCORECHG005QuotaRestoreValidationIsAllOrNothing(t *testing.T) {
 		states func(*Client) map[string]ProviderQuotaState
 	}{
 		{
-			name: "unknown canonical ID",
+			name: "removed old provider ID",
 			states: func(*Client) map[string]ProviderQuotaState {
 				return map[string]ProviderQuotaState{
-					"quota-first": {Used: 90, ResetAt: future},
-					"unknown":     {Used: 1, ResetAt: future},
+					"quota-first":   {Used: 90, ResetAt: future},
+					"quota-removed": {Used: 1, ResetAt: future},
 				}
 			},
 		},
 		{
 			name: "operational alias",
 			states: func(client *Client) map[string]ProviderQuotaState {
+				alias := client.findGroup("quota-second").name
+				if alias == "quota-second" {
+					t.Fatal("fixture operational alias unexpectedly equals its canonical ID")
+				}
 				return map[string]ProviderQuotaState{
-					"quota-first":                         {Used: 90, ResetAt: future},
-					client.findGroup("quota-second").name: {Used: 1, ResetAt: future},
+					"quota-first": {Used: 90, ResetAt: future},
+					alias:         {Used: 1, ResetAt: future},
 				}
 			},
 		},
@@ -137,16 +154,33 @@ func TestFNCORECHG005QuotaRestoreValidationIsAllOrNothing(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "periodic quota with zero encoded deadline",
+			states: func(*Client) map[string]ProviderQuotaState {
+				return map[string]ProviderQuotaState{
+					"quota-first":  {Used: 90, ResetAt: future},
+					"quota-second": {Used: 1, ResetAt: time.Unix(0, 0)},
+				}
+			},
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			candidate := newCandidate(t)
-			before := fncoreCHG005QuotaStates(candidate.Stats())
-			if err := candidate.RestoreProviderQuotas(test.states(candidate)); err == nil {
-				t.Fatal("RestoreProviderQuotas() error = nil, want validation failure")
+			// Map iteration is deliberately unspecified. Rebuild and retry enough
+			// times that an implementation which mutates while validating cannot
+			// hide behind encountering the invalid entry first.
+			for range 32 {
+				candidate := newCandidate(t)
+				before := fncoreCHG005QuotaStates(candidate.Stats())
+				states := test.states(candidate)
+				states["quota-third"] = ProviderQuotaState{Used: 91, ResetAt: future}
+				if err := candidate.RestoreProviderQuotas(states); err == nil {
+					t.Fatal("RestoreProviderQuotas() error = nil, want validation failure")
+				}
+				fncoreCHG005RequireStatesEqual(t, fncoreCHG005QuotaStates(candidate.Stats()), before)
+				_ = candidate.Close()
 			}
-			fncoreCHG005RequireStatesEqual(t, fncoreCHG005QuotaStates(candidate.Stats()), before)
 		})
 	}
 
@@ -154,6 +188,11 @@ func TestFNCORECHG005QuotaRestoreValidationIsAllOrNothing(t *testing.T) {
 		candidate := newCandidate(t)
 		before := fncoreCHG005QuotaStates(candidate.Stats())
 		inactive := candidate.findGroup("quota-second")
+		inactiveBefore := ProviderQuotaState{
+			Used:    inactive.stats.quotaUsed.Load(),
+			ResetAt: time.Unix(0, inactive.quotaResetAt.Load()),
+		}
+		inactiveExceeded := inactive.stats.quotaExceeded.Load()
 		if _, changed := candidate.deactivateProvider(inactive, true); !changed {
 			t.Fatal("fixture provider did not become inactive")
 		}
@@ -168,7 +207,96 @@ func TestFNCORECHG005QuotaRestoreValidationIsAllOrNothing(t *testing.T) {
 			t.Fatalf("active provider changed after inactive-provider failure: got %+v, want %+v",
 				got["quota-first"], before["quota-first"])
 		}
+		inactiveAfter := ProviderQuotaState{
+			Used:    inactive.stats.quotaUsed.Load(),
+			ResetAt: time.Unix(0, inactive.quotaResetAt.Load()),
+		}
+		if inactiveAfter != inactiveBefore || inactive.stats.quotaExceeded.Load() != inactiveExceeded {
+			t.Fatalf("inactive provider changed after failed restore: got %+v/%v, want %+v/%v",
+				inactiveAfter, inactive.stats.quotaExceeded.Load(), inactiveBefore, inactiveExceeded)
+		}
 	})
+
+	t.Run("closed candidate", func(t *testing.T) {
+		candidate := newCandidate(t)
+		before := fncoreCHG005QuotaStates(candidate.Stats())
+		if err := candidate.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+		if err := candidate.RestoreProviderQuotas(map[string]ProviderQuotaState{
+			"quota-first": {Used: 90, ResetAt: future},
+		}); err == nil {
+			t.Fatal("RestoreProviderQuotas() error = nil, want closed-client failure")
+		}
+		fncoreCHG005RequireStatesEqual(t, fncoreCHG005QuotaStates(candidate.Stats()), before)
+	})
+}
+
+func TestFNCORECHG005QuotaRestoreAllowsPartialAndEmptyState(t *testing.T) {
+	future := time.Unix(1_900_000_000, 987)
+	_, retained := fncoreCHG005Provider("quota-retained", "retained.invalid:119", 100, 10, time.Hour, future)
+	_, added := fncoreCHG005Provider("quota-added", "added.invalid:119", 100, 20, time.Hour, future)
+	candidate := newRegressionClient(t, retained, added)
+	before := fncoreCHG005QuotaStates(candidate.Stats())
+
+	if err := candidate.RestoreProviderQuotas(nil); err != nil {
+		t.Fatalf("RestoreProviderQuotas(nil) error = %v", err)
+	}
+	if err := candidate.RestoreProviderQuotas(map[string]ProviderQuotaState{}); err != nil {
+		t.Fatalf("RestoreProviderQuotas(empty) error = %v", err)
+	}
+	fncoreCHG005RequireStatesEqual(t, fncoreCHG005QuotaStates(candidate.Stats()), before)
+
+	wantRetained := ProviderQuotaState{Used: 80, ResetAt: future}
+	if err := candidate.RestoreProviderQuotas(map[string]ProviderQuotaState{
+		"quota-retained": wantRetained,
+	}); err != nil {
+		t.Fatalf("RestoreProviderQuotas(partial) error = %v", err)
+	}
+	fncoreCHG005RequireState(t, candidate, "quota-retained", wantRetained)
+	fncoreCHG005RequireState(t, candidate, "quota-added", before["quota-added"])
+}
+
+func TestFNCORECHG005QuotaRestoreSerializesWithRegistryMutation(t *testing.T) {
+	future := time.Unix(1_900_000_000, 654)
+	_, provider := fncoreCHG005Provider("quota-serialized", "serialized.invalid:119", 100, 10, time.Hour, future)
+	candidate := newRegressionClient(t, provider)
+	done := make(chan error, 1)
+	started := make(chan struct{})
+
+	candidate.registryMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			candidate.registryMu.Unlock()
+		}
+	}()
+	go func() {
+		close(started)
+		done <- candidate.RestoreProviderQuotas(map[string]ProviderQuotaState{
+			"quota-serialized": {Used: 80, ResetAt: future},
+		})
+	}()
+	<-started
+
+	select {
+	case err := <-done:
+		candidate.registryMu.Unlock()
+		locked = false
+		t.Fatalf("RestoreProviderQuotas() returned without registry serialization: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+	candidate.registryMu.Unlock()
+	locked = false
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RestoreProviderQuotas() error after registry release = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RestoreProviderQuotas() remained blocked after registry release")
+	}
 }
 
 func TestFNCORECHG005RestoredQuotaBlocksBeforeFirstWireAttempt(t *testing.T) {
@@ -179,6 +307,7 @@ func TestFNCORECHG005RestoredQuotaBlocksBeforeFirstWireAttempt(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("RestoreProviderQuotas() error = %v", err)
 	}
+	commandsBefore, connectionsBefore := fncoreCHG005ServerSnapshot(server)
 
 	_, err := candidate.BodyTargeted(
 		fncoreAdmissionContext(t),
@@ -191,6 +320,11 @@ func TestFNCORECHG005RestoredQuotaBlocksBeforeFirstWireAttempt(t *testing.T) {
 	if got := server.commandCount("BODY"); got != 0 {
 		t.Fatalf("restored quota allowed %d BODY commands, want 0", got)
 	}
+	commandsAfter, connectionsAfter := fncoreCHG005ServerSnapshot(server)
+	if commandsAfter != commandsBefore || connectionsAfter != connectionsBefore {
+		t.Fatalf("quota rejection changed wire activity from %d commands/%d connections to %d/%d",
+			commandsBefore, connectionsBefore, commandsAfter, connectionsAfter)
+	}
 }
 
 func TestFNCORECHG005QuotaHandoverIncludesSettledCompletionCharge(t *testing.T) {
@@ -201,7 +335,7 @@ func TestFNCORECHG005QuotaHandoverIncludesSettledCompletionCharge(t *testing.T) 
 	candidate := newRegressionClient(t, candidateProvider)
 
 	if _, err := old.BodyTargeted(
-		context.Background(),
+		fncoreAdmissionContext(t),
 		"settled@example.invalid",
 		TargetedBodyOptions{Provider: "quota-shared"},
 	); err != nil {
@@ -232,7 +366,7 @@ func TestFNCORECHG005QuotaHandoverIncludesSerializedReset(t *testing.T) {
 		t.Fatalf("ResetProviderQuota() error = %v", err)
 	}
 	settled := fncoreCHG005QuotaStates(old.Stats())
-	if settled["quota-reset"].Used != 0 || settled["quota-reset"].ResetAt.Equal(initialReset) {
+	if settled["quota-reset"].Used != 0 || settled["quota-reset"].ResetAt.IsZero() || settled["quota-reset"].ResetAt.Equal(initialReset) {
 		t.Fatalf("settled reset state = %+v, want zero usage and a fresh deadline", settled["quota-reset"])
 	}
 	if err := candidate.RestoreProviderQuotas(settled); err != nil {
