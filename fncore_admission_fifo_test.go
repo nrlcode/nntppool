@@ -507,3 +507,84 @@ func TestFNCORECHG004StoppedGateRejectsReservedRequestBeforeWire(t *testing.T) {
 		t.Errorf("stopped reservation retained capacity: pipeline=%d body=%d", pipeline, body)
 	}
 }
+
+func TestFNCORECHG004ReservationHandoffRevalidatesThrottleAndStop(t *testing.T) {
+	payload := []byte("BODY <reservation-handoff@example.invalid>\r\n")
+
+	t.Run("throttle shrink invalidates only the pending reservation", func(t *testing.T) {
+		gate := newConnGate(2, time.Hour)
+		t.Cleanup(gate.stop)
+		gate.configureRequestCapacity(1, 1, 1, nil)
+
+		first, ok := gate.reserveRequest(payload, false, true)
+		if !ok {
+			t.Fatal("first reservation was rejected before throttle")
+		}
+		second, ok := gate.reserveRequest(payload, false, true)
+		if !ok {
+			first.release()
+			t.Fatal("second reservation was rejected before throttle")
+		}
+		if got := first.handoff(); got != requestHandoffGranted {
+			first.release()
+			second.release()
+			t.Fatalf("first handoff = %v, want granted", got)
+		}
+
+		gate.markRunning()
+		gate.throttle()
+		if got := second.handoff(); got != requestHandoffSaturated {
+			first.release()
+			second.release()
+			t.Fatalf("stale second handoff = %v, want saturated", got)
+		}
+
+		gate.mu.Lock()
+		pipeline, body := gate.reservedPipeline, gate.reservedBody
+		gate.mu.Unlock()
+		if pipeline != 1 || body != 1 {
+			first.release()
+			t.Fatalf("capacity after stale handoff = pipeline %d, body %d; want handed reservation only", pipeline, body)
+		}
+		second.release()
+		gate.mu.Lock()
+		pipeline, body = gate.reservedPipeline, gate.reservedBody
+		gate.mu.Unlock()
+		if pipeline != 1 || body != 1 {
+			first.release()
+			t.Fatalf("repeated stale release changed capacity: pipeline=%d body=%d", pipeline, body)
+		}
+		first.release()
+		gate.mu.Lock()
+		pipeline, body = gate.reservedPipeline, gate.reservedBody
+		gate.mu.Unlock()
+		if pipeline != 0 || body != 0 {
+			t.Fatalf("final capacity = pipeline %d, body %d; want zero", pipeline, body)
+		}
+	})
+
+	t.Run("stopped gate rejects pending and new reservations", func(t *testing.T) {
+		gate := newConnGate(1, time.Hour)
+		gate.configureRequestCapacity(1, 1, 1, nil)
+		reservation, ok := gate.reserveRequest(payload, false, true)
+		if !ok {
+			t.Fatal("reservation was rejected before stop")
+		}
+		gate.stop()
+		if got := reservation.handoff(); got != requestHandoffUnavailable {
+			reservation.release()
+			t.Fatalf("stopped handoff = %v, want unavailable", got)
+		}
+		if extra, reserved := gate.reserveRequest(payload, false, true); reserved {
+			extra.release()
+			t.Fatal("stopped gate accepted a new reservation")
+		}
+		reservation.release()
+		gate.mu.Lock()
+		pipeline, body := gate.reservedPipeline, gate.reservedBody
+		gate.mu.Unlock()
+		if pipeline != 0 || body != 0 {
+			t.Fatalf("stopped gate retained capacity: pipeline=%d body=%d", pipeline, body)
+		}
+	})
+}
