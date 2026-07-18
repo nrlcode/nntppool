@@ -185,35 +185,38 @@ func TestFNCORECHG005QuotaRestoreValidationIsAllOrNothing(t *testing.T) {
 	}
 
 	t.Run("inactive provider", func(t *testing.T) {
-		candidate := newCandidate(t)
-		before := fncoreCHG005QuotaStates(candidate.Stats())
-		inactive := candidate.findGroup("quota-second")
-		inactiveBefore := ProviderQuotaState{
-			Used:    inactive.stats.quotaUsed.Load(),
-			ResetAt: time.Unix(0, inactive.quotaResetAt.Load()),
-		}
-		inactiveExceeded := inactive.stats.quotaExceeded.Load()
-		if _, changed := candidate.deactivateProvider(inactive, true); !changed {
-			t.Fatal("fixture provider did not become inactive")
-		}
-		if err := candidate.RestoreProviderQuotas(map[string]ProviderQuotaState{
-			"quota-first":  {Used: 90, ResetAt: future},
-			"quota-second": {Used: 1, ResetAt: future},
-		}); err == nil {
-			t.Fatal("RestoreProviderQuotas() error = nil, want inactive-provider failure")
-		}
-		got := fncoreCHG005QuotaStates(candidate.Stats())
-		if got["quota-first"] != before["quota-first"] {
-			t.Fatalf("active provider changed after inactive-provider failure: got %+v, want %+v",
-				got["quota-first"], before["quota-first"])
-		}
-		inactiveAfter := ProviderQuotaState{
-			Used:    inactive.stats.quotaUsed.Load(),
-			ResetAt: time.Unix(0, inactive.quotaResetAt.Load()),
-		}
-		if inactiveAfter != inactiveBefore || inactive.stats.quotaExceeded.Load() != inactiveExceeded {
-			t.Fatalf("inactive provider changed after failed restore: got %+v/%v, want %+v/%v",
-				inactiveAfter, inactive.stats.quotaExceeded.Load(), inactiveBefore, inactiveExceeded)
+		for range 32 {
+			candidate := newCandidate(t)
+			before := fncoreCHG005QuotaStates(candidate.Stats())
+			inactive := candidate.findGroup("quota-second")
+			inactiveBefore := ProviderQuotaState{
+				Used:    inactive.stats.quotaUsed.Load(),
+				ResetAt: time.Unix(0, inactive.quotaResetAt.Load()),
+			}
+			inactiveExceeded := inactive.stats.quotaExceeded.Load()
+			if _, changed := candidate.deactivateProvider(inactive, true); !changed {
+				t.Fatal("fixture provider did not become inactive")
+			}
+			if err := candidate.RestoreProviderQuotas(map[string]ProviderQuotaState{
+				"quota-first":  {Used: 90, ResetAt: future},
+				"quota-second": {Used: 1, ResetAt: future},
+				"quota-third":  {Used: 91, ResetAt: future},
+			}); err == nil {
+				t.Fatal("RestoreProviderQuotas() error = nil, want inactive-provider failure")
+			}
+			got := fncoreCHG005QuotaStates(candidate.Stats())
+			if got["quota-first"] != before["quota-first"] || got["quota-third"] != before["quota-third"] {
+				t.Fatalf("active provider changed after inactive-provider failure: got %+v, want %+v", got, before)
+			}
+			inactiveAfter := ProviderQuotaState{
+				Used:    inactive.stats.quotaUsed.Load(),
+				ResetAt: time.Unix(0, inactive.quotaResetAt.Load()),
+			}
+			if inactiveAfter != inactiveBefore || inactive.stats.quotaExceeded.Load() != inactiveExceeded {
+				t.Fatalf("inactive provider changed after failed restore: got %+v/%v, want %+v/%v",
+					inactiveAfter, inactive.stats.quotaExceeded.Load(), inactiveBefore, inactiveExceeded)
+			}
+			_ = candidate.Close()
 		}
 	})
 
@@ -286,6 +289,7 @@ func TestFNCORECHG005QuotaRestoreSerializesWithRegistryMutation(t *testing.T) {
 		t.Fatalf("RestoreProviderQuotas() returned without registry serialization: %v", err)
 	case <-time.After(250 * time.Millisecond):
 	}
+	fncoreCHG005RequireState(t, candidate, "quota-serialized", ProviderQuotaState{Used: 10, ResetAt: future})
 	candidate.registryMu.Unlock()
 	locked = false
 
@@ -294,6 +298,7 @@ func TestFNCORECHG005QuotaRestoreSerializesWithRegistryMutation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("RestoreProviderQuotas() error after registry release = %v", err)
 		}
+		fncoreCHG005RequireState(t, candidate, "quota-serialized", ProviderQuotaState{Used: 80, ResetAt: future})
 	case <-time.After(2 * time.Second):
 		t.Fatal("RestoreProviderQuotas() remained blocked after registry release")
 	}
