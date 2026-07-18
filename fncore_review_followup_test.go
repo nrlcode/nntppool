@@ -565,7 +565,7 @@ func TestFNCOREFailedDrainDeadlineClearRetiresTransport(t *testing.T) {
 		Payload:      []byte("BODY <clear-failure@example.invalid>\r\n"),
 		RespCh:       make(chan Response, 1),
 		BodyWriter:   writer,
-		ValidateBody: true,
+		validateBody: true,
 		submittedAt:  time.Now(),
 	}
 	go connection.Run()

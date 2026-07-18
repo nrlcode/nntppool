@@ -246,8 +246,8 @@ func (c *Client) completeProviderStart(id string, generation uint64, ping PingRe
 	group := c.startProviderGroup(registration.spec, ping)
 	if c.ctx.Err() != nil {
 		c.registryMu.Unlock()
-		group.cancel()
 		group.gate.stop()
+		group.cancel()
 		return false
 	}
 
@@ -292,6 +292,9 @@ func (c *Client) deactivateProvider(group *providerGroup, retain bool) (uint64, 
 		return 0, false
 	}
 
+	// A group may leave the registry only after its admission gate is terminal.
+	// Close can then omit it from its snapshot without cancelling ahead of stop.
+	group.gate.stop()
 	next := current.clone()
 	if retain {
 		registration.group = nil
@@ -304,7 +307,6 @@ func (c *Client) deactivateProvider(group *providerGroup, retain bool) (uint64, 
 	c.registryMu.Unlock()
 
 	group.cancel()
-	group.gate.stop()
 	return registration.generation, true
 }
 
@@ -372,6 +374,11 @@ func (c *Client) removeProvider(token string) (*providerGroup, bool) {
 		return nil, false
 	}
 	registration := current.byID[id]
+	if registration.group != nil {
+		// Stop under the mutation lock so concurrent Close either snapshots this
+		// group or observes that its gate is already terminal.
+		registration.group.gate.stop()
+	}
 	next := current.clone()
 	removeRegistration(next, id)
 	c.publishRegistryLocked(next)

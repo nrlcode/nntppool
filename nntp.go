@@ -202,10 +202,10 @@ type Request struct {
 	// Optional: decoded body bytes are streamed here. If nil, they are buffered into Response.Body.
 	BodyWriter io.Writer
 
-	// ValidateBody enables complete yEnc framing/integrity validation. It is
+	// validateBody enables complete yEnc framing/integrity validation. It is
 	// set by the high-level BODY APIs; raw Send remains source/behavior compatible.
-	ValidateBody   bool
-	FreshTransport bool
+	validateBody   bool
+	freshTransport bool
 
 	// Optional: called with yEnc metadata once =ybegin/=ypart headers are parsed, before body decoding.
 	OnMeta func(YEncMeta)
@@ -273,7 +273,7 @@ type Request struct {
 	heldBody           bool
 	heldBackgroundStat bool
 	heldPipeline       bool
-	Priority           bool
+	priority           bool
 }
 
 type Response struct {
@@ -925,6 +925,53 @@ type connGate struct {
 	restoreTimer *time.Timer
 	restoreDur   time.Duration
 	available    atomic.Int32 // allowed - held; updated under mu, read lock-free
+
+	// Request reservations are the pre-write admission authority used by FIFO
+	// selection. Other dispatch modes register the same occupancy without using
+	// it to choose a provider, preserving their historical routing behavior.
+	pipelinePerConnection       int
+	bodyPerConnection           int
+	backgroundStatPerConnection int
+	reservedPipeline            int
+	reservedBody                int
+	reservedBackgroundStat      int
+	capacityNotify              func()
+	capacityEpoch               uint64
+	stopped                     bool
+}
+
+type requestCapacityClass uint8
+
+const (
+	requestCapacityBody requestCapacityClass = iota
+	requestCapacityBackgroundStat
+	requestCapacityPriorityStat
+)
+
+type requestHandoffStatus uint8
+
+const (
+	requestHandoffGranted requestHandoffStatus = iota
+	requestHandoffSaturated
+	requestHandoffUnavailable
+)
+
+type requestReservationState uint8
+
+const (
+	requestReservationReserved requestReservationState = iota
+	requestReservationHandedOff
+	requestReservationRejected
+	requestReservationReleased
+)
+
+type requestReservation struct {
+	gate          *connGate
+	class         requestCapacityClass
+	enforce       bool
+	epoch         uint64
+	state         requestReservationState
+	handoffStatus requestHandoffStatus
 }
 
 func newConnGate(max int, restoreDur time.Duration) *connGate {
@@ -939,6 +986,174 @@ func newConnGate(max int, restoreDur time.Duration) *connGate {
 	g.cond = sync.NewCond(&g.mu)
 	g.available.Store(int32(max))
 	return g
+}
+
+func (g *connGate) configureRequestCapacity(inflight, statInflight, backgroundStatInflight int, notify func()) {
+	g.mu.Lock()
+	g.bodyPerConnection = inflight
+	g.pipelinePerConnection = statInflight
+	g.backgroundStatPerConnection = backgroundStatInflight
+	g.capacityNotify = notify
+	g.mu.Unlock()
+}
+
+func requestClass(payload []byte, priority bool) requestCapacityClass {
+	if isCheapCommand(payload) {
+		if priority {
+			return requestCapacityPriorityStat
+		}
+		return requestCapacityBackgroundStat
+	}
+	return requestCapacityBody
+}
+
+// reserveRequest atomically registers one logical provider attempt. When
+// enforce is true, every applicable request-class bound must have capacity.
+// A false enforce value records occupancy but leaves round-robin and targeted
+// dispatch behavior unchanged; their existing connection semaphores remain the
+// transport-level backstop.
+func (g *connGate) reserveRequest(payload []byte, priority, enforce bool) (*requestReservation, bool) {
+	class := requestClass(payload, priority)
+	g.mu.Lock()
+	if g.stopped {
+		g.mu.Unlock()
+		return nil, false
+	}
+	pipelineLimit := g.allowed * g.pipelinePerConnection
+	bodyLimit := g.allowed * g.bodyPerConnection
+	backgroundStatLimit := g.allowed * g.backgroundStatPerConnection
+	if enforce {
+		available := pipelineLimit > 0 && g.reservedPipeline < pipelineLimit
+		switch class {
+		case requestCapacityBody:
+			available = available && g.reservedBody < bodyLimit
+		case requestCapacityBackgroundStat:
+			available = available && g.reservedBackgroundStat < backgroundStatLimit
+		}
+		if !available {
+			g.mu.Unlock()
+			return nil, false
+		}
+	}
+	g.reservedPipeline++
+	switch class {
+	case requestCapacityBody:
+		g.reservedBody++
+	case requestCapacityBackgroundStat:
+		g.reservedBackgroundStat++
+	}
+	epoch := g.capacityEpoch
+	g.mu.Unlock()
+	return &requestReservation{
+		gate:          g,
+		class:         class,
+		enforce:       enforce,
+		epoch:         epoch,
+		state:         requestReservationReserved,
+		handoffStatus: requestHandoffUnavailable,
+	}, true
+}
+
+func (g *connGate) reservationWithinCurrentLimitsLocked(class requestCapacityClass) bool {
+	pipelineLimit := g.allowed * g.pipelinePerConnection
+	if pipelineLimit <= 0 || g.reservedPipeline > pipelineLimit {
+		return false
+	}
+	switch class {
+	case requestCapacityBody:
+		bodyLimit := g.allowed * g.bodyPerConnection
+		return bodyLimit > 0 && g.reservedBody <= bodyLimit
+	case requestCapacityBackgroundStat:
+		backgroundLimit := g.allowed * g.backgroundStatPerConnection
+		return backgroundLimit > 0 && g.reservedBackgroundStat <= backgroundLimit
+	default:
+		return true
+	}
+}
+
+func (r *requestReservation) releaseLocked(g *connGate) {
+	if r.state == requestReservationReleased {
+		return
+	}
+	r.state = requestReservationReleased
+	g.reservedPipeline--
+	switch r.class {
+	case requestCapacityBody:
+		g.reservedBody--
+	case requestCapacityBackgroundStat:
+		g.reservedBackgroundStat--
+	}
+}
+
+// handoff revalidates an enforced FIFO reservation at the last gate-owned
+// boundary before transport. Capacity reductions invalidate only reservations
+// that have not already handed ownership to the runner.
+func (r *requestReservation) handoff() requestHandoffStatus {
+	if r == nil || r.gate == nil {
+		return requestHandoffUnavailable
+	}
+	g := r.gate
+	g.mu.Lock()
+	switch r.state {
+	case requestReservationHandedOff:
+		g.mu.Unlock()
+		return requestHandoffGranted
+	case requestReservationRejected:
+		status := r.handoffStatus
+		g.mu.Unlock()
+		return status
+	case requestReservationReleased:
+		status := r.handoffStatus
+		g.mu.Unlock()
+		return status
+	}
+
+	status := requestHandoffGranted
+	if g.stopped {
+		status = requestHandoffUnavailable
+	} else if r.enforce && r.epoch != g.capacityEpoch && !g.reservationWithinCurrentLimitsLocked(r.class) {
+		status = requestHandoffSaturated
+	}
+	if status == requestHandoffGranted {
+		r.state = requestReservationHandedOff
+		r.handoffStatus = status
+		g.mu.Unlock()
+		return status
+	}
+	r.handoffStatus = status
+	r.state = requestReservationRejected
+	g.mu.Unlock()
+	return status
+}
+
+func (r *requestReservation) release() {
+	if r == nil || r.gate == nil {
+		return
+	}
+	g := r.gate
+	g.mu.Lock()
+	released := r.state != requestReservationReleased
+	if r.state != requestReservationRejected && r.state != requestReservationReleased {
+		r.handoffStatus = requestHandoffUnavailable
+	}
+	r.releaseLocked(g)
+	g.mu.Unlock()
+	if released {
+		g.notifyCapacity()
+	}
+}
+
+func (g *connGate) notifyCapacity() {
+	if g.capacityNotify != nil {
+		g.capacityNotify()
+	}
+}
+
+func (g *connGate) isStopped() bool {
+	g.mu.Lock()
+	stopped := g.stopped
+	g.mu.Unlock()
+	return stopped
 }
 
 // enter blocks until held < allowed or one of the contexts is cancelled.
@@ -961,10 +1176,13 @@ func (g *connGate) enter(slotCtx, reqCtx context.Context) bool {
 	defer close(done)
 
 	for g.held >= g.allowed {
-		if slotCtx.Err() != nil || reqCtx.Err() != nil {
+		if g.stopped || slotCtx.Err() != nil || reqCtx.Err() != nil {
 			return false
 		}
 		g.cond.Wait()
+	}
+	if g.stopped {
+		return false
 	}
 	g.held++
 	g.available.Store(int32(g.allowed - g.held))
@@ -994,12 +1212,16 @@ func (g *connGate) markNotRunning() {
 // throttle reduces allowed slots to max(1, running) and resets the restore timer.
 func (g *connGate) throttle() {
 	g.mu.Lock()
-	defer g.mu.Unlock()
+	if g.stopped {
+		g.mu.Unlock()
+		return
+	}
 
 	newAllowed := max(1, g.running)
 	// Only tighten, never loosen during throttle.
 	if newAllowed < g.allowed {
 		g.allowed = newAllowed
+		g.capacityEpoch++
 	}
 
 	// Reset (or start) the restore timer.
@@ -1008,25 +1230,37 @@ func (g *connGate) throttle() {
 	}
 	g.restoreTimer = time.AfterFunc(g.restoreDur, g.restore)
 	g.available.Store(int32(g.allowed - g.held))
+	g.mu.Unlock()
 }
 
 func (g *connGate) restore() {
 	g.mu.Lock()
+	if g.stopped {
+		g.restoreTimer = nil
+		g.mu.Unlock()
+		return
+	}
 	g.allowed = g.maxSlots
 	g.restoreTimer = nil
 	g.available.Store(int32(g.allowed - g.held))
 	g.mu.Unlock()
 	g.cond.Broadcast()
+	g.notifyCapacity()
 }
 
 func (g *connGate) stop() {
 	g.mu.Lock()
+	if !g.stopped {
+		g.stopped = true
+		g.capacityEpoch++
+	}
 	if g.restoreTimer != nil {
 		g.restoreTimer.Stop()
 		g.restoreTimer = nil
 	}
 	g.mu.Unlock()
 	g.cond.Broadcast()
+	g.notifyCapacity()
 }
 
 func (g *connGate) snapshot() (maxSlots, running int) {
@@ -1233,7 +1467,7 @@ func markRequestWritten(req *Request) {
 }
 
 func (c *NNTPConnection) acquireBackgroundStat(req *Request) error {
-	if !isCheapCommand(req.Payload) || req.Priority {
+	if !isCheapCommand(req.Payload) || req.priority {
 		return nil
 	}
 	select {
@@ -1523,7 +1757,7 @@ func (c *NNTPConnection) Run() {
 		if req.Ctx == nil {
 			req.Ctx = context.Background()
 		}
-		if req.FreshTransport && c.createdAt.Before(req.submittedAt) {
+		if req.freshTransport && c.createdAt.Before(req.submittedAt) {
 			unsent = nil
 			finishUnadmittedRequest(req, c.providerID, errFreshTransportRequired)
 			return
@@ -1657,7 +1891,7 @@ mainLoop:
 			var gotPriority bool
 			blockedDeferredStat := deferredNormal != nil &&
 				isCheapCommand(deferredNormal.Payload) &&
-				!deferredNormal.Priority &&
+				!deferredNormal.priority &&
 				len(c.backgroundStatSem) == cap(c.backgroundStatSem)
 			req, ok, gotPriority = takePriority()
 			if blockedDeferredStat && !gotPriority {
@@ -1786,7 +2020,7 @@ mainLoop:
 			continue
 		default:
 		}
-		if req.FreshTransport && c.createdAt.Before(req.submittedAt) {
+		if req.freshTransport && c.createdAt.Before(req.submittedAt) {
 			unsent = nil
 			c.releaseAdmittedRequest(req)
 			finishUnadmittedRequest(req, c.providerID, errFreshTransportRequired)
@@ -1866,7 +2100,7 @@ func (c *NNTPConnection) readerLoop() {
 		}
 		decoder := NNTPResponse{
 			onMeta:             req.OnMeta,
-			strictDecodeErrors: req.ValidateBody,
+			strictDecodeErrors: req.validateBody,
 			decodeFn:           req.decodeFn,
 		}
 
@@ -1933,7 +2167,7 @@ func (c *NNTPConnection) readerLoop() {
 		} else if terminalErr != nil {
 			req.recordDeadlineOwner(terminalOwner)
 		}
-		if err == nil && req.ValidateBody {
+		if err == nil && req.validateBody {
 			err = decoder.validateBody()
 			if err != nil && retirementErr == nil && !errors.Is(err, errBodyEncodingUnknown) {
 				retirementOwner, retirementErr = readDeadlineNone, err
@@ -2006,7 +2240,7 @@ func (c *NNTPConnection) readerLoop() {
 		if c.stats != nil {
 			n := int64(decoder.BytesConsumed)
 			c.stats.BytesConsumed.Add(n)
-			if c.stats.quotaBytes > 0 {
+			if c.stats.quotaBytes > 0 && !req.PostMode {
 				if c.stats.quotaUsed.Add(n) >= c.stats.quotaBytes {
 					c.stats.quotaExceeded.Store(true)
 				}
@@ -2303,11 +2537,13 @@ type Client struct {
 	backupGroups atomic.Pointer[[]*providerGroup]
 	nextIdx      atomic.Uint64 // round-robin counter for mainGroups
 
-	dispatch     DispatchStrategy // set once by NewClient, read-only after
-	statProbe    bool             // set once by NewClient; enables parallel STAT probing on 430
-	speedAware   bool             // set once by NewClient; weights round-robin dispatch by throughput
-	breakerOn    bool
-	breakerClock circuitBreakerClock
+	dispatch        DispatchStrategy // set once by NewClient, read-only after
+	statProbe       bool             // set once by NewClient; enables parallel STAT probing on 430
+	speedAware      bool             // set once by NewClient; weights round-robin dispatch by throughput
+	breakerOn       bool
+	breakerClock    circuitBreakerClock
+	capacityMu      sync.Mutex
+	capacityChanged chan struct{}
 
 	nextGenerated           uint64
 	nextLifecycleGeneration uint64
@@ -2471,6 +2707,7 @@ func (c *Client) startProviderGroup(spec resolvedProvider, ping PingResult) *pro
 
 	name := spec.name
 	gate := newConnGate(p.Connections, p.ThrottleRestore)
+	gate.configureRequestCapacity(inflight, statInflight, backgroundStatInflight, c.notifyCapacityChange)
 	gctx, gcancel := context.WithCancel(c.ctx)
 
 	g := &providerGroup{
@@ -2586,15 +2823,16 @@ func NewClient(ctx context.Context, providers []Provider, opts ...ClientOption) 
 	}
 
 	c := &Client{
-		ctx:           ctx,
-		cancel:        cancel,
-		dispatch:      cfg.dispatch,
-		statProbe:     !cfg.statProbeOff,
-		speedAware:    !cfg.speedAwareOff,
-		breakerOn:     cfg.circuitBreakerEnabled,
-		breakerClock:  cfg.circuitBreakerClock,
-		nextGenerated: 1,
-		startTime:     time.Now(),
+		ctx:             ctx,
+		cancel:          cancel,
+		dispatch:        cfg.dispatch,
+		statProbe:       !cfg.statProbeOff,
+		speedAware:      !cfg.speedAwareOff,
+		breakerOn:       cfg.circuitBreakerEnabled,
+		breakerClock:    cfg.circuitBreakerClock,
+		capacityChanged: make(chan struct{}),
+		nextGenerated:   1,
+		startTime:       time.Now(),
 	}
 	registry := newProviderRegistry()
 	registry.ownerByToken = owners
@@ -2618,18 +2856,19 @@ func NewClient(ctx context.Context, providers []Provider, opts ...ClientOption) 
 	return c, nil
 }
 
-// Close cancels the client, stops all provider gates, and waits for all
+// Close stops all provider gates, cancels the client, and waits for all
 // connection slots to stop. Slots manage their own TCP connection cleanup.
-// Context cancellation (c.cancel) cascades to all group contexts, so closing
-// reqCh is unnecessary and avoids a race with stale-snapshot senders.
+// Gates stop before context cancellation so a stale-snapshot reservation cannot
+// hand off after shutdown begins. Closing reqCh remains unnecessary and would
+// race with those stale-snapshot senders.
 func (c *Client) Close() error {
-	c.cancel()
 	registry := c.closeRegistry()
 	for _, groups := range [...][]*providerGroup{registry.mains, registry.backups} {
 		for _, group := range groups {
 			group.gate.stop()
 		}
 	}
+	c.cancel()
 	c.wg.Wait()
 	return nil
 }
@@ -2682,6 +2921,20 @@ func (c *Client) requestCancellation(ctx context.Context) error {
 		}
 	}
 	return c.ctx.Err()
+}
+
+func (c *Client) capacityChange() <-chan struct{} {
+	c.capacityMu.Lock()
+	changed := c.capacityChanged
+	c.capacityMu.Unlock()
+	return changed
+}
+
+func (c *Client) notifyCapacityChange() {
+	c.capacityMu.Lock()
+	close(c.capacityChanged)
+	c.capacityChanged = make(chan struct{})
+	c.capacityMu.Unlock()
 }
 
 // extractProbeMsgID returns the "<id@host>" message-ID from a BODY, HEAD, or
@@ -2743,7 +2996,7 @@ func (c *Client) raceCandidates(
 		}
 		if g.isQuotaExceeded() {
 			lastErr = fmt.Errorf("%s: %w", safeIdentityText(g.name), ErrQuotaExceeded)
-			*attempts = append(*attempts, buildEligibilityEvidence(payload, g.id, lastErr, validateBody))
+			*attempts = append(*attempts, buildEligibilityEvidence(ctx, payload, g.id, lastErr, validateBody))
 			continue
 		}
 		live = append(live, g)
@@ -2959,9 +3212,9 @@ func (c *Client) tryGroup(
 		Payload:         payload,
 		RespCh:          innerCh,
 		BodyWriter:      bodyWriter,
-		ValidateBody:    validateBody,
-		FreshTransport:  freshTransport,
-		Priority:        priority,
+		validateBody:    validateBody,
+		freshTransport:  freshTransport,
+		priority:        priority,
 		OnMeta:          onMeta,
 		decodeFn:        c.decodeFn,
 		submittedAt:     time.Now(),
@@ -3071,7 +3324,7 @@ func buildAttemptEvidence(req *Request, providerID string, resp Response, comple
 	outcome := classifyAttemptOutcome(req, responseCode, cause)
 	validation := BodyValidationNotApplicable
 	if operationFromPayload(req.Payload) == OperationBody {
-		if !req.ValidateBody {
+		if !req.validateBody {
 			validation = BodyValidationNotRequested
 		} else {
 			switch outcome {
@@ -3113,8 +3366,13 @@ func buildAttemptEvidence(req *Request, providerID string, resp Response, comple
 	}
 }
 
-func buildEligibilityEvidence(payload []byte, providerID string, cause error, validateBody bool) AttemptEvidence {
-	req := &Request{Payload: payload, ValidateBody: validateBody}
+func buildEligibilityEvidence(ctx context.Context, payload []byte, providerID string, cause error, validateBody bool) AttemptEvidence {
+	req := &Request{Ctx: ctx, Payload: payload, validateBody: validateBody}
+	if errors.Is(cause, context.DeadlineExceeded) {
+		// Provider response timing has not started at this boundary, so a
+		// deadline can only belong to the caller or the client's parent context.
+		req.deadlineOwner = readDeadlineCaller
+	}
 	return buildAttemptEvidence(req, providerID, Response{Err: cause}, time.Now())
 }
 
@@ -3173,6 +3431,115 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 	c.doSendWithRetry(ctx, payload, bodyWriter, onMeta, respCh, false, false)
 }
 
+type providerAdmissionStatus uint8
+
+const (
+	providerAdmissionGranted providerAdmissionStatus = iota
+	providerAdmissionRejected
+	providerAdmissionUnavailable
+	providerAdmissionCancelled
+	providerAdmissionSaturated
+)
+
+type providerAttemptLease struct {
+	group       *providerGroup
+	breaker     circuitBreakerLease
+	reservation *requestReservation
+	completion  sync.Once
+}
+
+func eligibilityResponse(ctx context.Context, payload []byte, g *providerGroup, cause error, validateBody bool) Response {
+	return Response{
+		Err:        cause,
+		ProviderID: g.id,
+		Attempts:   []AttemptEvidence{buildEligibilityEvidence(ctx, payload, g.id, cause, validateBody)},
+	}
+}
+
+// beginProviderAttempt is the single logical-attempt eligibility boundary.
+// Quota is checked before breaker acquisition so an ineligible download cannot
+// mutate breaker state. FIFO may additionally require an atomic request-class
+// reservation; other dispatch modes register occupancy without changing their
+// provider-selection behavior.
+func (c *Client) beginProviderAttempt(
+	ctx context.Context,
+	g *providerGroup,
+	payload []byte,
+	priority bool,
+	validateBody bool,
+	useQuota bool,
+	enforceCapacity bool,
+) (*providerAttemptLease, Response, providerAdmissionStatus) {
+	if err := c.requestCancellation(ctx); err != nil {
+		return nil, eligibilityResponse(ctx, payload, g, err, validateBody), providerAdmissionCancelled
+	}
+	if g.ctx.Err() != nil {
+		return nil, eligibilityResponse(ctx, payload, g, ErrConnectionDied, validateBody), providerAdmissionUnavailable
+	}
+	if useQuota && g.isQuotaExceeded() {
+		if err := c.requestCancellation(ctx); err != nil {
+			return nil, eligibilityResponse(ctx, payload, g, err, validateBody), providerAdmissionCancelled
+		}
+		cause := fmt.Errorf("%s: %w", safeIdentityText(g.name), ErrQuotaExceeded)
+		return nil, eligibilityResponse(ctx, payload, g, cause, validateBody), providerAdmissionRejected
+	}
+
+	breakerLease, breakerErr := g.breaker.acquire(g.id)
+	if breakerErr != nil {
+		// Preserve caller/client cancellation precedence when it races with an
+		// otherwise factual breaker rejection.
+		if err := c.requestCancellation(ctx); err != nil {
+			return nil, eligibilityResponse(ctx, payload, g, err, validateBody), providerAdmissionCancelled
+		}
+		if g.ctx.Err() != nil {
+			return nil, eligibilityResponse(ctx, payload, g, ErrConnectionDied, validateBody), providerAdmissionUnavailable
+		}
+		return nil, eligibilityResponse(ctx, payload, g, breakerErr, validateBody), providerAdmissionRejected
+	}
+	if err := c.requestCancellation(ctx); err != nil {
+		g.breaker.complete(breakerLease, circuitBreakerNeutral)
+		return nil, eligibilityResponse(ctx, payload, g, err, validateBody), providerAdmissionCancelled
+	}
+	if g.ctx.Err() != nil {
+		g.breaker.complete(breakerLease, circuitBreakerNeutral)
+		return nil, eligibilityResponse(ctx, payload, g, ErrConnectionDied, validateBody), providerAdmissionUnavailable
+	}
+
+	reservation, reserved := g.gate.reserveRequest(payload, priority, enforceCapacity)
+	if !reserved {
+		g.breaker.complete(breakerLease, circuitBreakerNeutral)
+		if err := c.requestCancellation(ctx); err != nil {
+			return nil, eligibilityResponse(ctx, payload, g, err, validateBody), providerAdmissionCancelled
+		}
+		if g.gate.isStopped() || g.ctx.Err() != nil {
+			return nil, eligibilityResponse(ctx, payload, g, ErrConnectionDied, validateBody), providerAdmissionUnavailable
+		}
+		return nil, Response{}, providerAdmissionSaturated
+	}
+	return &providerAttemptLease{
+		group:       g,
+		breaker:     breakerLease,
+		reservation: reservation,
+	}, Response{}, providerAdmissionGranted
+}
+
+func (l *providerAttemptLease) complete(resp Response, ok, cancelled bool) {
+	if l == nil {
+		return
+	}
+	l.completion.Do(func() {
+		l.group.breaker.complete(l.breaker, classifyCircuitBreakerCompletion(resp, ok, cancelled))
+		l.reservation.release()
+	})
+}
+
+func (l *providerAttemptLease) handoff() requestHandoffStatus {
+	if l == nil || l.reservation == nil {
+		return requestHandoffUnavailable
+	}
+	return l.reservation.handoff()
+}
+
 // tryGroupResilient retries a single provider on a fresh connection when a
 // pooled connection dies mid-request (stale socket the server already
 // closed). Without this, a single-provider pool fails immediately with
@@ -3191,37 +3558,42 @@ func (c *Client) tryGroupResilient(
 	validateBody bool,
 	freshTransport bool,
 ) (resp Response, ok bool, cancelled bool) {
-	lease, breakerErr := g.breaker.acquire(g.id)
-	if breakerErr != nil {
-		// Preserve PR1 cancellation precedence when cancellation races with
-		// breaker eligibility. An open provider must not hide caller shutdown.
-		cancellationResp := func(err error) Response {
-			return Response{
-				Err:        err,
-				ProviderID: g.id,
-				Attempts:   []AttemptEvidence{buildEligibilityEvidence(payload, g.id, err, validateBody)},
-			}
-		}
-		if err := ctx.Err(); err != nil {
-			return cancellationResp(err), false, true
-		}
-		if err := c.ctx.Err(); err != nil {
-			return cancellationResp(err), false, true
-		}
-		resp = Response{
-			Err:        breakerErr,
-			ProviderID: g.id,
-			Attempts:   []AttemptEvidence{buildEligibilityEvidence(payload, g.id, breakerErr, validateBody)},
-		}
-		return resp, true, false
+	lease, rejection, status := c.beginProviderAttempt(ctx, g, payload, priority, validateBody, true, false)
+	switch status {
+	case providerAdmissionRejected:
+		return rejection, true, false
+	case providerAdmissionUnavailable:
+		return rejection, false, false
+	case providerAdmissionCancelled:
+		return rejection, false, true
+	case providerAdmissionSaturated:
+		return Response{}, false, false
 	}
-	if lease.probe {
+	return c.tryGroupResilientAdmitted(ctx, g, payload, bodyWriter, onMeta, priority, validateBody, freshTransport, lease)
+}
+
+func (c *Client) tryGroupResilientAdmitted(
+	ctx context.Context,
+	g *providerGroup,
+	payload []byte,
+	bodyWriter io.Writer,
+	onMeta func(YEncMeta),
+	priority bool,
+	validateBody bool,
+	freshTransport bool,
+	lease *providerAttemptLease,
+) (resp Response, ok bool, cancelled bool) {
+	if lease.handoff() != requestHandoffGranted {
+		lease.complete(Response{}, false, false)
+		return Response{}, false, false
+	}
+	if lease.breaker.probe {
 		// Half-open is a transport recovery probe, not merely another request
 		// on a socket that predates the breaker cooldown.
 		freshTransport = true
 	}
 	defer func() {
-		g.breaker.complete(lease, classifyCircuitBreakerCompletion(resp, ok, cancelled))
+		lease.complete(resp, ok, cancelled)
 	}()
 
 	var attempts []AttemptEvidence
@@ -3270,6 +3642,48 @@ func (c *Client) tryGroupResilient(
 	}
 }
 
+// tryGroupOnce preserves single-attempt operations such as targeted SpeedTest
+// while sharing the same quota, breaker, cancellation, and completion boundary
+// as the resilient BODY/STAT runner.
+func (c *Client) tryGroupOnce(
+	ctx context.Context,
+	g *providerGroup,
+	payload []byte,
+	bodyWriter io.Writer,
+	onMeta func(YEncMeta),
+	priority bool,
+	validateBody bool,
+	freshTransport bool,
+) (resp Response, ok bool, cancelled bool) {
+	lease, rejection, status := c.beginProviderAttempt(ctx, g, payload, priority, validateBody, true, false)
+	switch status {
+	case providerAdmissionRejected:
+		return rejection, true, false
+	case providerAdmissionUnavailable:
+		return rejection, false, false
+	case providerAdmissionCancelled:
+		return rejection, false, true
+	case providerAdmissionSaturated:
+		return Response{}, false, false
+	}
+	if lease.handoff() != requestHandoffGranted {
+		lease.complete(Response{}, false, false)
+		return Response{}, false, false
+	}
+	if lease.breaker.probe {
+		freshTransport = true
+	}
+	defer func() {
+		lease.complete(resp, ok, cancelled)
+	}()
+	for {
+		resp, ok, cancelled = c.tryGroup(ctx, g, payload, bodyWriter, onMeta, priority, validateBody, freshTransport)
+		if !errors.Is(resp.Err, errFreshTransportRequired) {
+			return resp, ok, cancelled
+		}
+	}
+}
+
 func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta func(YEncMeta), respCh chan Response, priority bool, validateBody bool) {
 	defer close(respCh)
 
@@ -3296,19 +3710,10 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 		return
 	}
 
-	// Pick start index based on dispatch strategy.
+	// Round-robin keeps its historical weighted starting point. FIFO instead
+	// reserves request-class capacity atomically on every provider attempt.
 	var start int
-	switch c.dispatch {
-	case DispatchFIFO:
-		// Priority order: first provider with available capacity and within quota,
-		// falling back to provider 0 if all are saturated or exceeded.
-		for i, g := range mains {
-			if g.gate.available.Load() > 0 && !g.isQuotaExceeded() {
-				start = i
-				break
-			}
-		}
-	default: // DispatchRoundRobin
+	if c.dispatch != DispatchFIFO {
 		// Dynamic weighted round-robin. Quota-exceeded providers get weight 0
 		// so they are never selected during normal dispatch.
 		cumWeights, totalW := dispatchWeights(mains, c.speedAware)
@@ -3322,20 +3727,103 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 		}
 	}
 
-	for attempt := range n {
-		idx := (start + attempt) % n
-		g := mains[idx]
-		if g.isQuotaExceeded() {
-			if err := c.requestCancellation(ctx); err != nil {
-				attempts = append(attempts, buildEligibilityEvidence(payload, g.id, err, validateBody))
-				respCh <- cancellationResponse(attempts, err)
-				return
+	exhausted := make([]bool, n)
+	exhaustedCount := 0
+
+mainProviders:
+	for exhaustedCount < n {
+		var idx int
+		var g *providerGroup
+		var fifoLease *providerAttemptLease
+		if c.dispatch == DispatchFIFO {
+			for fifoLease == nil && exhaustedCount < n {
+				capacityChanged := c.capacityChange()
+				capacityBlocked := false
+				for candidate, candidateGroup := range mains {
+					if exhausted[candidate] {
+						continue
+					}
+					lease, rejection, status := c.beginProviderAttempt(
+						ctx,
+						candidateGroup,
+						payload,
+						priority || post430,
+						validateBody,
+						true,
+						true,
+					)
+					switch status {
+					case providerAdmissionGranted:
+						idx, g, fifoLease = candidate, candidateGroup, lease
+					case providerAdmissionSaturated:
+						capacityBlocked = true
+					case providerAdmissionCancelled:
+						attempts = append(attempts, rejection.Attempts...)
+						respCh <- cancellationResponse(attempts, rejection.Err)
+						return
+					case providerAdmissionRejected, providerAdmissionUnavailable:
+						exhausted[candidate] = true
+						exhaustedCount++
+						attempts = append(attempts, rejection.Attempts...)
+						if status == providerAdmissionRejected {
+							lastErr = rejection.Err
+						}
+					}
+					if fifoLease != nil {
+						break
+					}
+				}
+				if fifoLease != nil || exhaustedCount == n {
+					break
+				}
+				if !capacityBlocked {
+					break
+				}
+				select {
+				case <-ctx.Done():
+					respCh <- cancellationResponse(attempts, ctx.Err())
+					return
+				case <-c.ctx.Done():
+					respCh <- cancellationResponse(attempts, c.ctx.Err())
+					return
+				case <-capacityChanged:
+				}
 			}
-			lastErr = fmt.Errorf("%s: %w", safeIdentityText(g.name), ErrQuotaExceeded)
-			attempts = append(attempts, buildEligibilityEvidence(payload, g.id, lastErr, validateBody))
-			continue
+			if fifoLease == nil {
+				break mainProviders
+			}
+		} else {
+			idx = (start + exhaustedCount) % n
+			g = mains[idx]
 		}
-		resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, bodyWriter, onMeta, priority || post430, validateBody, false)
+		if fifoLease != nil {
+			switch fifoLease.handoff() {
+			case requestHandoffSaturated:
+				fifoLease.complete(Response{}, false, false)
+				continue mainProviders
+			case requestHandoffUnavailable:
+				fifoLease.complete(Response{}, false, false)
+				exhausted[idx] = true
+				exhaustedCount++
+				continue mainProviders
+			}
+		}
+
+		exhausted[idx] = true
+		exhaustedCount++
+		var resp Response
+		var ok, cancelled bool
+		if fifoLease != nil {
+			resp, ok, cancelled = c.tryGroupResilientAdmitted(
+				ctx, g, payload, bodyWriter, onMeta,
+				priority || post430, validateBody, false, fifoLease,
+			)
+		} else {
+			resp, ok, cancelled = c.tryGroupResilient(
+				ctx, g, payload, bodyWriter, onMeta,
+				priority || post430, validateBody, false,
+			)
+		}
 		attempts = append(attempts, resp.Attempts...)
 		if cancelled {
 			err := ctx.Err()
@@ -3376,9 +3864,17 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 
 			if raceable {
 				// Build remaining mains and race them in parallel via STAT.
-				rest := make([]*providerGroup, 0, n-attempt-1)
-				for a := attempt + 1; a < n; a++ {
-					rest = append(rest, mains[(start+a)%n])
+				rest := make([]*providerGroup, 0, n-exhaustedCount)
+				if c.dispatch == DispatchFIFO {
+					for candidate, candidateGroup := range mains {
+						if !exhausted[candidate] {
+							rest = append(rest, candidateGroup)
+						}
+					}
+				} else {
+					for a := exhaustedCount; a < n; a++ {
+						rest = append(rest, mains[(start+a)%n])
+					}
 				}
 				delivered, cancelled, raceErr := c.raceCandidates(
 					ctx, rest, statPayload, payload, bodyWriter, onMeta,
@@ -3398,7 +3894,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 				if raceErr != nil {
 					lastErr = raceErr
 				}
-				break // all remaining mains were probed in the race
+				break mainProviders // all remaining mains were probed in the race
 			}
 			continue
 		}
@@ -3445,16 +3941,6 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 				return
 			}
 			g := backups[i]
-			if g.isQuotaExceeded() {
-				if err := c.requestCancellation(ctx); err != nil {
-					attempts = append(attempts, buildEligibilityEvidence(payload, g.id, err, validateBody))
-					respCh <- cancellationResponse(attempts, err)
-					return
-				}
-				lastErr = fmt.Errorf("%s: %w", safeIdentityText(g.name), ErrQuotaExceeded)
-				attempts = append(attempts, buildEligibilityEvidence(payload, g.id, lastErr, validateBody))
-				continue
-			}
 			resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, bodyWriter, onMeta, priority || post430, validateBody, false)
 			attempts = append(attempts, resp.Attempts...)
 			if cancelled {
@@ -3598,7 +4084,6 @@ func (c *Client) RemoveProvider(name string) error {
 	}
 	if group != nil {
 		group.cancel()
-		group.gate.stop()
 	}
 	return nil
 }

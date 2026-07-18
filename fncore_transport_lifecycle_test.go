@@ -528,7 +528,7 @@ func TestFNCOREBootstrapFreshRejectionSettlesDeferredNormal(t *testing.T) {
 		Ctx:            context.Background(),
 		Payload:        []byte("BODY <fresh@example.invalid>\r\n"),
 		RespCh:         freshResponse,
-		FreshTransport: true,
+		freshTransport: true,
 		submittedAt:    nntpConnection.createdAt.Add(time.Second),
 	}
 	nntpConnection.secondReq = &Request{

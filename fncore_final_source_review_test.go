@@ -304,7 +304,7 @@ func TestFNCOREProgressedBodyCancellationCannotBeOverwrittenByStaleStallDeadline
 		Payload:      []byte("BODY <stale-stall@example.invalid>\r\n"),
 		RespCh:       make(chan Response, 1),
 		BodyWriter:   io.Discard,
-		ValidateBody: true,
+		validateBody: true,
 		submittedAt:  time.Now(),
 	}
 	go connection.Run()

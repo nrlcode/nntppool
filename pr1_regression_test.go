@@ -103,11 +103,15 @@ func (p *regressionProvider) commandCount(prefix string) int {
 }
 
 func newRegressionClient(t *testing.T, providers ...Provider) *Client {
+	return newRegressionClientWithDispatch(t, DispatchFIFO, providers...)
+}
+
+func newRegressionClientWithDispatch(t *testing.T, dispatch DispatchStrategy, providers ...Provider) *Client {
 	t.Helper()
 	client, err := NewClient(
 		context.Background(),
 		providers,
-		WithDispatchStrategy(DispatchFIFO),
+		WithDispatchStrategy(dispatch),
 	)
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)
@@ -1202,7 +1206,7 @@ func TestPR1UnsentPriorityPrecedesQueuedNormalWork(t *testing.T) {
 		}()
 		return client, nil
 	}
-	client := newRegressionClient(t, Provider{
+	client := newRegressionClientWithDispatch(t, DispatchRoundRobin, Provider{
 		Host:         "strict-priority.invalid:119",
 		Factory:      factory,
 		Connections:  1,
@@ -1273,7 +1277,7 @@ func TestPR1BackgroundStatWindowPreservesPriorityHeadroom(t *testing.T) {
 		}()
 		return client, nil
 	}
-	client := newRegressionClient(t, Provider{
+	client := newRegressionClientWithDispatch(t, DispatchRoundRobin, Provider{
 		Host:                   "occupancy.invalid:119",
 		Factory:                factory,
 		Connections:            1,
