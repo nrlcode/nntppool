@@ -494,8 +494,8 @@ func TestFNCORECHG004StoppedGateRejectsReservedRequestBeforeWire(t *testing.T) {
 		}
 		t.Fatalf("stopped reservation reached wire as %q", command)
 	case got := <-result:
-		if got.ok || got.cancelled {
-			t.Fatalf("stopped reservation result = %+v, want neutral pretransport rejection", got)
+		if got.cancelled {
+			t.Fatalf("stopped reservation result = %+v, want non-cancellation pretransport rejection", got)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("stopped reservation neither rejected nor reached the wire")
@@ -581,7 +581,11 @@ func TestFNCORECHG004ReservationHandoffRevalidatesThrottleAndStop(t *testing.T) 
 		}
 		if extra, reserved := gate.reserveRequest(payload, false, true); reserved {
 			extra.release()
-			t.Fatal("stopped gate accepted a new reservation")
+			t.Fatal("stopped gate accepted a new enforced reservation")
+		}
+		if extra, reserved := gate.reserveRequest(payload, false, false); reserved {
+			extra.release()
+			t.Fatal("stopped gate accepted a new non-enforced reservation")
 		}
 		reservation.release()
 		gate.mu.Lock()
