@@ -171,6 +171,12 @@ func TestFNCOREQuotaSuppressesTargetedPublicPaths(t *testing.T) {
 
 			test.invoke(t, fncoreAdmissionContext(t), client, fncoreAdmissionProviderID)
 
+			if got := targetServer.connections.Load(); got != 0 {
+				t.Errorf("quota-exhausted target connections = %d, want 0", got)
+			}
+			if got := otherServer.connections.Load(); got != 0 {
+				t.Errorf("targeted %s other-provider connections = %d, want 0", test.name, got)
+			}
 			if got := targetServer.commandCount(test.prefix); got != 0 {
 				t.Errorf("quota-exhausted target received %d %s commands, want 0", got, test.prefix)
 			}
@@ -266,6 +272,9 @@ func TestFNCOREOpenBreakerSuppressesPublicPaths(t *testing.T) {
 		if got := server.posts.Load(); got != 0 {
 			t.Errorf("open-breaker POST reached provider %d times, want 0", got)
 		}
+		if got := server.connections.Load(); got != 0 {
+			t.Errorf("open-breaker POST connections = %d, want 0", got)
+		}
 		if after := providerBreakerStats(t, client, fncoreAdmissionProviderID); after != before {
 			t.Errorf("open-breaker POST changed breaker: before=%+v after=%+v", before, after)
 		}
@@ -289,6 +298,9 @@ func TestFNCOREOpenBreakerSuppressesPublicPaths(t *testing.T) {
 		}
 		if got := server.commandCount("BODY"); got != 0 {
 			t.Errorf("open-breaker targeted SpeedTest sent %d BODY commands, want 0", got)
+		}
+		if got := server.connections.Load(); got != 0 {
+			t.Errorf("open-breaker targeted SpeedTest connections = %d, want 0", got)
 		}
 		if after := providerBreakerStats(t, client, fncoreAdmissionProviderID); after != before {
 			t.Errorf("open-breaker SpeedTest changed breaker: before=%+v after=%+v", before, after)
