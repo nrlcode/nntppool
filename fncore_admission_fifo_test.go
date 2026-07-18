@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -614,40 +613,30 @@ func TestFNCORECHG004ProviderRemovalStopsGateBeforeCancellation(t *testing.T) {
 		t.Fatalf("initial reservation status = %v, response = %+v; want granted", status, rejection)
 	}
 
-	// Hold the gate lock so removal can publish the registry change but cannot
-	// yet linearize gate.stop. Cancellation must remain unpublished until that
-	// stop boundary wins the same lock used by reservation handoff.
-	group.gate.mu.Lock()
-	removeDone := make(chan error, 1)
-	go func() { removeDone <- client.RemoveProvider(provider.id) }()
-	deadline := time.Now().Add(2 * time.Second)
-	for client.findGroup(provider.id) != nil && time.Now().Before(deadline) {
-		runtime.Gosched()
-	}
-	if client.findGroup(provider.id) != nil {
+	// Observe the existing cancellation boundary directly. The wrapper adds no
+	// production hook and records the gate state at the exact cancellation call.
+	originalCancel := group.cancel
+	stoppedAtCancel := make(chan bool, 1)
+	group.cancel = func() {
+		group.gate.mu.Lock()
+		stopped := group.gate.stopped
 		group.gate.mu.Unlock()
-		select {
-		case <-removeDone:
-		case <-time.After(2 * time.Second):
-		}
-		lease.complete(Response{}, false, false)
-		t.Fatal("provider removal did not publish its registry change")
+		stoppedAtCancel <- stopped
+		originalCancel()
 	}
-	cancelledBeforeStop := group.ctx.Err() != nil
-	group.gate.mu.Unlock()
+	if err := client.RemoveProvider(provider.id); err != nil {
+		lease.complete(Response{}, false, false)
+		t.Fatalf("RemoveProvider() error = %v", err)
+	}
 	select {
-	case err := <-removeDone:
-		if err != nil {
+	case stopped := <-stoppedAtCancel:
+		if !stopped {
 			lease.complete(Response{}, false, false)
-			t.Fatalf("RemoveProvider() error = %v", err)
+			t.Fatal("provider context was cancelled before gate.stop linearized")
 		}
 	case <-time.After(2 * time.Second):
 		lease.complete(Response{}, false, false)
-		t.Fatal("RemoveProvider() did not settle after gate release")
-	}
-	if cancelledBeforeStop {
-		lease.complete(Response{}, false, false)
-		t.Fatal("provider context was cancelled before gate.stop linearized")
+		t.Fatal("provider removal did not invoke group cancellation")
 	}
 	if group.ctx.Err() == nil {
 		lease.complete(Response{}, false, false)

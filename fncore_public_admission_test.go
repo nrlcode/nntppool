@@ -597,12 +597,12 @@ func TestFNCOREClientDeadlineEvidenceRemainsCancellation(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 	before := providerBreakerStats(t, client, fncoreAdmissionProviderID)
 	select {
-	case <-clientCtx.Done():
+	case <-client.ctx.Done():
 	case <-time.After(2 * time.Second):
-		t.Fatal("client parent deadline did not expire")
+		t.Fatal("client deadline did not propagate to the client context")
 	}
-	if !errors.Is(clientCtx.Err(), context.DeadlineExceeded) {
-		t.Fatalf("client context error = %v, want context deadline", clientCtx.Err())
+	if !errors.Is(client.ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("client context error = %v, want context deadline", client.ctx.Err())
 	}
 
 	_, err = client.BodyTargeted(context.Background(), "client-deadline-evidence@example.invalid", TargetedBodyOptions{Provider: fncoreAdmissionProviderID})
