@@ -400,7 +400,6 @@ func TestF451CMappedRetryTransportFailureStopsAtBound(t *testing.T) {
 func TestF451CCancellationAfterMappedRetryDispatch(t *testing.T) {
 	retryDispatched := make(chan struct{})
 	releaseRetry := make(chan struct{})
-	t.Cleanup(func() { close(releaseRetry) })
 	var dispatchOnce sync.Once
 	primary := &regressionProvider{
 		host: "f451c-cancel-primary.invalid:119",
@@ -423,6 +422,7 @@ func TestF451CCancellationAfterMappedRetryDispatch(t *testing.T) {
 	backupProvider := backup.provider(true)
 	backupProvider.ID = "f451c-cancel-backup"
 	client := f451cClient(t, primaryProvider, backupProvider)
+	t.Cleanup(func() { close(releaseRetry) })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
@@ -434,9 +434,16 @@ func TestF451CCancellationAfterMappedRetryDispatch(t *testing.T) {
 	case <-retryDispatched:
 	case err := <-result:
 		t.Fatalf("Body() settled before mapped retry dispatch: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("Body() did not dispatch the mapped retry")
 	}
 	cancel()
-	err := <-result
+	var err error
+	select {
+	case err = <-result:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Body() did not settle after cancellation")
+	}
 
 	transportErr := f451cRequireTransportError(t, err, OutcomeCancellation)
 	if !errors.Is(err, context.Canceled) {
