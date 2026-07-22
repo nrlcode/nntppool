@@ -207,6 +207,10 @@ type Request struct {
 	validateBody   bool
 	freshTransport bool
 
+	// response451Policy is copied from the exact provider group at dispatch so
+	// attempt evidence cannot be reinterpreted after configuration changes.
+	response451Policy Response451Policy
+
 	// Optional: called with yEnc metadata once =ybegin/=ypart headers are parsed, before body decoding.
 	OnMeta func(YEncMeta)
 	// decodeFn is an internal deterministic test seam for native decoder
@@ -2265,7 +2269,8 @@ func (c *NNTPConnection) readerLoop() {
 				}
 				recordSpeed(c.stats, n, time.Since(fb))
 			default:
-				if decoder.StatusCode == 430 || decoder.StatusCode == 423 {
+				if decoder.StatusCode == 430 || decoder.StatusCode == 423 ||
+					requestMaps451ToAbsence(req, decoder.StatusCode) {
 					c.stats.Missing.Add(1)
 				} else {
 					c.stats.Errors.Add(1)
@@ -2375,6 +2380,16 @@ func withCircuitBreakerClock(clock circuitBreakerClock) ClientOption {
 	return func(cfg *clientConfig) { cfg.circuitBreakerClock = clock }
 }
 
+// Response451Policy controls the provider-local meaning of NNTP 451 replies
+// for article existence and retrieval commands. Its zero value preserves the
+// existing temporary-failure behavior after the bounded fresh retry.
+type Response451Policy uint8
+
+const (
+	Response451Temporary Response451Policy = iota
+	Response451AbsentAfterRetry
+)
+
 // Provider describes a single NNTP server with its own credentials and connection count.
 type Provider struct {
 	// ID is the caller's stable transport identity for result and attempt
@@ -2395,6 +2410,9 @@ type Provider struct {
 	ThrottleRestore        time.Duration // 0 defaults to 30s
 	KeepAlive              time.Duration // TCP keep-alive interval; 0 defaults to 30s; negative disables
 	ReconnectDelay         time.Duration // 0 disables auto-reconnect after 502; when set, re-adds provider after this delay
+	// Response451Policy applies only to STAT, BODY, HEAD, and ARTICLE. The zero
+	// value keeps 451 temporary; AbsentAfterRetry maps retry absence evidence.
+	Response451Policy Response451Policy
 
 	// AttemptTimeout bounds time-to-first-response-byte starting only when the
 	// request becomes response head on its NNTP connection. Pool admission and
@@ -3029,7 +3047,7 @@ func (c *Client) raceCandidates(
 			c.retireUnavailableProvider(g)
 			return false, false, fmt.Errorf("%s: %w", safeIdentityText(g.name), ErrServiceUnavailable)
 		}
-		if resp.StatusCode == 430 || resp.StatusCode == 423 {
+		if responseIsHardArticleAbsence(resp) {
 			c.nextIdx.Add(1)
 			return false, false, lastErr
 		}
@@ -3072,13 +3090,13 @@ func (c *Client) raceCandidates(
 			continue
 		}
 		g := pr.g
-		switch pr.resp.StatusCode {
-		case 502:
+		switch {
+		case pr.resp.StatusCode == 502:
 			c.retireUnavailableProvider(g)
 			lastErr = fmt.Errorf("%s: %w", safeIdentityText(g.name), ErrServiceUnavailable)
-		case 430, 423:
+		case responseIsHardArticleAbsence(pr.resp):
 			c.nextIdx.Add(1)
-		case 223:
+		case pr.resp.StatusCode == 223:
 			winners = append(winners, g)
 		default:
 			lastErr = fmt.Errorf("%s: %w", safeIdentityText(g.name), toError(pr.resp.StatusCode, pr.resp.Status))
@@ -3113,7 +3131,7 @@ func (c *Client) raceCandidates(
 			lastErr = resp.Err
 			continue
 		}
-		if resp.StatusCode == 430 || resp.StatusCode == 423 {
+		if responseIsHardArticleAbsence(resp) {
 			c.nextIdx.Add(1)
 			continue
 		}
@@ -3208,18 +3226,19 @@ func (c *Client) tryGroup(
 
 	innerCh := make(chan Response, 1)
 	req := &Request{
-		Ctx:             reqCtx,
-		Payload:         payload,
-		RespCh:          innerCh,
-		BodyWriter:      bodyWriter,
-		validateBody:    validateBody,
-		freshTransport:  freshTransport,
-		priority:        priority,
-		OnMeta:          onMeta,
-		decodeFn:        c.decodeFn,
-		submittedAt:     time.Now(),
-		responseTimeout: g.attemptTimeout(),
-		transportCause:  func() error { return c.groupCause(g) },
+		Ctx:               reqCtx,
+		Payload:           payload,
+		RespCh:            innerCh,
+		BodyWriter:        bodyWriter,
+		validateBody:      validateBody,
+		freshTransport:    freshTransport,
+		response451Policy: g.p.Response451Policy,
+		priority:          priority,
+		OnMeta:            onMeta,
+		decodeFn:          c.decodeFn,
+		submittedAt:       time.Now(),
+		responseTimeout:   g.attemptTimeout(),
+		transportCause:    func() error { return c.groupCause(g) },
 	}
 
 	var hotCh chan *Request
@@ -3321,9 +3340,13 @@ func buildAttemptEvidence(req *Request, providerID string, resp Response, comple
 			responseCode = setupErr.setupResponseCode()
 		}
 	}
+	operation := operationFromPayload(req.Payload)
 	outcome := classifyAttemptOutcome(req, responseCode, cause)
+	if resp.Err == nil && requestMaps451ToAbsence(req, responseCode) {
+		outcome = OutcomeHardArticleAbsence
+	}
 	validation := BodyValidationNotApplicable
-	if operationFromPayload(req.Payload) == OperationBody {
+	if operation == OperationBody {
 		if !req.validateBody {
 			validation = BodyValidationNotRequested
 		} else {
@@ -3354,7 +3377,7 @@ func buildAttemptEvidence(req *Request, providerID string, resp Response, comple
 	providerResponseTimeout := headAt > 0 && req.providerDeadlineExpired(resp.Err)
 	return AttemptEvidence{
 		ProviderID:               providerID,
-		Operation:                operationFromPayload(req.Payload),
+		Operation:                operation,
 		Outcome:                  outcome,
 		ResponseCode:             responseCode,
 		BodyValidation:           validation,
@@ -3374,6 +3397,26 @@ func buildEligibilityEvidence(ctx context.Context, payload []byte, providerID st
 		req.deadlineOwner = readDeadlineCaller
 	}
 	return buildAttemptEvidence(req, providerID, Response{Err: cause}, time.Now())
+}
+
+func requestMaps451ToAbsence(req *Request, responseCode int) bool {
+	return responseCode == 451 &&
+		req != nil &&
+		req.response451Policy == Response451AbsentAfterRetry &&
+		isArticleOperation(req.Payload)
+}
+
+// responseIsHardArticleAbsence recognizes native absence and a provider-mapped
+// 451 only after the resilient runner has completed its bounded fresh retry.
+func responseIsHardArticleAbsence(resp Response) bool {
+	if resp.StatusCode == 423 || resp.StatusCode == 430 {
+		return true
+	}
+	if resp.StatusCode != 451 || len(resp.Attempts) == 0 {
+		return false
+	}
+	final := resp.Attempts[len(resp.Attempts)-1]
+	return final.ResponseCode == 451 && final.Outcome == OutcomeHardArticleAbsence
 }
 
 // maxSpeedScore is the highest multiplier speed-aware dispatch applies to a
@@ -3599,6 +3642,7 @@ func (c *Client) tryGroupResilientAdmitted(
 	var attempts []AttemptEvidence
 	connRetries := 0
 	temporaryRetried := false
+	mapped451Retry := false
 	for {
 		resp, ok, cancelled = c.tryGroup(ctx, g, payload, bodyWriter, onMeta, priority, validateBody, freshTransport)
 		attempts = append(attempts, resp.Attempts...)
@@ -3619,6 +3663,7 @@ func (c *Client) tryGroupResilientAdmitted(
 		}
 		if !temporaryRetried && resp.Err == nil && resp.StatusCode == 451 && isArticleOperation(payload) {
 			temporaryRetried = true
+			mapped451Retry = requestMaps451ToAbsence(resp.Request, resp.StatusCode)
 			delay := temporaryRetryMinDelay + time.Duration(rand.Int64N(int64(temporaryRetryJitter)+1))
 			select {
 			case <-time.After(delay):
@@ -3632,6 +3677,12 @@ func (c *Client) tryGroupResilientAdmitted(
 				resp.Attempts = cloneAttempts(attempts)
 				return resp, true, true
 			}
+		}
+		// A mapped 451 receives exactly one consistency retry. A transport loss
+		// on that retry is inconclusive and must not start a third attempt.
+		if mapped451Retry && isConnectionDeathError(resp.Err) {
+			resp.Attempts = cloneAttempts(attempts)
+			return
 		}
 		if connRetries < maxConnDiedRetries && isConnectionDeathError(resp.Err) {
 			connRetries++
@@ -3856,7 +3907,7 @@ mainProviders:
 			lastErr = fmt.Errorf("%s: %w", safeIdentityText(g.name), ErrServiceUnavailable)
 			continue
 		}
-		if resp.StatusCode == 430 || resp.StatusCode == 423 {
+		if responseIsHardArticleAbsence(resp) {
 			c.nextIdx.Add(1) // bias next request away from this provider
 			lastResp = resp
 			hasResp = true
@@ -3976,7 +4027,7 @@ mainProviders:
 				respCh <- resp
 				return
 			}
-			if resp.StatusCode == 430 || resp.StatusCode == 423 {
+			if responseIsHardArticleAbsence(resp) {
 				lastResp = resp
 				hasResp = true
 				continue

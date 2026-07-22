@@ -161,6 +161,11 @@ func resolveInitialProviders(providers []Provider) ([]resolvedProvider, map[stri
 }
 
 func validateProvider(provider Provider) error {
+	switch provider.Response451Policy {
+	case Response451Temporary, Response451AbsentAfterRetry:
+	default:
+		return fmt.Errorf("%w: unknown 451 response policy %d", ErrInvalidProviderConfiguration, provider.Response451Policy)
+	}
 	if provider.Connections <= 0 {
 		return fmt.Errorf("nntp: provider connections must be > 0")
 	}

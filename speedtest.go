@@ -216,14 +216,31 @@ func (c *Client) SpeedTest(ctx context.Context, opts SpeedTestOptions) (*SpeedTe
 	}, nil
 }
 
-// sendToGroup dispatches exactly one logical attempt to a specific provider.
-// It shares provider eligibility and breaker completion without inheriting the
-// resilient runner's connection-death or article-451 retries.
+// sendToGroup dispatches to one provider. Targeted SpeedTest retains its
+// historical single attempt unless that provider explicitly maps article 451.
 func (c *Client) sendToGroup(ctx context.Context, g *providerGroup, payload []byte, bodyWriter io.Writer) <-chan Response {
 	outerCh := make(chan Response, 1)
 	go func() {
 		defer close(outerCh)
-		resp, ok, _ := c.tryGroupOnce(ctx, g, payload, bodyWriter, nil, false, false, false)
+		var resp Response
+		var ok bool
+		if g.p.Response451Policy == Response451AbsentAfterRetry && isArticleOperation(payload) {
+			var cancelled bool
+			resp, ok, cancelled = c.tryGroupResilient(ctx, g, payload, bodyWriter, nil, false, false, false)
+			if cancelled {
+				cause := ctx.Err()
+				if cause == nil {
+					cause = c.ctx.Err()
+				}
+				if cause == nil {
+					cause = context.Canceled
+				}
+				outerCh <- cancellationResponse(resp.Attempts, cause)
+				return
+			}
+		} else {
+			resp, ok, _ = c.tryGroupOnce(ctx, g, payload, bodyWriter, nil, false, false, false)
+		}
 		if !ok && resp.Err == nil {
 			resp.Err = ErrConnectionDied
 		}

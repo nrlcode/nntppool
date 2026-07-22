@@ -12,12 +12,26 @@ import (
 // external keyed literals remain valid as additive fields are introduced.
 var (
 	_ = nntppool.Provider{Host: "example.invalid:119", Connections: 1}
+	_ = nntppool.Provider{
+		Host:              "mapped.example.invalid:119",
+		Connections:       1,
+		Response451Policy: nntppool.Response451AbsentAfterRetry,
+	}
 	_ = nntppool.Request{Ctx: context.Background(), Payload: []byte("DATE\r\n"), RespCh: make(chan nntppool.Response, 1)}
 	_ = nntppool.Response{StatusCode: 200, Status: "200 ready"}
 	_ = nntppool.ArticleBody{MessageID: "fixture@example.invalid", Bytes: []byte("payload")}
+	_ = nntppool.ArticleHead{MessageID: "fixture@example.invalid"}
+	_ = nntppool.ArticleHead{
+		MessageID:  "mapped@example.invalid",
+		ProviderID: "provider",
+		Attempts:   []nntppool.AttemptEvidence{},
+	}
 	_ = nntppool.StatResult{MessageID: "fixture@example.invalid", Number: 1}
 	_ = nntppool.ProviderStats{Name: "provider"}
 	_ = nntppool.ClientStats{}
+
+	_ nntppool.Response451Policy = nntppool.Response451Temporary
+	_ nntppool.Operation         = nntppool.OperationArticle
 )
 
 type v4ClientMethods interface {
