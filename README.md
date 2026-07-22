@@ -59,7 +59,7 @@ A high-performance NNTP connection pool library for Go. It manages multiple NNTP
 - **Multi-provider pooling**: configure N connection slots per provider; supports both main and backup tiers
 - **Command pipelining**: configurable inflight requests per connection (default: 1)
 - **Weighted round-robin dispatch**: distributes load by available inflight capacity; FIFO mode also available
-- **Automatic failover**: ordered fallback for hard absence (423/430), temporary failure, corruption, unavailability, and transport failure, followed by failure-only backups
+- **Automatic failover**: ordered fallback for hard absence (423/430 or explicitly mapped provider-local 451), temporary failure, corruption, unavailability, and transport failure, followed by failure-only backups
 - **Bounded provider circuit breaker**: optional short-lived suppression after repeated provider-level temporary failures, with exclusive half-open recovery probes
 - **Independent provider evidence**: every configured account remains eligible after hard absence, even when multiple accounts share one endpoint
 - **Provider removal on 502**: permanently unavailable providers are atomically removed from the pool
@@ -643,7 +643,11 @@ Both strategies use the same provider eligibility boundary. They skip quota-exce
        • if ReconnectDelay > 0: schedule re-add after delay
        • try next provider
    - 451 → retire its socket, reject every other preexisting socket for that provider,
-     retry once on a newly created connection after short jitter, then try next provider
+     retry once on a newly created connection after short jitter, then try next provider:
+       • default/zero policy: repeated 451 remains temporary
+       • `Response451AbsentAfterRetry`: for STAT, BODY, HEAD, and ARTICLE only,
+         retry 451/423/430 completes provider-local hard absence
+       • any other retry outcome remains inconclusive rather than absent
    - buffered BODY framing/decode/size/CRC failure → retire the socket, try next provider
    - connection error → try next provider
    - quota exceeded → skip, try next provider
@@ -669,7 +673,7 @@ client, err := nntppool.NewClient(ctx, providers,
 )
 ```
 
-When enabled, each provider opens after three qualifying failures from distinct public requests within a rolling 30-second window. Accounting happens once after all internal retries for that provider: a final `451`, provider connection/bootstrap failure, direct provider transport failure, or genuine provider response/progress timeout counts. Local queue/admission expiry, collateral pipeline cancellation, hard article absence, caller cancellation, health preemption, isolated article corruption, authentication, quota, configuration, and explicit service-unavailable states do not count. Bootstrap preserves `ErrAuthRequired`/`ErrAuthRejected` and marks recognized local address or TLS policy failures with `ErrInvalidProviderConfiguration`, so those actionable causes cannot be hidden by breaker cooldown.
+When enabled, each provider opens after three qualifying failures from distinct public requests within a rolling 30-second window. Accounting happens once after all internal retries for that provider: a final default-policy `451`, provider connection/bootstrap failure, direct provider transport failure, or genuine provider response/progress timeout counts. Local queue/admission expiry, collateral pipeline cancellation, hard article absence, caller cancellation, health preemption, isolated article corruption, authentication, quota, configuration, and explicit service-unavailable states do not count. A provider-mapped article `451` sequence is entirely breaker-neutral. Bootstrap preserves `ErrAuthRequired`/`ErrAuthRejected` and marks recognized local address or TLS policy failures with `ErrInvalidProviderConfiguration`, so those actionable causes cannot be hidden by breaker cooldown.
 
 An open provider is skipped while alternatives are tried. After cooldown, exactly one request receives an exclusive half-open probe on a fresh transport; concurrent requests receive `ErrCircuitBreakerOpen` with a `*CircuitBreakerError`. Failed probes advance cooldowns through 10, 20, 40, 80, and 120 seconds, capped at 120 seconds. Any successful provider request closes the breaker and resets its failure window and cooldown immediately.
 
@@ -854,6 +858,13 @@ type AttemptEvidence struct {
     ResponseServiceDuration  time.Duration
 }
 
+type Response451Policy uint8
+
+const (
+    Response451Temporary Response451Policy = iota
+    Response451AbsentAfterRetry
+)
+
 // TransportError wraps the existing sentinel/protocol cause so errors.Is and
 // errors.As checks remain valid after provider exhaustion or cancellation.
 // Kind describes the aggregate pool outcome. Uniform results attribute the
@@ -918,8 +929,10 @@ type StatResult struct {
 
 // ArticleHead holds the result of a HEAD command.
 type ArticleHead struct {
-    MessageID string
-    Headers   map[string][]string // RFC 5322 headers, multi-value, folding resolved
+    MessageID  string
+    ProviderID string
+    Attempts   []AttemptEvidence
+    Headers    map[string][]string // RFC 5322 headers, multi-value, folding resolved
 }
 
 // ProviderStats is a snapshot of one provider's metrics.
@@ -928,7 +941,7 @@ type ProviderStats struct {
     ProviderID        string
     AvgSpeed          float64       // bytes/sec since client start
     BytesConsumed     int64         // raw wire bytes
-    Missing           int64         // 430/423 responses
+    Missing           int64         // 423/430 and mapped article 451 wire responses
     Errors            int64         // network errors and bad status codes
     ActiveConnections int           // currently running connection slots
     MaxConnections    int           // configured Connections value
@@ -970,6 +983,7 @@ type ProviderStats struct {
 | `ThrottleRestore` | `time.Duration` | 30s | How long to wait before restoring throttled slots after a 502/400 greeting |
 | `KeepAlive` | `time.Duration` | 30s | TCP keep-alive interval; negative disables OS-level keep-alive |
 | `ReconnectDelay` | `time.Duration` | 0 (disabled) | If set, re-adds the provider this long after a 502 removal |
+| `Response451Policy` | `Response451Policy` | `Response451Temporary` | Provider-local article meaning of 451; `Response451AbsentAfterRetry` maps only the bounded retry conclusion to hard absence |
 | `AttemptTimeout` | `time.Duration` | adaptive, 2s–10s | Time-to-first-response-byte bound starting only at FIFO response head; caller context owns pool and pipeline wait |
 | `StallTimeout` | `time.Duration` | 8s | Rolling body-progress timeout; negative disables it |
 | `AbandonedBodyDrainBytes` | `int` | 1 MiB | Maximum obsolete BODY bytes drained after cancellation before retiring the socket |
@@ -981,6 +995,11 @@ type ProviderStats struct {
 | `QuotaPeriod` | `time.Duration` | 0 (no reset) | Rolling window for quota reset; 0 = lifetime cap |
 | `QuotaUsed` | `int64` | 0 | Bytes already consumed at startup (for state restoration) |
 | `QuotaResetAt` | `time.Time` | zero | Quota reset deadline at startup (for state restoration) |
+
+Unknown `Response451Policy` values fail `NewClient` or `AddProvider` validation
+before the provider factory or network is used. `ProviderStats.Missing` counts
+hard-absence wire responses, not conclusive requests, so each mapped 451 reply
+increments it even when the fresh retry later succeeds.
 
 ### Client options
 
@@ -1004,7 +1023,7 @@ nntppool.WithProviderCircuitBreaker(true)
 
 | Error | NNTP Code | Meaning |
 |-------|-----------|---------|
-| `ErrArticleNotFound` | 430 or 423 | Article does not exist on this provider (semantic match: both codes satisfy `errors.Is`) |
+| `ErrArticleNotFound` | 430, 423, or mapped 451 aggregate | Article does not exist on this provider; mapped 451 retains its raw protocol cause |
 | `ErrPostingNotPermitted` | 440 | Server does not allow posting |
 | `ErrPostingFailed` | 441 | Server rejected the article |
 | `ErrAuthRequired` | 480 | Authentication required before this command |
@@ -1134,6 +1153,10 @@ go tool govulncheck ./...
 ## Speed Test Tool
 
 `cmd/speedtest` measures download throughput through the pool using NZB files. By default it uses the SABnzbd 10GB test NZB; you can point it at any NZB file or URL.
+
+A targeted `SpeedTest` remains single-attempt under the default 451 policy. It
+uses the bounded fresh retry only when the selected provider opts into
+`Response451AbsentAfterRetry` for its article request.
 
 ### Build
 

@@ -33,10 +33,12 @@ const (
 	OperationBody    Operation = "BODY"
 	OperationStat    Operation = "STAT"
 	OperationHead    Operation = "HEAD"
+	OperationArticle Operation = "ARTICLE"
 	OperationPost    Operation = "POST"
 )
 
-const operationArticle Operation = "ARTICLE"
+// Retain the private spelling for internal and package-test compatibility.
+const operationArticle = OperationArticle
 
 // BodyValidationStatus records whether a BODY attempt crossed the complete
 // transport validation boundary.
@@ -154,7 +156,7 @@ parsed:
 	case equalASCIIFold(payload[:end], "BODY"):
 		return OperationBody
 	case equalASCIIFold(payload[:end], "ARTICLE"):
-		return operationArticle
+		return OperationArticle
 	case equalASCIIFold(payload[:end], "STAT"):
 		return OperationStat
 	case equalASCIIFold(payload[:end], "HEAD"):
@@ -167,7 +169,7 @@ parsed:
 
 func isArticleOperation(payload []byte) bool {
 	switch operationFromPayload(payload) {
-	case OperationBody, OperationStat, OperationHead, operationArticle:
+	case OperationBody, OperationStat, OperationHead, OperationArticle:
 		return true
 	default:
 		return false
@@ -299,6 +301,11 @@ func newTransportError(attempts []AttemptEvidence, cause error) *TransportError 
 			}
 			break
 		}
+	}
+	if kind == OutcomeHardArticleAbsence && cause != nil {
+		// Preserve a mapped vendor 451 as the representative raw cause while
+		// retaining the established ErrArticleNotFound sentinel contract.
+		cause = withErrorClassification(cause, ErrArticleNotFound)
 	}
 	return &TransportError{
 		Kind:         kind,

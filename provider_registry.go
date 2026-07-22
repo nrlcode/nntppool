@@ -161,6 +161,9 @@ func resolveInitialProviders(providers []Provider) ([]resolvedProvider, map[stri
 }
 
 func validateProvider(provider Provider) error {
+	if err := validateResponse451Policy(provider.Response451Policy); err != nil {
+		return err
+	}
 	if provider.Connections <= 0 {
 		return fmt.Errorf("nntp: provider connections must be > 0")
 	}
