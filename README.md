@@ -647,7 +647,7 @@ Both strategies use the same provider eligibility boundary. They skip quota-exce
        • default/zero policy: repeated 451 remains temporary
        • `Response451AbsentAfterRetry`: for STAT, BODY, HEAD, and ARTICLE only,
          retry 451/423/430 completes provider-local hard absence
-       • any other retry outcome remains inconclusive rather than absent
+       • success wins; any other retry outcome remains inconclusive rather than absent
    - buffered BODY framing/decode/size/CRC failure → retire the socket, try next provider
    - connection error → try next provider
    - quota exceeded → skip, try next provider
@@ -659,7 +659,8 @@ Both strategies use the same provider eligibility boundary. They skip quota-exce
    - backup 502 → remove, try next backup
 
 3. If all providers exhausted:
-   - return hard absence only when every eligible provider conclusively reported 423/430
+   - return hard absence only when every eligible provider conclusively reported
+     423/430 or completed the explicitly mapped 451 retry boundary
    - mixed outcome classes return a structured inconclusive error with per-attempt evidence
 ```
 
@@ -675,7 +676,7 @@ client, err := nntppool.NewClient(ctx, providers,
 
 When enabled, each provider opens after three qualifying failures from distinct public requests within a rolling 30-second window. Accounting happens once after all internal retries for that provider: a final default-policy `451`, provider connection/bootstrap failure, direct provider transport failure, or genuine provider response/progress timeout counts. Local queue/admission expiry, collateral pipeline cancellation, hard article absence, caller cancellation, health preemption, isolated article corruption, authentication, quota, configuration, and explicit service-unavailable states do not count. A provider-mapped article `451` sequence is entirely breaker-neutral. Bootstrap preserves `ErrAuthRequired`/`ErrAuthRejected` and marks recognized local address or TLS policy failures with `ErrInvalidProviderConfiguration`, so those actionable causes cannot be hidden by breaker cooldown.
 
-An open provider is skipped while alternatives are tried. After cooldown, exactly one request receives an exclusive half-open probe on a fresh transport; concurrent requests receive `ErrCircuitBreakerOpen` with a `*CircuitBreakerError`. Failed probes advance cooldowns through 10, 20, 40, 80, and 120 seconds, capped at 120 seconds. Any successful provider request closes the breaker and resets its failure window and cooldown immediately.
+An open provider is skipped while alternatives are tried. After cooldown, exactly one request receives an exclusive half-open probe on a fresh transport; concurrent requests receive `ErrCircuitBreakerOpen` with a `*CircuitBreakerError`. Failed probes advance cooldowns through 10, 20, 40, 80, and 120 seconds, capped at 120 seconds. A successful request normally closes the breaker immediately; a success reached after a mapped article `451` remains neutral.
 
 nntppool does not wait for a cooldown or run caller retry/backoff policy. `ProviderStats.CircuitBreaker` exposes the current in-memory state, failure count, cooldown deadline, and probe occupancy. This transient state is transport telemetry, not durable article-availability evidence.
 

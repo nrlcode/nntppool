@@ -2390,15 +2390,6 @@ const (
 	Response451AbsentAfterRetry
 )
 
-func validateResponse451Policy(policy Response451Policy) error {
-	switch policy {
-	case Response451Temporary, Response451AbsentAfterRetry:
-		return nil
-	default:
-		return fmt.Errorf("%w: unknown 451 response policy %d", ErrInvalidProviderConfiguration, policy)
-	}
-}
-
 // Provider describes a single NNTP server with its own credentials and connection count.
 type Provider struct {
 	// ID is the caller's stable transport identity for result and attempt
