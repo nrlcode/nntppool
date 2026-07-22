@@ -262,7 +262,8 @@ func TestF451CTargetedSpeedTestPolicyBoundary(t *testing.T) {
 			},
 		}
 		provider, _ := f451cProvider(server, "f451c-speed-mapped", f451cPolicyAbsentAfterRetry)
-		client := f451cClient(t, provider)
+		client := newBreakerClient(t, newBreakerFakeClock(), provider)
+		fncoreRecordBreakerCompletions(t, client, provider.ID, 2, circuitBreakerFailure)
 		result, err := client.SpeedTest(context.Background(), SpeedTestOptions{
 			NZBReader:    testNZBReader("mapped-speed@example.invalid"),
 			ProviderName: "f451c-speed-mapped",
@@ -279,6 +280,10 @@ func TestF451CTargetedSpeedTestPolicyBoundary(t *testing.T) {
 		}
 		if got := server.connections.Load(); got < 2 {
 			t.Errorf("mapped targeted SpeedTest connections = %d, want a fresh retry transport", got)
+		}
+		breaker := providerBreakerStats(t, client, provider.ID)
+		if breaker.State != CircuitBreakerClosed || breaker.QualifyingFailures != 2 {
+			t.Errorf("mapped targeted SpeedTest breaker = %+v, want neutral completion with two prior failures", breaker)
 		}
 	})
 }
@@ -508,38 +513,29 @@ func TestF451CQuotaAdmissionPrecedesMappedTargetedSpeedTest(t *testing.T) {
 }
 
 func TestF451CMappedRetryIsBreakerNeutralAndCountsWireAbsence(t *testing.T) {
-	t.Run("closed failure window", func(t *testing.T) {
-		_, provider := breakerProvider(
-			"f451c-neutral-closed",
-			"f451c-neutral-closed.invalid:119",
-			func(connection int, _ string) []byte {
-				if connection == 1 {
-					return []byte("451 provider-mapped article absence\r\n")
-				}
-				return []byte("223 1 <fixture@example.invalid> exists\r\n")
-			},
+	t.Run("repeated mapped absence", func(t *testing.T) {
+		server, provider := breakerProvider(
+			"f451c-neutral-repeated",
+			"f451c-neutral-repeated.invalid:119",
+			func(_ int, _ string) []byte { return []byte("451 provider-mapped article absence\r\n") },
 		)
 		provider, _ = f451cSetProviderPolicy(provider, f451cPolicyAbsentAfterRetry)
 		client := newBreakerClient(t, newBreakerFakeClock(), provider)
 		fncoreRecordBreakerCompletions(t, client, provider.ID, 2, circuitBreakerFailure)
 
-		result, err := client.Stat(context.Background(), "fixture@example.invalid")
-		if err != nil {
-			t.Fatalf("mapped retry Stat() error = %v", err)
-		}
-		if len(result.Attempts) != 2 ||
-			result.Attempts[0].Outcome != OutcomeHardArticleAbsence ||
-			result.Attempts[0].ResponseCode != 451 ||
-			result.Attempts[1].Outcome != OutcomeSuccess {
-			t.Errorf("attempts = %+v, want mapped 451 then success", result.Attempts)
+		_, err := client.Stat(context.Background(), "fixture@example.invalid")
+		transportErr := f451cRequireTransportError(t, err, OutcomeHardArticleAbsence)
+		if !errors.Is(err, ErrArticleNotFound) || transportErr == nil || len(transportErr.Attempts) != 2 {
+			t.Errorf("repeated mapped Stat() = %v, attempts %+v; want conclusive two-attempt absence", err, transportErr)
 		}
 		breaker := providerBreakerStats(t, client, provider.ID)
 		if breaker.State != CircuitBreakerClosed || breaker.QualifyingFailures != 2 {
-			t.Errorf("breaker after mapped retry success = %+v, want closed with two prior failures", breaker)
+			t.Errorf("breaker after repeated mapped absence = %+v, want closed with two prior failures", breaker)
 		}
 		stats := fncoreAdmissionProviderStats(t, client, provider.ID)
-		if stats.Missing != 1 || stats.Errors != 0 {
-			t.Errorf("mapped wire missing/errors = %d/%d, want 1/0", stats.Missing, stats.Errors)
+		if stats.Missing != 2 || stats.Errors != 0 || server.commandCount("STAT") != 2 {
+			t.Errorf("repeated mapped commands/missing/errors = %d/%d/%d, want 2/2/0",
+				server.commandCount("STAT"), stats.Missing, stats.Errors)
 		}
 	})
 
@@ -622,6 +618,86 @@ func TestF451CExactF006FailureOnlyFallback(t *testing.T) {
 		if attempt.ProviderID != wantProviders[index] || attempt.Outcome != wantOutcomes[index] {
 			t.Errorf("attempt[%d] = %+v, want provider %q outcome %s", index, attempt, wantProviders[index], wantOutcomes[index])
 		}
+	}
+}
+
+func TestF451CNativeAndMappedAbsenceRetryBounds(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		status string
+		code   int
+	}{
+		{name: "423", status: "423 no article with that number\r\n", code: 423},
+		{name: "430", status: "430 no such article\r\n", code: 430},
+	} {
+		t.Run(test.name+"_initial", func(t *testing.T) {
+			server := &regressionProvider{host: "f451c-native-" + test.name + ".invalid:119", respond: func(_ int, _ string) []byte { return []byte(test.status) }}
+			provider, _ := f451cProvider(server, "f451c-native-"+test.name, f451cPolicyAbsentAfterRetry)
+			client := f451cClient(t, provider)
+			_, err := client.Stat(context.Background(), "native@example.invalid")
+			transportErr := f451cRequireTransportError(t, err, OutcomeHardArticleAbsence)
+			if !errors.Is(err, ErrArticleNotFound) || server.commandCount("STAT") != 1 ||
+				transportErr == nil || len(transportErr.Attempts) != 1 || transportErr.Attempts[0].ResponseCode != test.code {
+				t.Errorf("initial %s error/attempts = %v/%+v, commands %d; want one native absence",
+					test.name, err, transportErr, server.commandCount("STAT"))
+			}
+		})
+
+		t.Run("451_then_"+test.name, func(t *testing.T) {
+			server := &regressionProvider{
+				host: "f451c-mapped-native-" + test.name + ".invalid:119",
+				respond: func(connection int, _ string) []byte {
+					if connection == 1 {
+						return []byte("451 provider-mapped article absence\r\n")
+					}
+					return []byte(test.status)
+				},
+			}
+			provider, _ := f451cProvider(server, "f451c-mapped-native-"+test.name, f451cPolicyAbsentAfterRetry)
+			client := f451cClient(t, provider)
+			_, err := client.Stat(context.Background(), "mapped-native@example.invalid")
+			transportErr := f451cRequireTransportError(t, err, OutcomeHardArticleAbsence)
+			if !errors.Is(err, ErrArticleNotFound) || server.commandCount("STAT") != 2 ||
+				transportErr == nil || len(transportErr.Attempts) != 2 ||
+				transportErr.Attempts[0].ResponseCode != 451 || transportErr.Attempts[1].ResponseCode != test.code {
+				t.Errorf("451 then %s error/attempts = %v/%+v, commands %d; want bounded conclusive absence",
+					test.name, err, transportErr, server.commandCount("STAT"))
+			}
+		})
+	}
+}
+
+func TestF451CMappedAbsenceEntersParallelStatProbe(t *testing.T) {
+	mapped := &regressionProvider{
+		host:    "f451c-probe-mapped.invalid:119",
+		respond: func(_ int, _ string) []byte { return []byte("451 provider-mapped article absence\r\n") },
+	}
+	available := &regressionProvider{
+		host: "f451c-probe-available.invalid:119",
+		respond: func(_ int, command string) []byte {
+			if strings.HasPrefix(command, "STAT") {
+				return []byte("223 1 <probe@example.invalid> exists\r\n")
+			}
+			return yencSinglePart([]byte("parallel probe payload"), "probe.bin")
+		},
+	}
+	missing := &regressionProvider{
+		host:    "f451c-probe-missing.invalid:119",
+		respond: func(_ int, _ string) []byte { return []byte("430 no such article\r\n") },
+	}
+	client := newRegressionClient(t,
+		f451cIntegrationProvider(mapped, "f451c-probe-mapped", false, f451cPolicyAbsentAfterRetry),
+		f451cIntegrationProvider(available, "f451c-probe-available", false, f451cPolicyTemporary),
+		f451cIntegrationProvider(missing, "f451c-probe-missing", false, f451cPolicyTemporary),
+	)
+	body, err := client.Body(context.Background(), "probe@example.invalid")
+	if err != nil || body == nil || !bytes.Equal(body.Bytes, []byte("parallel probe payload")) {
+		t.Fatalf("parallel probe Body() = body %+v, error %v", body, err)
+	}
+	if mapped.commandCount("BODY") != 2 || available.commandCount("STAT") != 1 ||
+		available.commandCount("BODY") != 1 || missing.commandCount("STAT") != 1 {
+		t.Fatalf("mapped BODY/available STAT+BODY/missing STAT = %d/%d+%d/%d, want 2/1+1/1",
+			mapped.commandCount("BODY"), available.commandCount("STAT"), available.commandCount("BODY"), missing.commandCount("STAT"))
 	}
 }
 
