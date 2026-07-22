@@ -252,22 +252,59 @@ func TestF451CTargetedSpeedTestPolicyBoundary(t *testing.T) {
 	})
 
 	t.Run("mapped retries fresh and classifies", func(t *testing.T) {
+		firstDispatched := make(chan struct{})
+		releaseFirst := make(chan struct{})
+		var releaseOnce sync.Once
+		release := func() { releaseOnce.Do(func() { close(releaseFirst) }) }
 		server := &regressionProvider{
 			host: "f451c-speed-mapped.invalid:119",
 			respond: func(connection int, command string) []byte {
 				if strings.HasPrefix(command, "BODY") && connection == 1 {
+					close(firstDispatched)
+					<-releaseFirst
 					return []byte("451 provider-mapped article absence\r\n")
 				}
 				return yencSinglePart([]byte("mapped speed-test retry"), "mapped-speed.bin")
 			},
 		}
 		provider, _ := f451cProvider(server, "f451c-speed-mapped", f451cPolicyAbsentAfterRetry)
-		client := newBreakerClient(t, newBreakerFakeClock(), provider)
-		fncoreRecordBreakerCompletions(t, client, provider.ID, 2, circuitBreakerFailure)
-		result, err := client.SpeedTest(context.Background(), SpeedTestOptions{
-			NZBReader:    testNZBReader("mapped-speed@example.invalid"),
-			ProviderName: "f451c-speed-mapped",
-		})
+		clock := newBreakerFakeClock()
+		client := newBreakerClient(t, clock, provider)
+		t.Cleanup(release)
+		fncoreRecordBreakerCompletions(t, client, provider.ID, providerBreakerFailureThreshold, circuitBreakerFailure)
+		opened := providerBreakerStats(t, client, provider.ID)
+		clock.Advance(providerBreakerCooldowns[0])
+		type speedResult struct {
+			result *SpeedTestResult
+			err    error
+		}
+		done := make(chan speedResult, 1)
+		go func() {
+			result, err := client.SpeedTest(context.Background(), SpeedTestOptions{
+				NZBReader:    testNZBReader("mapped-speed@example.invalid"),
+				ProviderName: "f451c-speed-mapped",
+			})
+			done <- speedResult{result: result, err: err}
+		}()
+		select {
+		case <-firstDispatched:
+		case outcome := <-done:
+			t.Fatalf("mapped SpeedTest settled before first response release: %+v", outcome)
+		case <-time.After(3 * time.Second):
+			t.Fatal("mapped SpeedTest did not dispatch through the half-open provider")
+		}
+		inFlight := providerBreakerStats(t, client, provider.ID)
+		if inFlight.State != CircuitBreakerHalfOpen || !inFlight.ProbeInFlight {
+			t.Errorf("mapped targeted SpeedTest in-flight breaker = %+v, want exclusive half-open probe", inFlight)
+		}
+		release()
+		var outcome speedResult
+		select {
+		case outcome = <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("mapped SpeedTest did not settle after first response release")
+		}
+		result, err := outcome.result, outcome.err
 		if err != nil {
 			t.Fatalf("mapped targeted SpeedTest() error = %v", err)
 		}
@@ -281,9 +318,10 @@ func TestF451CTargetedSpeedTestPolicyBoundary(t *testing.T) {
 		if got := server.connections.Load(); got < 2 {
 			t.Errorf("mapped targeted SpeedTest connections = %d, want a fresh retry transport", got)
 		}
-		breaker := providerBreakerStats(t, client, provider.ID)
-		if breaker.State != CircuitBreakerClosed || breaker.QualifyingFailures != 2 {
-			t.Errorf("mapped targeted SpeedTest breaker = %+v, want neutral completion with two prior failures", breaker)
+		settled := providerBreakerStats(t, client, provider.ID)
+		if settled.State != CircuitBreakerHalfOpen || settled.ProbeInFlight ||
+			settled.Cooldown != opened.Cooldown || !settled.OpenUntil.Equal(opened.OpenUntil) {
+			t.Errorf("mapped targeted SpeedTest settled breaker = %+v, want neutral release of %+v", settled, opened)
 		}
 	})
 }
