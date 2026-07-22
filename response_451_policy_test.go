@@ -459,3 +459,159 @@ func TestF451CCancellationAfterMappedRetryDispatch(t *testing.T) {
 		t.Errorf("second attempt = %+v, want cancellation on dispatched fresh retry", second)
 	}
 }
+
+func f451cIntegrationProvider(server *regressionProvider, id string, backup bool, policy uint8) Provider {
+	provider, _ := f451cProvider(server, id, policy)
+	provider.Backup = backup
+	return provider
+}
+
+func TestF451CQuotaAdmissionPrecedesMappedTargetedSpeedTest(t *testing.T) {
+	server, provider := fncoreQuotaExhaustedProvider("f451c-quota", "f451c-quota.invalid:119")
+	var configured bool
+	provider, configured = f451cSetProviderPolicy(provider, f451cPolicyAbsentAfterRetry)
+	if !configured {
+		t.Error("quota fixture could not opt in to the mapped 451 policy")
+	}
+	client := fncoreAdmissionClient(t, provider)
+	fncoreRecordBreakerCompletions(t, client, provider.ID, 1, circuitBreakerFailure)
+	before := providerBreakerStats(t, client, provider.ID)
+
+	result, err := client.SpeedTest(context.Background(), SpeedTestOptions{
+		NZBReader:    testNZBReader("quota@example.invalid"),
+		ProviderName: provider.ID,
+	})
+	if err != nil {
+		t.Fatalf("SpeedTest() error = %v", err)
+	}
+	if result.SegmentsDone != 1 {
+		t.Fatalf("SpeedTest segments done = %d, want one settled admission result", result.SegmentsDone)
+	}
+	if got := server.connections.Load(); got != 0 {
+		t.Errorf("quota-exhausted provider connections = %d, want 0", got)
+	}
+	if got := server.commandCount("BODY"); got != 0 {
+		t.Errorf("quota-exhausted provider BODY commands = %d, want 0", got)
+	}
+	if after := providerBreakerStats(t, client, provider.ID); after != before {
+		t.Errorf("quota rejection changed breaker: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestF451CMappedRetryIsBreakerNeutralAndCountsWireAbsence(t *testing.T) {
+	t.Run("closed failure window", func(t *testing.T) {
+		_, provider := breakerProvider(
+			"f451c-neutral-closed",
+			"f451c-neutral-closed.invalid:119",
+			func(connection int, _ string) []byte {
+				if connection == 1 {
+					return []byte("451 provider-mapped article absence\r\n")
+				}
+				return []byte("223 1 <fixture@example.invalid> exists\r\n")
+			},
+		)
+		provider, _ = f451cSetProviderPolicy(provider, f451cPolicyAbsentAfterRetry)
+		client := newBreakerClient(t, newBreakerFakeClock(), provider)
+		fncoreRecordBreakerCompletions(t, client, provider.ID, 2, circuitBreakerFailure)
+
+		result, err := client.Stat(context.Background(), "fixture@example.invalid")
+		if err != nil {
+			t.Fatalf("mapped retry Stat() error = %v", err)
+		}
+		if len(result.Attempts) != 2 ||
+			result.Attempts[0].Outcome != OutcomeHardArticleAbsence ||
+			result.Attempts[0].ResponseCode != 451 ||
+			result.Attempts[1].Outcome != OutcomeSuccess {
+			t.Errorf("attempts = %+v, want mapped 451 then success", result.Attempts)
+		}
+		breaker := providerBreakerStats(t, client, provider.ID)
+		if breaker.State != CircuitBreakerClosed || breaker.QualifyingFailures != 2 {
+			t.Errorf("breaker after mapped retry success = %+v, want closed with two prior failures", breaker)
+		}
+		stats := fncoreAdmissionProviderStats(t, client, provider.ID)
+		if stats.Missing != 1 || stats.Errors != 0 {
+			t.Errorf("mapped wire missing/errors = %d/%d, want 1/0", stats.Missing, stats.Errors)
+		}
+	})
+
+	t.Run("half-open settlement", func(t *testing.T) {
+		clock := newBreakerFakeClock()
+		server, provider := breakerProvider(
+			"f451c-neutral-half-open",
+			"f451c-neutral-half-open.invalid:119",
+			func(connection int, _ string) []byte {
+				if connection == 1 {
+					return []byte("451 provider-mapped article absence\r\n")
+				}
+				return []byte("223 1 <fixture@example.invalid> exists\r\n")
+			},
+		)
+		provider, _ = f451cSetProviderPolicy(provider, f451cPolicyAbsentAfterRetry)
+		client := newBreakerClient(t, clock, provider)
+		fncoreRecordBreakerCompletions(t, client, provider.ID, providerBreakerFailureThreshold, circuitBreakerFailure)
+		opened := providerBreakerStats(t, client, provider.ID)
+		clock.Advance(providerBreakerCooldowns[0])
+
+		if _, err := client.Stat(context.Background(), "fixture@example.invalid"); err != nil {
+			t.Fatalf("half-open mapped retry Stat() error = %v", err)
+		}
+		settled := providerBreakerStats(t, client, provider.ID)
+		if settled.State != CircuitBreakerHalfOpen || settled.ProbeInFlight ||
+			settled.QualifyingFailures != 0 || settled.Cooldown != opened.Cooldown ||
+			!settled.OpenUntil.Equal(opened.OpenUntil) {
+			t.Errorf("settled breaker = %+v, want unchanged eligible half-open state from %+v", settled, opened)
+		}
+		if got := server.commandCount("STAT"); got != 2 {
+			t.Errorf("half-open STAT commands = %d, want mapped attempt plus fresh retry", got)
+		}
+	})
+}
+
+func TestF451CExactF006FailureOnlyFallback(t *testing.T) {
+	mapped := &regressionProvider{
+		host:    "f451c-f006-mapped.invalid:119",
+		respond: func(_ int, _ string) []byte { return []byte("451 provider-mapped absence\r\n") },
+	}
+	temporary := &regressionProvider{
+		host:    "f451c-f006-temporary.invalid:119",
+		respond: func(_ int, _ string) []byte { return []byte("451 temporary failure\r\n") },
+	}
+	backup := &regressionProvider{
+		host:    "f451c-f006-backup.invalid:119",
+		respond: func(_ int, _ string) []byte { return []byte("223 1 <fixture@example.invalid> exists\r\n") },
+	}
+	client := f451cClient(t,
+		f451cIntegrationProvider(mapped, "f451c-f006-mapped", false, f451cPolicyAbsentAfterRetry),
+		f451cIntegrationProvider(temporary, "f451c-f006-temporary", false, f451cPolicyTemporary),
+		f451cIntegrationProvider(backup, "f451c-f006-backup", true, f451cPolicyTemporary),
+	)
+
+	result, err := client.Stat(context.Background(), "fixture@example.invalid")
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if result.ProviderID != "f451c-f006-backup" {
+		t.Fatalf("serving provider = %q, want failure-only backup", result.ProviderID)
+	}
+	if gotA, gotB, gotC := mapped.commandCount("STAT"), temporary.commandCount("STAT"), backup.commandCount("STAT"); gotA != 2 || gotB != 2 || gotC != 1 {
+		t.Fatalf("mapped/default/backup STAT counts = %d/%d/%d, want 2/2/1", gotA, gotB, gotC)
+	}
+	wantProviders := []string{
+		"f451c-f006-mapped", "f451c-f006-mapped",
+		"f451c-f006-temporary", "f451c-f006-temporary",
+		"f451c-f006-backup",
+	}
+	wantOutcomes := []OutcomeKind{
+		OutcomeHardArticleAbsence, OutcomeHardArticleAbsence,
+		OutcomeTemporaryFailure, OutcomeTemporaryFailure,
+		OutcomeSuccess,
+	}
+	if len(result.Attempts) != len(wantProviders) {
+		t.Fatalf("attempts = %+v, want five ordered outcomes", result.Attempts)
+	}
+	for index, attempt := range result.Attempts {
+		if attempt.ProviderID != wantProviders[index] || attempt.Outcome != wantOutcomes[index] {
+			t.Errorf("attempt[%d] = %+v, want provider %q outcome %s", index, attempt, wantProviders[index], wantOutcomes[index])
+		}
+	}
+}
