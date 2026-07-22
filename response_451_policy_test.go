@@ -2,6 +2,7 @@ package nntppool
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // These values are deliberately test-local so this first red commit compiles
@@ -613,5 +615,158 @@ func TestF451CExactF006FailureOnlyFallback(t *testing.T) {
 		if attempt.ProviderID != wantProviders[index] || attempt.Outcome != wantOutcomes[index] {
 			t.Errorf("attempt[%d] = %+v, want provider %q outcome %s", index, attempt, wantProviders[index], wantOutcomes[index])
 		}
+	}
+}
+
+func TestF451CMappedRetryPreservesPartialWriterCommit(t *testing.T) {
+	writerErr := errors.New("f451c partial writer sentinel")
+	payload := bytes.Repeat([]byte("p"), 32*1024)
+	primary := &regressionProvider{
+		host: "f451c-writer-primary.invalid:119",
+		respond: func(connection int, _ string) []byte {
+			if connection == 1 {
+				return []byte("451 provider-mapped article absence\r\n")
+			}
+			return yencSinglePart(payload, "partial.bin")
+		},
+	}
+	provider, _ := f451cProvider(primary, "f451c-writer-primary", f451cPolicyAbsentAfterRetry)
+	backup := &regressionProvider{
+		host: "f451c-writer-backup.invalid:119",
+		respond: func(_ int, _ string) []byte {
+			return yencSinglePart([]byte("backup tripwire"), "backup.bin")
+		},
+	}
+	backupProvider := backup.provider(true)
+	backupProvider.ID = "f451c-writer-backup"
+	client := f451cClient(t, provider, backupProvider)
+	writer := &partialErrorWriter{err: writerErr}
+
+	response := <-client.Send(context.Background(), []byte("BODY <partial@example.invalid>\r\n"), writer)
+	err := responseError(response)
+	if !errors.Is(err, writerErr) {
+		t.Fatalf("Send() error = %v, want partial writer cause", err)
+	}
+	if writer.bytes.Len() == 0 || writer.bytes.Len() >= len(payload) ||
+		!bytes.Equal(writer.bytes.Bytes(), payload[:writer.bytes.Len()]) {
+		t.Fatalf("writer bytes = %d, want exact nonempty payload prefix below %d", writer.bytes.Len(), len(payload))
+	}
+	if got := backup.commandCount("BODY"); got != 0 {
+		t.Fatalf("backup BODY commands = %d, want zero after writer commit", got)
+	}
+	if got := primary.connections.Load(); got != 2 {
+		t.Fatalf("primary connections = %d, want original plus fresh retry", got)
+	}
+	if got := primary.commandCount("BODY"); got != 2 {
+		t.Fatalf("primary BODY commands = %d, want mapped reply plus retry", got)
+	}
+	if len(response.Attempts) != 2 ||
+		response.Attempts[0].ProviderID != provider.ID ||
+		response.Attempts[0].Operation != OperationBody ||
+		response.Attempts[0].Outcome != OutcomeHardArticleAbsence ||
+		response.Attempts[0].ResponseCode != 451 ||
+		response.Attempts[1].ProviderID != provider.ID ||
+		response.Attempts[1].Operation != OperationBody ||
+		response.Attempts[1].Outcome != outcomeLocalFailure ||
+		!errors.Is(response.Attempts[1].Cause, writerErr) {
+		t.Fatalf("attempts = %+v, want mapped 451 then local writer failure", response.Attempts)
+	}
+}
+
+func TestF451CMappedRetryDoesNotAbortCommittedCollateralBody(t *testing.T) {
+	var collateralConnection atomic.Int32
+	var mappedConnection atomic.Int32
+	var successConnection atomic.Int32
+	var targetAttempts atomic.Int32
+	collateralPayload := bytes.Repeat([]byte("c"), 256*1024)
+	targetPayload := []byte("fresh mapped retry")
+	server := &regressionProvider{
+		host: "f451c-collateral.invalid:119",
+		respond: func(connection int, command string) []byte {
+			if strings.Contains(command, "collateral@example.invalid") {
+				collateralConnection.Store(int32(connection))
+				return yencSinglePart(collateralPayload, "collateral.bin")
+			}
+			if targetAttempts.Add(1) == 1 {
+				mappedConnection.Store(int32(connection))
+				return []byte("451 provider-mapped article absence\r\n")
+			}
+			successConnection.Store(int32(connection))
+			return yencSinglePart(targetPayload, "target.bin")
+		},
+	}
+	provider, _ := f451cProvider(server, "f451c-collateral", f451cPolicyAbsentAfterRetry)
+	provider.Connections = 2
+	provider.Inflight = 1
+	client := f451cClient(t, provider)
+
+	writer := &blockingWriter{started: make(chan struct{}), release: make(chan struct{})}
+	var releaseOnce sync.Once
+	releaseWriter := func() { releaseOnce.Do(func() { close(writer.release) }) }
+	t.Cleanup(releaseWriter)
+	type bodyResult struct {
+		body *ArticleBody
+		err  error
+	}
+	collateralResult := make(chan bodyResult, 1)
+	go func() {
+		body, err := client.BodyStream(context.Background(), "collateral@example.invalid", writer)
+		collateralResult <- bodyResult{body: body, err: err}
+	}()
+	select {
+	case <-writer.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("collateral BODY did not commit to caller writer")
+	}
+
+	targetResult := make(chan bodyResult, 1)
+	go func() {
+		body, err := client.Body(context.Background(), "target@example.invalid")
+		targetResult <- bodyResult{body: body, err: err}
+	}()
+	var target bodyResult
+	select {
+	case target = <-targetResult:
+	case <-time.After(3 * time.Second):
+		t.Fatal("mapped retry did not complete while collateral writer was blocked")
+	}
+	if target.err != nil || target.body == nil || !bytes.Equal(target.body.Bytes, targetPayload) {
+		t.Fatalf("mapped retry result = body %+v, error %v", target.body, target.err)
+	}
+	if len(target.body.Attempts) != 2 ||
+		target.body.Attempts[0].Outcome != OutcomeHardArticleAbsence ||
+		target.body.Attempts[0].ResponseCode != 451 ||
+		target.body.Attempts[1].Outcome != OutcomeSuccess {
+		t.Fatalf("mapped retry attempts = %+v, want hard absence then success", target.body.Attempts)
+	}
+	select {
+	case result := <-collateralResult:
+		t.Fatalf("collateral BODY settled before writer release: body %+v, error %v", result.body, result.err)
+	default:
+	}
+
+	collateralConn := collateralConnection.Load()
+	mappedConn := mappedConnection.Load()
+	successConn := successConnection.Load()
+	if collateralConn == 0 || mappedConn == 0 || successConn == 0 ||
+		collateralConn == mappedConn || collateralConn == successConn || mappedConn == successConn {
+		t.Fatalf("connection ownership = collateral %d, mapped %d, success %d; want three distinct transports",
+			collateralConn, mappedConn, successConn)
+	}
+	if got := server.connections.Load(); got != 3 {
+		t.Fatalf("connections = %d, want capacity pair plus one fresh retry", got)
+	}
+
+	releaseWriter()
+	select {
+	case result := <-collateralResult:
+		if result.err != nil || result.body == nil || result.body.ProviderID != provider.ID {
+			t.Fatalf("collateral BODY result = body %+v, error %v", result.body, result.err)
+		}
+		if len(result.body.Attempts) != 1 || result.body.Attempts[0].Outcome != OutcomeSuccess {
+			t.Fatalf("collateral attempts = %+v, want one successful committed attempt", result.body.Attempts)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("collateral BODY did not settle after writer release")
 	}
 }
