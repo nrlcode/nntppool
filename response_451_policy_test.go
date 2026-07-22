@@ -1,11 +1,13 @@
 package nntppool
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"net"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -197,6 +199,12 @@ func TestF451CMappedPolicyIsArticleScoped(t *testing.T) {
 			if !errors.Is(err, ErrArticleNotFound) {
 				t.Errorf("mapped %s error = %v, want ErrArticleNotFound compatibility", test.operation, err)
 			}
+			if test.operation == f451cArticleOperation {
+				var raw *Error
+				if !errors.As(err, &raw) || raw.Code != 451 || !strings.Contains(raw.Message, "provider-mapped article absence") {
+					t.Errorf("mapped ARTICLE raw error = %#v, want original vendor 451", raw)
+				}
+			}
 			if got := server.commandCount(test.prefix); got != 2 {
 				t.Errorf("mapped %s attempts = %d, want original plus fresh retry", test.operation, got)
 			}
@@ -206,6 +214,10 @@ func TestF451CMappedPolicyIsArticleScoped(t *testing.T) {
 			for index, attempt := range transportErr.Attempts {
 				if attempt.Operation != test.operation || attempt.Outcome != OutcomeHardArticleAbsence || attempt.ResponseCode != 451 {
 					t.Errorf("mapped %s attempt %d = %+v, want hard-absence raw 451", test.operation, index, attempt)
+				}
+				var raw *Error
+				if !errors.As(attempt.Cause, &raw) || raw.Code != 451 || !strings.Contains(raw.Message, "provider-mapped article absence") {
+					t.Errorf("mapped %s attempt %d cause = %v, want original vendor 451", test.operation, index, attempt.Cause)
 				}
 			}
 		})
@@ -314,5 +326,136 @@ func TestF451CHeadPublishesMappedRetryEvidence(t *testing.T) {
 		attempts[0].Operation != OperationHead || attempts[0].Outcome != OutcomeHardArticleAbsence || attempts[0].ResponseCode != 451 ||
 		attempts[1].Operation != OperationHead || attempts[1].Outcome != OutcomeSuccess {
 		t.Fatalf("Head() evidence = %+v, want mapped raw 451 then HEAD success", attempts)
+	}
+}
+
+func TestF451CMappedRetryPreservesDifferentFinalOutcome(t *testing.T) {
+	server := &regressionProvider{
+		host: "f451c-mixed-retry.invalid:119",
+		respond: func(connection int, _ string) []byte {
+			if connection == 1 {
+				return []byte("451 provider-mapped article absence\r\n")
+			}
+			return []byte("499 different retry outcome\r\n")
+		},
+	}
+	provider, _ := f451cProvider(server, "f451c-mixed-retry", f451cPolicyAbsentAfterRetry)
+	client := f451cClient(t, provider)
+
+	_, err := client.Stat(context.Background(), "mixed-retry@example.invalid")
+	transportErr := f451cRequireTransportError(t, err, OutcomeInconclusive)
+	if errors.Is(err, ErrArticleNotFound) {
+		t.Fatalf("mixed retry error = %v, must not collapse to article absence", err)
+	}
+	if got := server.commandCount("STAT"); got != 2 {
+		t.Fatalf("STAT attempts = %d, want mapped response plus fresh retry", got)
+	}
+	if transportErr == nil || len(transportErr.Attempts) != 2 {
+		t.Fatalf("mixed retry evidence = %+v, want two ordered attempts", transportErr)
+	}
+	first, second := transportErr.Attempts[0], transportErr.Attempts[1]
+	if first.Operation != OperationStat || first.Outcome != OutcomeHardArticleAbsence || first.ResponseCode != 451 {
+		t.Errorf("first attempt = %+v, want mapped hard-absence STAT 451", first)
+	}
+	if second.Operation != OperationStat || second.Outcome != OutcomeInconclusive || second.ResponseCode != 499 {
+		t.Errorf("second attempt = %+v, want distinct inconclusive STAT 499", second)
+	}
+}
+
+func TestF451CMappedRetryTransportFailureStopsAtBound(t *testing.T) {
+	var factoryCalls atomic.Int32
+	dialErr := errors.New("f451c deterministic retry dial failure")
+	factory := func(context.Context) (net.Conn, error) {
+		if factoryCalls.Add(1) > 1 {
+			return nil, dialErr
+		}
+		client, server := net.Pipe()
+		go func() {
+			defer func() { _ = server.Close() }()
+			_, _ = server.Write([]byte("200 f451c transport server ready\r\n"))
+			if _, err := bufio.NewReader(server).ReadString('\n'); err == nil {
+				_, _ = server.Write([]byte("451 provider-mapped article absence\r\n"))
+			}
+		}()
+		return client, nil
+	}
+	provider := Provider{ID: "f451c-transport", Host: "f451c-transport.invalid:119", Factory: factory, Connections: 1, SkipPing: true}
+	provider, _ = f451cSetProviderPolicy(provider, f451cPolicyAbsentAfterRetry)
+	client := f451cClient(t, provider)
+
+	_, err := client.Stat(context.Background(), "transport@example.invalid")
+	transportErr := f451cRequireTransportError(t, err, OutcomeInconclusive)
+	if errors.Is(err, ErrArticleNotFound) || !errors.Is(err, dialErr) {
+		t.Fatalf("transport retry error = %v, want inconclusive wrapped dial failure", err)
+	}
+	if factoryCalls.Load() != 2 || transportErr == nil || len(transportErr.Attempts) != 2 ||
+		transportErr.Attempts[0].Outcome != OutcomeHardArticleAbsence || transportErr.Attempts[0].ResponseCode != 451 ||
+		transportErr.Attempts[1].Outcome != OutcomeTransportFailure {
+		t.Fatalf("factory calls/attempts = %d/%+v, want bounded mapped 451 then transport failure", factoryCalls.Load(), transportErr)
+	}
+}
+
+func TestF451CCancellationAfterMappedRetryDispatch(t *testing.T) {
+	retryDispatched := make(chan struct{})
+	releaseRetry := make(chan struct{})
+	t.Cleanup(func() { close(releaseRetry) })
+	var dispatchOnce sync.Once
+	primary := &regressionProvider{
+		host: "f451c-cancel-primary.invalid:119",
+		respond: func(connection int, _ string) []byte {
+			if connection == 1 {
+				return []byte("451 provider-mapped article absence\r\n")
+			}
+			dispatchOnce.Do(func() { close(retryDispatched) })
+			<-releaseRetry
+			return []byte("451 late response after cancellation\r\n")
+		},
+	}
+	backup := &regressionProvider{
+		host: "f451c-cancel-backup.invalid:119",
+		respond: func(_ int, _ string) []byte {
+			return yencSinglePart([]byte("backup must remain untouched"), "backup.bin")
+		},
+	}
+	primaryProvider, _ := f451cProvider(primary, "f451c-cancel-primary", f451cPolicyAbsentAfterRetry)
+	backupProvider := backup.provider(true)
+	backupProvider.ID = "f451c-cancel-backup"
+	client := f451cClient(t, primaryProvider, backupProvider)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := client.Body(ctx, "cancel-retry@example.invalid")
+		result <- err
+	}()
+	select {
+	case <-retryDispatched:
+	case err := <-result:
+		t.Fatalf("Body() settled before mapped retry dispatch: %v", err)
+	}
+	cancel()
+	err := <-result
+
+	transportErr := f451cRequireTransportError(t, err, OutcomeCancellation)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Body() error = %v, want caller cancellation", err)
+	}
+	if got := primary.commandCount("BODY"); got != 2 {
+		t.Errorf("primary BODY attempts = %d, want cancellation after retry dispatch", got)
+	}
+	if got := backup.commandCount("BODY"); got != 0 {
+		t.Errorf("backup BODY attempts = %d, want untouched", got)
+	}
+	if transportErr == nil || len(transportErr.Attempts) != 2 {
+		t.Fatalf("cancellation evidence = %+v, want two ordered attempts", transportErr)
+	}
+	first, second := transportErr.Attempts[0], transportErr.Attempts[1]
+	if first.ProviderID != "f451c-cancel-primary" || first.Operation != OperationBody ||
+		first.Outcome != OutcomeHardArticleAbsence || first.ResponseCode != 451 {
+		t.Errorf("first attempt = %+v, want mapped hard-absence BODY 451", first)
+	}
+	if second.ProviderID != "f451c-cancel-primary" || second.Operation != OperationBody ||
+		second.Outcome != OutcomeCancellation || !errors.Is(second.Cause, context.Canceled) {
+		t.Errorf("second attempt = %+v, want cancellation on dispatched fresh retry", second)
 	}
 }
